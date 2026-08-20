@@ -40,6 +40,7 @@ pub struct AppState {
     last_image_request: RwLock<Option<ImageRequest>>,
     selector_status: RwLock<SelectorStatus>,
     selection_trigger: watch::Sender<u64>,
+    csrf_token: String,
 }
 
 impl AppState {
@@ -52,6 +53,7 @@ impl AppState {
             last_image_request: RwLock::new(None),
             selector_status: RwLock::new(SelectorStatus::default()),
             selection_trigger,
+            csrf_token: random_token(),
         })
     }
 
@@ -70,7 +72,12 @@ impl AppState {
             last_image_request: RwLock::new(Some(request)),
             selector_status: RwLock::new(SelectorStatus::default()),
             selection_trigger,
+            csrf_token: random_token(),
         })
+    }
+
+    pub fn csrf_token(&self) -> &str {
+        &self.csrf_token
     }
 
     pub async fn last_image_request(&self) -> Option<ImageRequest> {
@@ -125,4 +132,14 @@ impl AppState {
             *generation = generation.saturating_add(1);
         });
     }
+}
+
+fn random_token() -> String {
+    let bytes = rand::random::<[u8; 32]>();
+    let mut token = String::with_capacity(64);
+    for byte in bytes {
+        use std::fmt::Write as _;
+        let _ = write!(token, "{byte:02x}");
+    }
+    token
 }

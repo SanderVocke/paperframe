@@ -127,13 +127,13 @@ Depends on Stages 1–3.
 
 Depends on Stages 1–4.
 
-- [ ] Replace the minimal page with an automatically escaped template showing mutable fields, current generation, latest selection status/error, cache readiness, and last frame GET without exposing source paths unnecessarily.
-- [ ] Implement bounded form parsing for `POST /settings`, including generation and per-process CSRF tokens.
-- [ ] Validate the complete proposed settings and SQLite query contract before atomically persisting, swapping the live snapshot, and notifying the scheduler.
-- [ ] Use POST/Redirect/GET on success and render actionable field/global errors without changing active/disk settings on failure.
-- [ ] Test HTML escaping, query editing and persistence, successful reselection notification, all validation failures, oversized forms, CSRF rejection, stale-generation conflict, concurrent submissions, and restart survival.
-- [ ] Verify formatting, strict linting, and all tests.
-- [ ] Commit the settings UI stage.
+- [x] Replace the minimal page with an automatically escaped template showing mutable fields, current generation, latest selection status/error, cache readiness, and last frame GET without exposing source paths unnecessarily.
+- [x] Implement bounded form parsing for `POST /settings`, including generation and per-process CSRF tokens.
+- [x] Validate the complete proposed settings and SQLite query contract before atomically persisting, swapping the live snapshot, and notifying the scheduler.
+- [x] Use POST/Redirect/GET on success and render actionable field/global errors without changing active/disk settings on failure.
+- [x] Test HTML escaping, query editing and persistence, successful reselection notification, all validation failures, oversized forms, CSRF rejection, stale-generation conflict, concurrent submissions, and restart survival.
+- [x] Verify formatting, strict linting, and all tests.
+- [x] Commit the settings UI stage.
 
 ### Stage 6 — Operational documentation and safety review
 

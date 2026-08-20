@@ -11,6 +11,7 @@ axum = "0.8"
 chrono = { version = "0.4", default-features = false, features = ["clock"] }
 chrono-tz = "0.10"
 httpdate = "1.0"
+rand = "0.9"
 rusqlite = { version = "0.37", features = ["bundled"] }
 serde = { version = "1.0", features = ["derive"] }
 sha2 = "0.10"
@@ -23,5 +24,6 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
 [dev-dependencies]
 http-body-util = "0.1"
+serde_urlencoded = "0.7"
 tempfile = "3.0"
 tower = { version = "0.5", features = ["util"] }

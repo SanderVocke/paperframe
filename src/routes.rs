@@ -5,28 +5,36 @@ use std::{
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
+use askama::Template;
 use axum::{
     Router,
     body::Body,
-    extract::{ConnectInfo, State},
+    extract::{ConnectInfo, DefaultBodyLimit, Form, State},
     http::{HeaderMap, StatusCode, header},
-    response::{Html, Response},
+    response::{Html, IntoResponse, Redirect, Response},
     routing::get,
 };
 use chrono::{SecondsFormat, Utc};
+use serde::{Deserialize, Serialize};
 use tokio::io::AsyncReadExt;
 use tower_http::trace::{DefaultMakeSpan, DefaultOnFailure, DefaultOnResponse, TraceLayer};
 use tracing::Level;
 use tracing::{error, info};
 
-use crate::state::{AppState, ImageRequest};
+use crate::{
+    catalog,
+    config::{PathMapping, ReplaceSettingsError, SelectionMode, SelectionSettings, Settings},
+    source::SourceStore,
+    state::{AppState, ImageRequest},
+};
 
 pub fn router(state: Arc<AppState>) -> Router {
     Router::new()
-        .route("/settings", get(settings))
+        .route("/settings", get(settings_page).post(update_settings))
         .route("/frame/current.jpg", get(get_image).head(head_image))
         .route("/health/live", get(health_live))
         .route("/health/ready", get(health_ready))
+        .layer(DefaultBodyLimit::max(64 * 1024))
         .layer(
             TraceLayer::new_for_http()
                 .make_span_with(DefaultMakeSpan::new().level(Level::INFO))
@@ -36,12 +44,154 @@ pub fn router(state: Arc<AppState>) -> Router {
         .with_state(state)
 }
 
-async fn settings(State(state): State<Arc<AppState>>) -> Html<String> {
-    let settings_generation = state.settings.snapshot().await.generation;
-    let request = state.last_image_request().await;
-    let status = match request {
+#[derive(Template)]
+#[template(path = "settings.html")]
+struct SettingsTemplate {
+    generation: u64,
+    csrf_token: String,
+    database_path: String,
+    query: String,
+    path_mappings: String,
+    mode_first: bool,
+    mode_daily_random: bool,
+    random_seed: String,
+    timezone: String,
+    rollover_time: String,
+    max_candidates: String,
+    cache_ready: bool,
+    last_request: String,
+    selector_status: String,
+    error: Option<String>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+struct SettingsForm {
+    generation: String,
+    csrf_token: String,
+    database_path: String,
+    query: String,
+    path_mappings: String,
+    selection_mode: String,
+    random_seed: String,
+    timezone: String,
+    rollover_time: String,
+    max_candidates: String,
+}
+
+async fn settings_page(State(state): State<Arc<AppState>>) -> Response {
+    let snapshot = state.settings.snapshot().await;
+    render_settings(
+        &state,
+        snapshot.generation,
+        SettingsForm::from_settings(snapshot.generation, state.csrf_token(), &snapshot.settings),
+        None,
+        StatusCode::OK,
+    )
+    .await
+}
+
+async fn update_settings(
+    State(state): State<Arc<AppState>>,
+    Form(form): Form<SettingsForm>,
+) -> Response {
+    if form.csrf_token != state.csrf_token() {
+        return render_form_error(&state, form, StatusCode::FORBIDDEN, "Invalid CSRF token").await;
+    }
+    let expected_generation = match form.generation.parse::<u64>() {
+        Ok(generation) => generation,
+        Err(_) => {
+            return render_form_error(
+                &state,
+                form,
+                StatusCode::UNPROCESSABLE_ENTITY,
+                "Settings generation must be an integer",
+            )
+            .await;
+        }
+    };
+    let proposed = match form.to_settings() {
+        Ok(settings) => settings,
+        Err(error) => {
+            return render_form_error(&state, form, StatusCode::UNPROCESSABLE_ENTITY, &error).await;
+        }
+    };
+    if let Err(error) =
+        validate_proposed_settings(proposed.clone(), state.cache.root().to_path_buf()).await
+    {
+        return render_form_error(
+            &state,
+            form,
+            StatusCode::UNPROCESSABLE_ENTITY,
+            &error.to_string(),
+        )
+        .await;
+    }
+
+    match state.settings.replace(expected_generation, proposed).await {
+        Ok(_) => {
+            state.trigger_selection();
+            Redirect::to("/settings").into_response()
+        }
+        Err(ReplaceSettingsError::Stale { current_generation }) => {
+            render_form_error(
+                &state,
+                form,
+                StatusCode::CONFLICT,
+                &format!(
+                    "Settings changed concurrently; current generation is {current_generation}"
+                ),
+            )
+            .await
+        }
+        Err(ReplaceSettingsError::Invalid(error)) => {
+            render_form_error(&state, form, StatusCode::UNPROCESSABLE_ENTITY, &error).await
+        }
+        Err(ReplaceSettingsError::Persistence(error)) => {
+            render_form_error(
+                &state,
+                form,
+                StatusCode::INTERNAL_SERVER_ERROR,
+                &format!("Failed to persist settings: {error}"),
+            )
+            .await
+        }
+    }
+}
+
+async fn validate_proposed_settings(
+    settings: Settings,
+    cache_root: std::path::PathBuf,
+) -> anyhow::Result<()> {
+    settings.validate_basic()?;
+    catalog::validate(settings.clone()).await?;
+    tokio::task::spawn_blocking(move || SourceStore::new(&settings, &cache_root).map(|_| ()))
+        .await
+        .map_err(|error| anyhow::anyhow!("settings validation worker stopped: {error}"))??;
+    Ok(())
+}
+
+async fn render_form_error(
+    state: &Arc<AppState>,
+    mut form: SettingsForm,
+    status: StatusCode,
+    error: &str,
+) -> Response {
+    let generation = state.settings.snapshot().await.generation;
+    form.generation = generation.to_string();
+    form.csrf_token = state.csrf_token().to_owned();
+    render_settings(state, generation, form, Some(error.to_owned()), status).await
+}
+
+async fn render_settings(
+    state: &Arc<AppState>,
+    generation: u64,
+    form: SettingsForm,
+    error: Option<String>,
+    status: StatusCode,
+) -> Response {
+    let last_request = match state.last_image_request().await {
         Some(request) => format!(
-            "<dl><dt>Last image request</dt><dd>{}</dd><dt>Client IP</dt><dd>{}</dd><dt>Response</dt><dd>{} {}</dd></dl>",
+            "{} from {} — {} {}",
             request
                 .requested_at
                 .to_rfc3339_opts(SecondsFormat::Secs, true),
@@ -52,12 +202,148 @@ async fn settings(State(state): State<Arc<AppState>>) -> Html<String> {
                 .canonical_reason()
                 .unwrap_or("Unknown")
         ),
-        None => "<p>No image request has occurred since the server started.</p>".to_owned(),
+        None => "No image GET has occurred since the server started.".to_owned(),
     };
+    let selector_status = format_selector_status(&state.selector_status().await);
+    let template = SettingsTemplate {
+        generation,
+        csrf_token: state.csrf_token().to_owned(),
+        database_path: form.database_path,
+        query: form.query,
+        path_mappings: form.path_mappings,
+        mode_first: form.selection_mode == "first",
+        mode_daily_random: form.selection_mode == "daily_random",
+        random_seed: form.random_seed,
+        timezone: form.timezone,
+        rollover_time: form.rollover_time,
+        max_candidates: form.max_candidates,
+        cache_ready: state.cache.is_ready(),
+        last_request,
+        selector_status,
+        error,
+    };
+    match template.render() {
+        Ok(html) => (status, Html(html)).into_response(),
+        Err(error) => {
+            tracing::error!(%error, "failed to render settings page");
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "failed to render settings page\n",
+            )
+                .into_response()
+        }
+    }
+}
 
-    Html(format!(
-        "<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width, initial-scale=1\"><title>Paper frame settings</title></head><body><main><h1>Paper frame server</h1><p>Hello, world!</p><p>Settings generation: {settings_generation}</p><h2>Status</h2>{status}</main></body></html>"
-    ))
+fn format_selector_status(status: &crate::state::SelectorStatus) -> String {
+    let mut parts = Vec::new();
+    if status.running {
+        parts.push("Selection is running.".to_owned());
+    }
+    if let Some(success) = &status.last_success {
+        parts.push(format!(
+            "Last success: {} — image ID {}, selection date {}, {} bytes, cache {}.",
+            success
+                .completed_at
+                .to_rfc3339_opts(SecondsFormat::Secs, true),
+            success.result.image_id,
+            success.result.selection_date,
+            success.result.content_length,
+            if success.result.cache_changed {
+                "updated"
+            } else {
+                "unchanged"
+            }
+        ));
+    }
+    if let Some(error) = &status.last_error {
+        parts.push(format!("Last error: {error}"));
+    }
+    if let Some(next) = status.next_attempt {
+        parts.push(format!(
+            "Next attempt: {}.",
+            next.to_rfc3339_opts(SecondsFormat::Secs, true)
+        ));
+    }
+    if parts.is_empty() {
+        "No selection has completed since the server started.".to_owned()
+    } else {
+        parts.join("\n")
+    }
+}
+
+impl SettingsForm {
+    fn from_settings(generation: u64, csrf_token: &str, settings: &Settings) -> Self {
+        let path_mappings = settings
+            .path_mappings
+            .iter()
+            .map(|mapping| {
+                format!(
+                    "{} => {}",
+                    mapping.database_root.display(),
+                    mapping.mounted_root.display()
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        Self {
+            generation: generation.to_string(),
+            csrf_token: csrf_token.to_owned(),
+            database_path: settings.database_path.display().to_string(),
+            query: settings.query.clone(),
+            path_mappings,
+            selection_mode: match settings.selection.mode {
+                SelectionMode::First => "first",
+                SelectionMode::DailyRandom => "daily_random",
+            }
+            .to_owned(),
+            random_seed: settings.selection.random_seed.clone(),
+            timezone: settings.selection.timezone.clone(),
+            rollover_time: settings.selection.rollover_time.clone(),
+            max_candidates: settings.max_candidates.to_string(),
+        }
+    }
+
+    fn to_settings(&self) -> Result<Settings, String> {
+        let mode = match self.selection_mode.as_str() {
+            "first" => SelectionMode::First,
+            "daily_random" => SelectionMode::DailyRandom,
+            _ => return Err("Selection mode must be first or daily_random".into()),
+        };
+        let max_candidates = self
+            .max_candidates
+            .parse::<usize>()
+            .map_err(|_| "Maximum candidates must be an integer".to_owned())?;
+        let path_mappings = parse_path_mappings(&self.path_mappings)?;
+        Ok(Settings {
+            database_path: self.database_path.trim().into(),
+            query: self.query.clone(),
+            path_mappings,
+            selection: SelectionSettings {
+                mode,
+                random_seed: self.random_seed.clone(),
+                timezone: self.timezone.trim().to_owned(),
+                rollover_time: self.rollover_time.trim().to_owned(),
+            },
+            max_candidates,
+        })
+    }
+}
+
+fn parse_path_mappings(input: &str) -> Result<Vec<PathMapping>, String> {
+    input
+        .lines()
+        .filter(|line| !line.trim().is_empty())
+        .map(|line| {
+            let (database_root, mounted_root) = line.split_once("=>").ok_or_else(|| {
+                "Each path mapping must use: database root => mounted root".to_owned()
+            })?;
+            Ok(PathMapping {
+                database_root: database_root.trim().into(),
+                mounted_root: mounted_root.trim().into(),
+            })
+        })
+        .collect()
 }
 
 async fn health_live() -> StatusCode {
@@ -238,7 +524,9 @@ mod tests {
     };
     use chrono::{TimeZone, Utc};
     use http_body_util::BodyExt;
-    use tempfile::tempdir;
+    use rusqlite::Connection;
+    use tempfile::{TempDir, tempdir};
+    use tokio::time::{Duration, timeout};
     use tower::ServiceExt;
 
     use crate::{
@@ -290,6 +578,57 @@ mod tests {
         AppState::new(config, SettingsManager::in_memory(test_settings()), cache)
     }
 
+    fn ui_state() -> (TempDir, Arc<AppState>) {
+        let directory = tempdir().unwrap();
+        let photos = directory.path().join("photos");
+        let cache_dir = directory.path().join("cache");
+        fs::create_dir(&photos).unwrap();
+        fs::create_dir(&cache_dir).unwrap();
+        fs::write(photos.join("one.jpg"), b"\xff\xd8\xffone\xff\xd9").unwrap();
+        let database_path = directory.path().join("digikam.db");
+        Connection::open(&database_path).unwrap();
+        let settings_path = directory.path().join("settings.toml");
+        let settings = Settings {
+            database_path,
+            query: "SELECT 1 AS image_id, '/library' AS root_path, '/' AS album_path, 'one.jpg' AS file_name".into(),
+            path_mappings: vec![PathMapping {
+                database_root: PathBuf::from("/library"),
+                mounted_root: photos,
+            }],
+            selection: SelectionSettings {
+                mode: SelectionMode::First,
+                random_seed: String::new(),
+                timezone: "UTC".into(),
+                rollover_time: "00:00".into(),
+            },
+            max_candidates: 100,
+        };
+        fs::write(&settings_path, toml::to_string_pretty(&settings).unwrap()).unwrap();
+        let config = Config {
+            bind: "127.0.0.1:0".parse().unwrap(),
+            settings_path: settings_path.clone(),
+            cache_dir: cache_dir.clone(),
+        };
+        let state = AppState::new(
+            config,
+            SettingsManager::load(settings_path).unwrap(),
+            CacheStore::new(&cache_dir).unwrap(),
+        );
+        (directory, state)
+    }
+
+    async fn current_form(state: &Arc<AppState>) -> SettingsForm {
+        let snapshot = state.settings.snapshot().await;
+        SettingsForm::from_settings(snapshot.generation, state.csrf_token(), &snapshot.settings)
+    }
+
+    fn post_settings(form: &SettingsForm) -> Request<Body> {
+        Request::post("/settings")
+            .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
+            .body(Body::from(serde_urlencoded::to_string(form).unwrap()))
+            .unwrap()
+    }
+
     fn image_request(method: &str, peer: [u8; 4]) -> axum::http::request::Builder {
         Request::builder()
             .method(method)
@@ -328,8 +667,8 @@ mod tests {
             "text/html; charset=utf-8"
         );
         let body = body_text(response).await;
-        assert!(body.contains("Hello, world!"));
-        assert!(body.contains("No image request has occurred"));
+        assert!(body.contains("Selection settings"));
+        assert!(body.contains("No image GET has occurred"));
     }
 
     #[tokio::test]
@@ -355,6 +694,179 @@ mod tests {
         assert!(body.contains("2026-08-20T22:03:14Z"));
         assert!(body.contains("192.168.20.47"));
         assert!(body.contains("304 Not Modified"));
+        assert!(body.contains("No selection has completed"));
+    }
+
+    #[tokio::test]
+    async fn settings_page_escapes_configured_values() {
+        let directory = tempdir().unwrap();
+        let cache_dir = directory.path().join("cache");
+        fs::create_dir(&cache_dir).unwrap();
+        let mut settings = test_settings();
+        settings.query = "<script>alert('x')</script>".into();
+        let config = Config {
+            bind: "127.0.0.1:0".parse().unwrap(),
+            settings_path: directory.path().join("settings.toml"),
+            cache_dir: cache_dir.clone(),
+        };
+        let state = AppState::new(
+            config,
+            SettingsManager::in_memory(settings),
+            CacheStore::new(&cache_dir).unwrap(),
+        );
+
+        let response = router(state)
+            .oneshot(Request::get("/settings").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        let body = body_text(response).await;
+
+        assert!(body.contains("&#60;script&#62;"));
+        assert!(!body.contains("<script>alert"));
+    }
+
+    #[tokio::test]
+    async fn valid_settings_post_persists_notifies_and_survives_reload() {
+        let (_directory, state) = ui_state();
+        let mut triggers = state.subscribe_to_selection_triggers();
+        let mut form = current_form(&state).await;
+        form.query = "SELECT 2 AS image_id, '/library' AS root_path, '/' AS album_path, 'one.jpg' AS file_name".into();
+        form.selection_mode = "daily_random".into();
+        form.random_seed = "new-seed".into();
+
+        let response = router(state.clone())
+            .oneshot(post_settings(&form))
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::SEE_OTHER);
+        timeout(Duration::from_secs(1), triggers.changed())
+            .await
+            .unwrap()
+            .unwrap();
+        let persisted = Settings::load(&state.config.settings_path).unwrap();
+        assert_eq!(persisted.query, form.query);
+        assert_eq!(persisted.selection.mode, SelectionMode::DailyRandom);
+        assert_eq!(persisted.selection.random_seed, "new-seed");
+        let reloaded = SettingsManager::load(state.config.settings_path.clone()).unwrap();
+        assert_eq!(reloaded.snapshot().await.settings, persisted);
+    }
+
+    #[tokio::test]
+    async fn invalid_csrf_sql_path_and_stale_generation_do_not_change_settings() {
+        let (_directory, state) = ui_state();
+        let original_bytes = fs::read(&state.config.settings_path).unwrap();
+
+        let mut csrf = current_form(&state).await;
+        csrf.csrf_token = "wrong".into();
+        let response = router(state.clone())
+            .oneshot(post_settings(&csrf))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+        assert_eq!(
+            fs::read(&state.config.settings_path).unwrap(),
+            original_bytes
+        );
+
+        let mut mutating = current_form(&state).await;
+        mutating.query = "DELETE FROM Images".into();
+        let response = router(state.clone())
+            .oneshot(post_settings(&mutating))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
+        assert_eq!(
+            fs::read(&state.config.settings_path).unwrap(),
+            original_bytes
+        );
+
+        let mut escaped = current_form(&state).await;
+        escaped.path_mappings = format!("/library => {}", state.cache.root().display());
+        let response = router(state.clone())
+            .oneshot(post_settings(&escaped))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
+        assert_eq!(
+            fs::read(&state.config.settings_path).unwrap(),
+            original_bytes
+        );
+
+        let mut stale = current_form(&state).await;
+        stale.generation = "99".into();
+        let response = router(state.clone())
+            .oneshot(post_settings(&stale))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+        assert_eq!(
+            fs::read(&state.config.settings_path).unwrap(),
+            original_bytes
+        );
+        assert_eq!(state.settings.snapshot().await.generation, 1);
+    }
+
+    #[tokio::test]
+    async fn concurrent_settings_posts_allow_only_one_writer() {
+        let (_directory, state) = ui_state();
+        let mut first = current_form(&state).await;
+        first.random_seed = "first".into();
+        let mut second = first.clone();
+        second.random_seed = "second".into();
+        let app = router(state.clone());
+
+        let (first_response, second_response) = tokio::join!(
+            app.clone().oneshot(post_settings(&first)),
+            app.oneshot(post_settings(&second))
+        );
+        let statuses = [
+            first_response.unwrap().status(),
+            second_response.unwrap().status(),
+        ];
+
+        assert!(statuses.contains(&StatusCode::SEE_OTHER));
+        assert!(statuses.contains(&StatusCode::CONFLICT));
+        assert_eq!(state.settings.snapshot().await.generation, 2);
+    }
+
+    #[tokio::test]
+    async fn oversized_settings_post_is_rejected() {
+        let (_directory, state) = ui_state();
+        let body = format!(
+            "generation=1&csrf_token={}&query={}",
+            state.csrf_token(),
+            "a".repeat(70 * 1024)
+        );
+
+        let response = router(state)
+            .oneshot(
+                Request::post("/settings")
+                    .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
+                    .body(Body::from(body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
+    }
+
+    #[test]
+    fn form_validation_reports_invalid_fields() {
+        let mut form = SettingsForm::from_settings(1, "token", &test_settings());
+        form.selection_mode = "surprise".into();
+        assert!(form.to_settings().unwrap_err().contains("Selection mode"));
+        form.selection_mode = "first".into();
+        form.max_candidates = "not-a-number".into();
+        assert!(
+            form.to_settings()
+                .unwrap_err()
+                .contains("Maximum candidates")
+        );
+        form.max_candidates = "10".into();
+        form.path_mappings = "invalid mapping".into();
+        assert!(form.to_settings().unwrap_err().contains("path mapping"));
     }
 
     #[tokio::test]
