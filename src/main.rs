@@ -16,7 +16,7 @@ use tokio::{net::TcpListener, sync::watch};
 use tracing::{error, info};
 use tracing_subscriber::EnvFilter;
 
-use crate::state::AppState;
+use crate::{source::SourceStore, state::AppState};
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -29,6 +29,9 @@ async fn main() -> Result<()> {
     let config = Config::load(&config_path)?;
     let settings = SettingsManager::load(config.settings_path.clone())?;
     let cache = CacheStore::new(&config.cache_dir)?;
+    let initial_settings = settings.snapshot().await;
+    SourceStore::new(&initial_settings.settings, cache.root())
+        .context("source/cache safety validation failed")?;
     let listener = TcpListener::bind(config.bind)
         .await
         .with_context(|| format!("failed to bind server to {}", config.bind))?;

@@ -139,14 +139,14 @@ Depends on Stages 1–4.
 
 Depends on Stages 1–5.
 
-- [ ] Update the README for local startup, bootstrap versus mutable settings, the query result contract/default DigiKam query, path mappings, selection modes/timing, cache semantics, settings UI, health endpoints, and failure behavior.
-- [ ] Document the source non-modification policy and defence layers, including read-only/no-atime-capable photo mounts, a separate writable cache/settings volume, non-root execution, and the prohibition on links/output paths into the library.
-- [ ] Add a Kubernetes-administrator section describing one replica, one process, ConfigMap-suitable bootstrap config, persistent writable settings/cache, read-only SQLite/photo mounts, probe paths, UID/file permissions, read-only root filesystem, graceful termination, and the absence of auth/TLS.
-- [ ] Document the live SQLite WAL/SHM consistency caveat and recommend a consistent snapshot or safely exposed read-only catalog when DigiKam writes concurrently.
-- [ ] Do not add Kubernetes manifests, charts, or deployment automation.
-- [ ] Audit dependencies and all file-opening/mutation call sites; demonstrate that source/database modules cannot obtain write/create access and cache/settings mutations remain confined to their roots.
-- [ ] Verify formatting, strict linting, the full test suite, and a release build.
-- [ ] Commit the documentation and safety-review stage.
+- [x] Update the README for local startup, bootstrap versus mutable settings, the query result contract/default DigiKam query, path mappings, selection modes/timing, cache semantics, settings UI, health endpoints, and failure behavior.
+- [x] Document the source non-modification policy and defence layers, including read-only/no-atime-capable photo mounts, a separate writable cache/settings volume, non-root execution, and the prohibition on links/output paths into the library.
+- [x] Add a Kubernetes-administrator section describing one replica, one process, ConfigMap-suitable bootstrap config, persistent writable settings/cache, read-only SQLite/photo mounts, probe paths, UID/file permissions, read-only root filesystem, graceful termination, and the absence of auth/TLS.
+- [x] Document the live SQLite WAL/SHM consistency caveat and recommend a consistent snapshot or safely exposed read-only catalog when DigiKam writes concurrently.
+- [x] Do not add Kubernetes manifests, charts, or deployment automation.
+- [x] Audit dependencies and all file-opening/mutation call sites; demonstrate that source/database modules cannot obtain write/create access and cache/settings mutations remain confined to their roots.
+- [x] Verify formatting, strict linting, the full test suite, and a release build.
+- [x] Commit the documentation and safety-review stage.
 
 ### Stage 7 — Final end-to-end validation
 
