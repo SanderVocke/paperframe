@@ -1,5 +1,4 @@
-# Listen on all network interfaces. Restrict access with your LAN firewall.
+# Immutable process/bootstrap configuration.
 bind = "0.0.0.0:8080"
-
-# Relative paths are resolved from the process working directory.
-image_path = "data/current.jpg"
+settings_path = "data/settings.toml"
+cache_dir = "data/cache"

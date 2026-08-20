@@ -1,0 +1,28 @@
+database_path = "/catalog/digikam4.db"
+max_candidates = 50000
+
+# The query must be one read-only SELECT/CTE and return these aliases:
+# image_id, root_path, album_path, file_name.
+query = """
+SELECT
+    Images.id AS image_id,
+    AlbumRoots.specificPath AS root_path,
+    Albums.relativePath AS album_path,
+    Images.name AS file_name
+FROM Images
+JOIN Albums ON Albums.id = Images.album
+JOIN AlbumRoots ON AlbumRoots.id = Albums.albumRoot
+WHERE lower(Images.name) LIKE '%.jpg'
+   OR lower(Images.name) LIKE '%.jpeg'
+ORDER BY Images.id
+"""
+
+[[path_mappings]]
+database_root = "/home/user/Pictures"
+mounted_root = "/photos"
+
+[selection]
+mode = "daily_random"
+random_seed = "living-room"
+timezone = "Europe/Amsterdam"
+rollover_time = "03:00"

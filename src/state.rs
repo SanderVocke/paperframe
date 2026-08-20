@@ -4,7 +4,7 @@ use axum::http::StatusCode;
 use chrono::{DateTime, Utc};
 use tokio::sync::RwLock;
 
-use crate::config::Config;
+use crate::config::{Config, SettingsManager};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ImageRequest {
@@ -15,21 +15,28 @@ pub struct ImageRequest {
 
 pub struct AppState {
     pub config: Config,
+    pub settings: Arc<SettingsManager>,
     last_image_request: RwLock<Option<ImageRequest>>,
 }
 
 impl AppState {
-    pub fn new(config: Config) -> Arc<Self> {
+    pub fn new(config: Config, settings: Arc<SettingsManager>) -> Arc<Self> {
         Arc::new(Self {
             config,
+            settings,
             last_image_request: RwLock::new(None),
         })
     }
 
     #[cfg(test)]
-    pub fn with_last_image_request(config: Config, request: ImageRequest) -> Arc<Self> {
+    pub fn with_last_image_request(
+        config: Config,
+        settings: Arc<SettingsManager>,
+        request: ImageRequest,
+    ) -> Arc<Self> {
         Arc::new(Self {
             config,
+            settings,
             last_image_request: RwLock::new(Some(request)),
         })
     }

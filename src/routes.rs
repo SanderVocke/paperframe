@@ -35,6 +35,7 @@ pub fn router(state: Arc<AppState>) -> Router {
 }
 
 async fn settings(State(state): State<Arc<AppState>>) -> Html<String> {
+    let settings_generation = state.settings.snapshot().await.generation;
     let request = state.last_image_request().await;
     let status = match request {
         Some(request) => format!(
@@ -53,7 +54,7 @@ async fn settings(State(state): State<Arc<AppState>>) -> Html<String> {
     };
 
     Html(format!(
-        "<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width, initial-scale=1\"><title>Paper frame settings</title></head><body><main><h1>Paper frame server</h1><p>Hello, world!</p><h2>Status</h2>{status}</main></body></html>"
+        "<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width, initial-scale=1\"><title>Paper frame settings</title></head><body><main><h1>Paper frame server</h1><p>Hello, world!</p><p>Settings generation: {settings_generation}</p><h2>Status</h2>{status}</main></body></html>"
     ))
 }
 
@@ -80,7 +81,7 @@ async fn head_image(State(state): State<Arc<AppState>>, headers: HeaderMap) -> R
 }
 
 async fn image_response(state: &AppState, headers: &HeaderMap, include_body: bool) -> Response {
-    let mut file = match tokio::fs::File::open(&state.config.image_path).await {
+    let mut file = match tokio::fs::File::open(state.config.current_image_path()).await {
         Ok(file) => file,
         Err(error) if error.kind() == ErrorKind::NotFound => {
             return error_response(StatusCode::NOT_FOUND, include_body, "image not found\n");
@@ -227,7 +228,9 @@ mod tests {
     use tower::ServiceExt;
 
     use crate::{
-        config::Config,
+        config::{
+            Config, PathMapping, SelectionMode, SelectionSettings, Settings, SettingsManager,
+        },
         state::{AppState, ImageRequest},
     };
 
@@ -236,14 +239,40 @@ mod tests {
     const JPEG_BYTES: &[u8] = b"\xff\xd8test-jpeg\xff\xd9";
 
     fn test_config(image_path: impl Into<PathBuf>) -> Config {
+        let image_path = image_path.into();
         Config {
             bind: "127.0.0.1:0".parse().unwrap(),
-            image_path: image_path.into(),
+            settings_path: PathBuf::from("unused-settings.toml"),
+            cache_dir: image_path
+                .parent()
+                .unwrap_or_else(|| Path::new("."))
+                .to_path_buf(),
+        }
+    }
+
+    fn test_settings() -> Settings {
+        Settings {
+            database_path: PathBuf::from("unused.db"),
+            query: "SELECT 1 AS image_id, '/photos' AS root_path, '/' AS album_path, 'one.jpg' AS file_name".into(),
+            path_mappings: vec![PathMapping {
+                database_root: PathBuf::from("/photos"),
+                mounted_root: PathBuf::from("/photos"),
+            }],
+            selection: SelectionSettings {
+                mode: SelectionMode::First,
+                random_seed: String::new(),
+                timezone: "UTC".into(),
+                rollover_time: "00:00".into(),
+            },
+            max_candidates: 100,
         }
     }
 
     fn test_state(image_path: impl Into<PathBuf>) -> Arc<AppState> {
-        AppState::new(test_config(image_path))
+        AppState::new(
+            test_config(image_path),
+            SettingsManager::in_memory(test_settings()),
+        )
     }
 
     fn image_request(method: &str, peer: [u8; 4]) -> axum::http::request::Builder {
@@ -292,6 +321,7 @@ mod tests {
     async fn settings_reports_latest_request() {
         let state = AppState::with_last_image_request(
             test_config("unused.jpg"),
+            SettingsManager::in_memory(test_settings()),
             ImageRequest {
                 requested_at: Utc.with_ymd_and_hms(2026, 8, 20, 22, 3, 14).unwrap(),
                 client_ip: IpAddr::V4(Ipv4Addr::new(192, 168, 20, 47)),
@@ -392,8 +422,11 @@ mod tests {
             client_ip: "192.168.1.8".parse().unwrap(),
             response_status: StatusCode::NOT_MODIFIED,
         };
-        let state =
-            AppState::with_last_image_request(test_config(image_path), original_request.clone());
+        let state = AppState::with_last_image_request(
+            test_config(image_path),
+            SettingsManager::in_memory(test_settings()),
+            original_request.clone(),
+        );
 
         let response = router(state.clone())
             .oneshot(
@@ -439,7 +472,9 @@ mod tests {
     #[tokio::test]
     async fn unreadable_image_returns_500_and_records_request() {
         let directory = tempdir().unwrap();
-        let state = test_state(directory.path());
+        let image_path = directory.path().join("current.jpg");
+        fs::create_dir(&image_path).unwrap();
+        let state = test_state(image_path);
 
         let response = router(state.clone())
             .oneshot(

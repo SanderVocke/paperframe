@@ -1,11 +1,11 @@
-mod config;
+pub mod config;
 mod routes;
 mod state;
 
 use std::{net::SocketAddr, path::PathBuf};
 
 use anyhow::{Context, Result};
-use config::Config;
+use config::{Config, SettingsManager};
 use tokio::net::TcpListener;
 use tracing::{error, info};
 use tracing_subscriber::EnvFilter;
@@ -28,13 +28,22 @@ async fn main() -> Result<()> {
         .local_addr()
         .context("failed to determine server address")?;
 
+    let settings = SettingsManager::load(config.settings_path.clone())?;
+    std::fs::create_dir_all(&config.cache_dir).with_context(|| {
+        format!(
+            "failed to create cache directory {}",
+            config.cache_dir.display()
+        )
+    })?;
+
     info!(
         address = %local_address,
-        image_path = %config.image_path.display(),
+        cache_dir = %config.cache_dir.display(),
+        settings_path = %config.settings_path.display(),
         "paper frame server listening"
     );
 
-    let state = AppState::new(config);
+    let state = AppState::new(config, settings);
     axum::serve(
         listener,
         routes::router(state).into_make_service_with_connect_info::<SocketAddr>(),

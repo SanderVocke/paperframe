@@ -6,13 +6,18 @@ publish = false
 
 [dependencies]
 anyhow = "1.0"
+askama = "0.14"
 axum = "0.8"
 chrono = { version = "0.4", default-features = false, features = ["clock"] }
+chrono-tz = "0.10"
 httpdate = "1.0"
+rusqlite = { version = "0.37", features = ["bundled"] }
 serde = { version = "1.0", features = ["derive"] }
-tokio = { version = "1.0", features = ["fs", "io-util", "macros", "net", "rt-multi-thread", "signal", "sync"] }
+sha2 = "0.10"
+sqlparser = "0.59"
+tokio = { version = "1.0", features = ["fs", "io-util", "macros", "net", "rt-multi-thread", "signal", "sync", "time"] }
 toml = "0.9"
-tower-http = { version = "0.6", features = ["trace"] }
+tower-http = { version = "0.6", features = ["limit", "trace"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
