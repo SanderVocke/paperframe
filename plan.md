@@ -89,13 +89,13 @@ Not included:
 
 Depends on Stage 1.
 
-- [ ] Add a catalog module using SQLite read-only open flags, disabled creation/extension loading, query-only mode, and blocking-work isolation from Tokio.
-- [ ] Define the candidate/result contract (`image_id`, `root_path`, `album_path`, `file_name`) and validate that configured SQL is exactly one read-only `SELECT`/CTE with those aliases.
-- [ ] Enforce the candidate limit and produce concise user-facing validation/runtime errors without exposing unnecessary internals over HTTP.
-- [ ] Build representative temporary DigiKam-schema SQLite fixtures for catalog tests.
-- [ ] Test successful candidate reads, malformed SQL, multiple statements, mutation/DDL/PRAGMA attempts, missing aliases/type errors, limits, unavailable databases, and unchanged database bytes/no journal creation after reads.
-- [ ] Verify formatting, strict linting, and all tests.
-- [ ] Commit the read-only catalog stage.
+- [x] Add a catalog module using SQLite read-only open flags, disabled creation/extension loading, query-only mode, and blocking-work isolation from Tokio.
+- [x] Define the candidate/result contract (`image_id`, `root_path`, `album_path`, `file_name`) and validate that configured SQL is exactly one read-only `SELECT`/CTE with those aliases.
+- [x] Enforce the candidate limit and produce concise user-facing validation/runtime errors without exposing unnecessary internals over HTTP.
+- [x] Build representative temporary DigiKam-schema SQLite fixtures for catalog tests.
+- [x] Test successful candidate reads, malformed SQL, multiple statements, mutation/DDL/PRAGMA attempts, missing aliases/type errors, limits, unavailable databases, and unchanged database bytes/no journal creation after reads.
+- [x] Verify formatting, strict linting, and all tests.
+- [x] Commit the read-only catalog stage.
 
 ### Stage 3 — Source confinement, selection, and cache publication
 

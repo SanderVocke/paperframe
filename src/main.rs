@@ -1,3 +1,4 @@
+pub mod catalog;
 pub mod config;
 mod routes;
 mod state;
