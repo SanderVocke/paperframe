@@ -31,7 +31,7 @@ async fn main() -> Result<()> {
         "paper frame server listening"
     );
 
-    let state = AppState::new();
+    let state = AppState::new(config);
     axum::serve(
         listener,
         routes::router(state).into_make_service_with_connect_info::<SocketAddr>(),

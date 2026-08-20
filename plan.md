@@ -82,14 +82,14 @@ Depends on Stage 1.
 
 Depends on Stages 1–2.
 
-- [ ] Implement image metadata loading, JPEG byte serving, and `Content-Type`, `Content-Length`, and `Last-Modified` headers.
-- [ ] Implement `If-Modified-Since` comparison and bodyless `304 Not Modified` responses.
-- [ ] Implement explicit `HEAD` behavior with the same applicable headers and no body.
-- [ ] Update last-GET state for every image GET after its response status is known, including `200`, `304`, `404`, and server errors; do not update it for HEAD.
-- [ ] Map a missing image to `404` and other file/metadata failures to controlled server errors, with diagnostic logs and no panic.
-- [ ] Add tests using temporary image files and injected peer addresses for successful bytes/headers, conditional GET, state updates, HEAD, missing files, and route isolation.
-- [ ] Verify formatting, linting, and all tests.
-- [ ] Commit the image-serving/cache stage.
+- [x] Implement image metadata loading, JPEG byte serving, and `Content-Type`, `Content-Length`, and `Last-Modified` headers.
+- [x] Implement `If-Modified-Since` comparison and bodyless `304 Not Modified` responses.
+- [x] Implement explicit `HEAD` behavior with the same applicable headers and no body.
+- [x] Update last-GET state for every image GET after its response status is known, including `200`, `304`, `404`, and server errors; do not update it for HEAD.
+- [x] Map a missing image to `404` and other file/metadata failures to controlled server errors, with diagnostic logs and no panic.
+- [x] Add tests using temporary image files and injected peer addresses for successful bytes/headers, conditional GET, state updates, HEAD, missing files, and route isolation.
+- [x] Verify formatting, linting, and all tests.
+- [x] Commit the image-serving/cache stage.
 
 ### Stage 4 — Operations documentation and robustness pass
 
