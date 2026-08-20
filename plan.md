@@ -152,17 +152,17 @@ Depends on Stages 1–5.
 
 Depends on all previous stages.
 
-- [ ] From a clean checkout, create a temporary representative DigiKam SQLite catalog, read-only photo tree, writable settings/cache directories, and documented bootstrap/settings files.
-- [ ] Record source image and database hashes/metadata, start the one-process release binary, and verify liveness plus initial not-ready/no-cache behavior.
-- [ ] Verify startup selection creates an independent cached JPEG, readiness becomes successful, and source/database hashes and relevant metadata remain unchanged.
-- [ ] Verify normal GET/HEAD, exact cached bytes, direct-peer status, `Last-Modified`, conditional `304`, and settings-page runtime status.
-- [ ] Change the SQL query and randomization settings through the web form; verify atomic on-disk persistence, immediate reselection, deterministic behavior, and survival across restart.
-- [ ] Submit invalid/mutating SQL, stale generation, invalid CSRF, traversal/path-escape settings, and an oversized body; verify rejection without disk/live-setting changes or source/database mutation.
-- [ ] Simulate database/source/copy failures and verify the old cache remains served, readiness/status are accurate, and retry does not busy-loop.
-- [ ] Inspect the cache artifact to prove it is neither a hard link nor symlink to a source and that all temporary files are confined/cleaned.
-- [ ] Send SIGTERM during normal operation and during selection; verify graceful process exit and intact settings/cache/source/database files.
-- [ ] Run `cargo fmt --check`, `cargo clippy --all-targets --all-features -- -D warnings`, the full test suite, and `cargo build --release`; record exact commands/results in the implementation summary.
-- [ ] Commit any final validated fixes as a meaningful milestone and leave the working tree clean.
+- [x] From a clean checkout, create a temporary representative DigiKam SQLite catalog, read-only photo tree, writable settings/cache directories, and documented bootstrap/settings files.
+- [x] Record source image and database hashes/metadata, start the one-process release binary, and verify liveness plus initial not-ready/no-cache behavior.
+- [x] Verify startup selection creates an independent cached JPEG, readiness becomes successful, and source/database hashes and relevant metadata remain unchanged.
+- [x] Verify normal GET/HEAD, exact cached bytes, direct-peer status, `Last-Modified`, conditional `304`, and settings-page runtime status.
+- [x] Change the SQL query and randomization settings through the web form; verify atomic on-disk persistence, immediate reselection, deterministic behavior, and survival across restart.
+- [x] Submit invalid/mutating SQL, stale generation, invalid CSRF, traversal/path-escape settings, and an oversized body; verify rejection without disk/live-setting changes or source/database mutation.
+- [x] Simulate database/source/copy failures and verify the old cache remains served, readiness/status are accurate, and retry does not busy-loop.
+- [x] Inspect the cache artifact to prove it is neither a hard link nor symlink to a source and that all temporary files are confined/cleaned.
+- [x] Send SIGTERM during normal operation and during selection; verify graceful process exit and intact settings/cache/source/database files.
+- [x] Run `cargo fmt --check`, `cargo clippy --all-targets --all-features -- -D warnings`, the full test suite, and `cargo build --release`; record exact commands/results in the implementation summary.
+- [x] Commit any final validated fixes as a meaningful milestone and leave the working tree clean.
 
 ## Execution contract
 
