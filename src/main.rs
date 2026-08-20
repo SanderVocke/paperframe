@@ -7,7 +7,7 @@ use std::{net::SocketAddr, path::PathBuf};
 use anyhow::{Context, Result};
 use config::Config;
 use tokio::net::TcpListener;
-use tracing::info;
+use tracing::{error, info};
 use tracing_subscriber::EnvFilter;
 
 use crate::state::AppState;
@@ -24,9 +24,12 @@ async fn main() -> Result<()> {
     let listener = TcpListener::bind(config.bind)
         .await
         .with_context(|| format!("failed to bind server to {}", config.bind))?;
+    let local_address = listener
+        .local_addr()
+        .context("failed to determine server address")?;
 
     info!(
-        address = %config.bind,
+        address = %local_address,
         image_path = %config.image_path.display(),
         "paper frame server listening"
     );
@@ -36,6 +39,7 @@ async fn main() -> Result<()> {
         listener,
         routes::router(state).into_make_service_with_connect_info::<SocketAddr>(),
     )
+    .with_graceful_shutdown(shutdown_signal())
     .await
     .context("HTTP server failed")?;
 
@@ -45,4 +49,31 @@ async fn main() -> Result<()> {
 fn init_tracing() {
     let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
     tracing_subscriber::fmt().with_env_filter(filter).init();
+}
+
+async fn shutdown_signal() {
+    if let Err(error) = wait_for_shutdown_signal().await {
+        error!(%error, "failed to listen for a shutdown signal");
+    }
+    info!("shutting down");
+}
+
+#[cfg(unix)]
+async fn wait_for_shutdown_signal() -> Result<()> {
+    use tokio::signal::unix::{SignalKind, signal};
+
+    let mut terminate =
+        signal(SignalKind::terminate()).context("failed to register SIGTERM handler")?;
+    tokio::select! {
+        result = tokio::signal::ctrl_c() => result.context("failed to listen for Ctrl-C")?,
+        _ = terminate.recv() => {}
+    }
+    Ok(())
+}
+
+#[cfg(not(unix))]
+async fn wait_for_shutdown_signal() -> Result<()> {
+    tokio::signal::ctrl_c()
+        .await
+        .context("failed to listen for Ctrl-C")
 }

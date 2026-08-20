@@ -15,7 +15,8 @@ use axum::{
 };
 use chrono::{SecondsFormat, Utc};
 use tokio::io::AsyncReadExt;
-use tower_http::trace::TraceLayer;
+use tower_http::trace::{DefaultMakeSpan, DefaultOnFailure, DefaultOnResponse, TraceLayer};
+use tracing::Level;
 use tracing::{error, info};
 
 use crate::state::{AppState, ImageRequest};
@@ -24,7 +25,12 @@ pub fn router(state: Arc<AppState>) -> Router {
     Router::new()
         .route("/settings", get(settings))
         .route("/frame/current.jpg", get(get_image).head(head_image))
-        .layer(TraceLayer::new_for_http())
+        .layer(
+            TraceLayer::new_for_http()
+                .make_span_with(DefaultMakeSpan::new().level(Level::INFO))
+                .on_response(DefaultOnResponse::new().level(Level::INFO))
+                .on_failure(DefaultOnFailure::new().level(Level::ERROR)),
+        )
         .with_state(state)
 }
 
@@ -131,7 +137,7 @@ async fn image_response(state: &AppState, headers: &HeaderMap, include_body: boo
         );
     }
 
-    let mut bytes = Vec::with_capacity(metadata.len().try_into().unwrap_or(0));
+    let mut bytes = Vec::new();
     if let Err(error) = file.read_to_end(&mut bytes).await {
         error!(error = %error, "failed to read configured image");
         return error_response(

@@ -95,12 +95,12 @@ Depends on Stages 1–2.
 
 Depends on Stages 1–3.
 
-- [ ] Add graceful shutdown for normal termination signals and concise startup/request logging.
-- [ ] Write a README covering prerequisites, configuration, startup, frame URL, `curl` examples, atomic image replacement guidance, cache behavior, and interpretation of last-request state.
-- [ ] Clearly document that state is in-memory, peer identity assumes a direct LAN connection, there is no authentication/TLS, and a successful GET does not prove panel refresh.
-- [ ] Review dependencies and code paths for unnecessary complexity, panics, lock misuse, accidental forwarding-header trust, and leaking filesystem details in HTTP errors.
-- [ ] Verify a release build in addition to formatting, linting, and tests.
-- [ ] Commit the documentation/robustness stage.
+- [x] Add graceful shutdown for normal termination signals and concise startup/request logging.
+- [x] Write a README covering prerequisites, configuration, startup, frame URL, `curl` examples, atomic image replacement guidance, cache behavior, and interpretation of last-request state.
+- [x] Clearly document that state is in-memory, peer identity assumes a direct LAN connection, there is no authentication/TLS, and a successful GET does not prove panel refresh.
+- [x] Review dependencies and code paths for unnecessary complexity, panics, lock misuse, accidental forwarding-header trust, and leaking filesystem details in HTTP errors.
+- [x] Verify a release build in addition to formatting, linting, and tests.
+- [x] Commit the documentation/robustness stage.
 
 ### Stage 5 — Final end-to-end validation
 
