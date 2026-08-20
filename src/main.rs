@@ -1,6 +1,9 @@
+pub mod cache;
 pub mod catalog;
 pub mod config;
 mod routes;
+pub mod selection;
+pub mod source;
 mod state;
 
 use std::{net::SocketAddr, path::PathBuf};

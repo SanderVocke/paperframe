@@ -101,14 +101,14 @@ Depends on Stage 1.
 
 Depends on Stages 1–2.
 
-- [ ] Implement path mapping/normalization and canonical containment checks, including defined handling of DigiKam leading separators and rejection of traversal, unmapped roots, missing files, and symlink escapes.
-- [ ] Introduce separate read-only source and writable cache modules; validate at startup/settings update that canonical cache storage is outside every mounted source root.
-- [ ] Implement `first` and deterministic `daily_random` candidate ranking, including timezone/rollover-derived selection dates and deterministic tie-breaking.
-- [ ] Implement bounded fallback through ranked candidates when a candidate is missing, outside policy, unreadable, or not a JPEG.
-- [ ] Implement streaming copy/digest/JPEG validation into a unique cache temporary file, sync and atomic `current.jpg` publication, same-digest no-op behavior, and temporary-file cleanup.
-- [ ] Test selection stability/variation/order, DST and rollover boundaries, path attacks, symlinks, source read-only opening, source byte/mtime preservation, no links, partial-copy failure retention, atomic replacement, and unchanged-digest mtime preservation.
-- [ ] Verify formatting, strict linting, and all tests.
-- [ ] Commit the selection/source/cache stage.
+- [x] Implement path mapping/normalization and canonical containment checks, including defined handling of DigiKam leading separators and rejection of traversal, unmapped roots, missing files, and symlink escapes.
+- [x] Introduce separate read-only source and writable cache modules; validate at startup/settings update that canonical cache storage is outside every mounted source root.
+- [x] Implement `first` and deterministic `daily_random` candidate ranking, including timezone/rollover-derived selection dates and deterministic tie-breaking.
+- [x] Implement bounded fallback through ranked candidates when a candidate is missing, outside policy, unreadable, or not a JPEG.
+- [x] Implement streaming copy/digest/JPEG validation into a unique cache temporary file, sync and atomic `current.jpg` publication, same-digest no-op behavior, and temporary-file cleanup.
+- [x] Test selection stability/variation/order, DST and rollover boundaries, path attacks, symlinks, source read-only opening, source byte/mtime preservation, no links, partial-copy failure retention, atomic replacement, and unchanged-digest mtime preservation.
+- [x] Verify formatting, strict linting, and all tests.
+- [x] Commit the selection/source/cache stage.
 
 ### Stage 4 — Scheduler, runtime state, cached image serving, and health
 
