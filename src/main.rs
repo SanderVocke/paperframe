@@ -2,6 +2,7 @@ pub mod cache;
 pub mod catalog;
 pub mod config;
 mod routes;
+pub mod scheduler;
 pub mod selection;
 pub mod source;
 mod state;
@@ -9,8 +10,9 @@ mod state;
 use std::{net::SocketAddr, path::PathBuf};
 
 use anyhow::{Context, Result};
+use cache::CacheStore;
 use config::{Config, SettingsManager};
-use tokio::net::TcpListener;
+use tokio::{net::TcpListener, sync::watch};
 use tracing::{error, info};
 use tracing_subscriber::EnvFilter;
 
@@ -25,20 +27,14 @@ async fn main() -> Result<()> {
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from("config.toml"));
     let config = Config::load(&config_path)?;
+    let settings = SettingsManager::load(config.settings_path.clone())?;
+    let cache = CacheStore::new(&config.cache_dir)?;
     let listener = TcpListener::bind(config.bind)
         .await
         .with_context(|| format!("failed to bind server to {}", config.bind))?;
     let local_address = listener
         .local_addr()
         .context("failed to determine server address")?;
-
-    let settings = SettingsManager::load(config.settings_path.clone())?;
-    std::fs::create_dir_all(&config.cache_dir).with_context(|| {
-        format!(
-            "failed to create cache directory {}",
-            config.cache_dir.display()
-        )
-    })?;
 
     info!(
         address = %local_address,
@@ -47,15 +43,23 @@ async fn main() -> Result<()> {
         "paper frame server listening"
     );
 
-    let state = AppState::new(config, settings);
-    axum::serve(
+    let state = AppState::new(config, settings, cache);
+    let (shutdown_tx, shutdown_rx) = watch::channel(false);
+    let scheduler_task = tokio::spawn(scheduler::run(state.clone(), shutdown_rx.clone()));
+    let signal_task = tokio::spawn(signal_shutdown(shutdown_tx.clone()));
+
+    let server_result = axum::serve(
         listener,
         routes::router(state).into_make_service_with_connect_info::<SocketAddr>(),
     )
-    .with_graceful_shutdown(shutdown_signal())
+    .with_graceful_shutdown(shutdown_requested(shutdown_rx))
     .await
-    .context("HTTP server failed")?;
+    .context("HTTP server failed");
 
+    let _ = shutdown_tx.send(true);
+    scheduler_task.await.context("scheduler task failed")?;
+    signal_task.abort();
+    server_result?;
     Ok(())
 }
 
@@ -64,11 +68,20 @@ fn init_tracing() {
     tracing_subscriber::fmt().with_env_filter(filter).init();
 }
 
-async fn shutdown_signal() {
+async fn signal_shutdown(shutdown: watch::Sender<bool>) {
     if let Err(error) = wait_for_shutdown_signal().await {
         error!(%error, "failed to listen for a shutdown signal");
     }
     info!("shutting down");
+    let _ = shutdown.send(true);
+}
+
+async fn shutdown_requested(mut shutdown: watch::Receiver<bool>) {
+    while !*shutdown.borrow() {
+        if shutdown.changed().await.is_err() {
+            return;
+        }
+    }
 }
 
 #[cfg(unix)]

@@ -35,12 +35,16 @@ impl CacheStore {
         Ok(Self { root })
     }
 
+    pub fn root(&self) -> &Path {
+        &self.root
+    }
+
     pub fn current_path(&self) -> PathBuf {
         self.root.join("current.jpg")
     }
 
     pub fn is_ready(&self) -> bool {
-        self.current_path().is_file()
+        File::open(self.current_path()).is_ok()
     }
 
     pub fn publish(&self, source: &mut ReadOnlySource) -> Result<Publication> {

@@ -25,6 +25,8 @@ pub fn router(state: Arc<AppState>) -> Router {
     Router::new()
         .route("/settings", get(settings))
         .route("/frame/current.jpg", get(get_image).head(head_image))
+        .route("/health/live", get(health_live))
+        .route("/health/ready", get(health_ready))
         .layer(
             TraceLayer::new_for_http()
                 .make_span_with(DefaultMakeSpan::new().level(Level::INFO))
@@ -58,6 +60,18 @@ async fn settings(State(state): State<Arc<AppState>>) -> Html<String> {
     ))
 }
 
+async fn health_live() -> StatusCode {
+    StatusCode::OK
+}
+
+async fn health_ready(State(state): State<Arc<AppState>>) -> StatusCode {
+    if state.cache.is_ready() {
+        StatusCode::OK
+    } else {
+        StatusCode::SERVICE_UNAVAILABLE
+    }
+}
+
 async fn get_image(
     State(state): State<Arc<AppState>>,
     ConnectInfo(peer): ConnectInfo<SocketAddr>,
@@ -81,7 +95,7 @@ async fn head_image(State(state): State<Arc<AppState>>, headers: HeaderMap) -> R
 }
 
 async fn image_response(state: &AppState, headers: &HeaderMap, include_body: bool) -> Response {
-    let mut file = match tokio::fs::File::open(state.config.current_image_path()).await {
+    let mut file = match tokio::fs::File::open(state.cache.current_path()).await {
         Ok(file) => file,
         Err(error) if error.kind() == ErrorKind::NotFound => {
             return error_response(StatusCode::NOT_FOUND, include_body, "image not found\n");
@@ -228,6 +242,7 @@ mod tests {
     use tower::ServiceExt;
 
     use crate::{
+        cache::CacheStore,
         config::{
             Config, PathMapping, SelectionMode, SelectionSettings, Settings, SettingsManager,
         },
@@ -245,6 +260,7 @@ mod tests {
             settings_path: PathBuf::from("unused-settings.toml"),
             cache_dir: image_path
                 .parent()
+                .filter(|parent| !parent.as_os_str().is_empty())
                 .unwrap_or_else(|| Path::new("."))
                 .to_path_buf(),
         }
@@ -269,10 +285,9 @@ mod tests {
     }
 
     fn test_state(image_path: impl Into<PathBuf>) -> Arc<AppState> {
-        AppState::new(
-            test_config(image_path),
-            SettingsManager::in_memory(test_settings()),
-        )
+        let config = test_config(image_path);
+        let cache = CacheStore::new(&config.cache_dir).unwrap();
+        AppState::new(config, SettingsManager::in_memory(test_settings()), cache)
     }
 
     fn image_request(method: &str, peer: [u8; 4]) -> axum::http::request::Builder {
@@ -319,9 +334,11 @@ mod tests {
 
     #[tokio::test]
     async fn settings_reports_latest_request() {
+        let config = test_config("unused.jpg");
         let state = AppState::with_last_image_request(
-            test_config("unused.jpg"),
+            config.clone(),
             SettingsManager::in_memory(test_settings()),
+            CacheStore::new(&config.cache_dir).unwrap(),
             ImageRequest {
                 requested_at: Utc.with_ymd_and_hms(2026, 8, 20, 22, 3, 14).unwrap(),
                 client_ip: IpAddr::V4(Ipv4Addr::new(192, 168, 20, 47)),
@@ -422,9 +439,11 @@ mod tests {
             client_ip: "192.168.1.8".parse().unwrap(),
             response_status: StatusCode::NOT_MODIFIED,
         };
+        let config = test_config(image_path);
         let state = AppState::with_last_image_request(
-            test_config(image_path),
+            config.clone(),
             SettingsManager::in_memory(test_settings()),
+            CacheStore::new(&config.cache_dir).unwrap(),
             original_request.clone(),
         );
 
@@ -490,6 +509,34 @@ mod tests {
             state.last_image_request().await.unwrap().response_status,
             StatusCode::INTERNAL_SERVER_ERROR
         );
+    }
+
+    #[tokio::test]
+    async fn health_reports_liveness_and_cache_readiness() {
+        let directory = tempdir().unwrap();
+        let image_path = directory.path().join("current.jpg");
+        let state = test_state(&image_path);
+        let app = router(state);
+
+        let live = app
+            .clone()
+            .oneshot(Request::get("/health/live").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        let not_ready = app
+            .clone()
+            .oneshot(Request::get("/health/ready").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        write_image(&image_path);
+        let ready = app
+            .oneshot(Request::get("/health/ready").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+
+        assert_eq!(live.status(), StatusCode::OK);
+        assert_eq!(not_ready.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(ready.status(), StatusCode::OK);
     }
 
     #[tokio::test]

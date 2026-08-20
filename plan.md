@@ -114,14 +114,14 @@ Depends on Stages 1–2.
 
 Depends on Stages 1–3.
 
-- [ ] Extend application state with ephemeral selector status, active settings generation, last frame request, and cache readiness while keeping locks out of database/file I/O.
-- [ ] Add a single-flight background selector that runs on startup, recalculates the next configured rollover, responds to settings-change notifications, and retries failures with bounded backoff.
-- [ ] Preserve and report an old cache when reselection fails; make startup usable with an existing cache even when DigiKam is temporarily unavailable.
-- [ ] Change the frame handlers to serve only `<cache_dir>/current.jpg` while preserving byte, HEAD, conditional GET, direct-peer, and status-recording behavior.
-- [ ] Add `/health/live` and `/health/ready` with the specified status semantics.
-- [ ] Test startup/settings/rollover triggers with an injected clock, single-flight behavior, failure retention/retry, shutdown cancellation, cache readiness transitions, health responses, and regression coverage for the frame endpoint.
-- [ ] Verify formatting, strict linting, and all tests.
-- [ ] Commit the scheduler/runtime/health stage.
+- [x] Extend application state with ephemeral selector status, active settings generation, last frame request, and cache readiness while keeping locks out of database/file I/O.
+- [x] Add a single-flight background selector that runs on startup, recalculates the next configured rollover, responds to settings-change notifications, and retries failures with bounded backoff.
+- [x] Preserve and report an old cache when reselection fails; make startup usable with an existing cache even when DigiKam is temporarily unavailable.
+- [x] Change the frame handlers to serve only `<cache_dir>/current.jpg` while preserving byte, HEAD, conditional GET, direct-peer, and status-recording behavior.
+- [x] Add `/health/live` and `/health/ready` with the specified status semantics.
+- [x] Test startup/settings/rollover triggers with an injected clock, single-flight behavior, failure retention/retry, shutdown cancellation, cache readiness transitions, health responses, and regression coverage for the frame endpoint.
+- [x] Verify formatting, strict linting, and all tests.
+- [x] Commit the scheduler/runtime/health stage.
 
 ### Stage 5 — Editable settings and status web page
 
