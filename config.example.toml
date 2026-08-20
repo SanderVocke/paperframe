@@ -1,0 +1,5 @@
+# Listen on all network interfaces. Restrict access with your LAN firewall.
+bind = "0.0.0.0:8080"
+
+# Relative paths are resolved from the process working directory.
+image_path = "data/current.jpg"

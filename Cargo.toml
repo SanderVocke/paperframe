@@ -1,0 +1,22 @@
+[package]
+name = "paperframe-server"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[dependencies]
+anyhow = "1.0"
+axum = "0.8"
+chrono = { version = "0.4", default-features = false, features = ["clock"] }
+httpdate = "1.0"
+serde = { version = "1.0", features = ["derive"] }
+tokio = { version = "1.0", features = ["fs", "macros", "net", "rt-multi-thread", "signal", "sync"] }
+toml = "0.9"
+tower-http = { version = "0.6", features = ["trace"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+[dev-dependencies]
+http-body-util = "0.1"
+tempfile = "3.0"
+tower = { version = "0.5", features = ["util"] }
