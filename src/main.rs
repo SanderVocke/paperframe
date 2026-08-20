@@ -10,6 +10,8 @@ use tokio::net::TcpListener;
 use tracing::info;
 use tracing_subscriber::EnvFilter;
 
+use crate::state::AppState;
+
 #[tokio::main]
 async fn main() -> Result<()> {
     init_tracing();
@@ -29,9 +31,10 @@ async fn main() -> Result<()> {
         "paper frame server listening"
     );
 
+    let state = AppState::new();
     axum::serve(
         listener,
-        routes::router().into_make_service_with_connect_info::<SocketAddr>(),
+        routes::router(state).into_make_service_with_connect_info::<SocketAddr>(),
     )
     .await
     .context("HTTP server failed")?;

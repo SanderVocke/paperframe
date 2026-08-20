@@ -71,12 +71,12 @@ Not included:
 
 Depends on Stage 1.
 
-- [ ] Define the shared application state and latest-image-request record (UTC timestamp, peer IP, and HTTP status).
-- [ ] Implement `GET /settings` as a small HTML response with a Hello World-level presentation and safe rendering of the current state.
-- [ ] Ensure the no-request state is explicit and concurrent reads/writes do not hold locks across I/O or response construction.
-- [ ] Test the settings page before and after injecting representative request state.
-- [ ] Verify formatting, linting, and all tests.
-- [ ] Commit the shared-state/settings-page stage.
+- [x] Define the shared application state and latest-image-request record (UTC timestamp, peer IP, and HTTP status).
+- [x] Implement `GET /settings` as a small HTML response with a Hello World-level presentation and safe rendering of the current state.
+- [x] Ensure the no-request state is explicit and concurrent reads/writes do not hold locks across I/O or response construction.
+- [x] Test the settings page before and after injecting representative request state.
+- [x] Verify formatting, linting, and all tests.
+- [x] Commit the shared-state/settings-page stage.
 
 ### Stage 3 — Image endpoint and cache semantics
 
