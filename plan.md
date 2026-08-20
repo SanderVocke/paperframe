@@ -106,15 +106,15 @@ Depends on Stages 1–3.
 
 Depends on all previous stages.
 
-- [ ] Start the server from a clean checkout with a temporary valid JPEG and documented configuration.
-- [ ] Verify `/settings` initially reports no image request.
-- [ ] Fetch `/frame/current.jpg` with `curl`; compare the response bytes to the source and inspect required headers.
-- [ ] Verify `/settings` now reports the observed client IP, UTC time, and `200` status.
-- [ ] Repeat the GET with `If-Modified-Since`; verify a bodyless `304` and updated status on `/settings`.
-- [ ] Issue a HEAD request; verify headers/no body and confirm it did not replace the last-GET record.
-- [ ] Replace the JPEG, verify the changed `Last-Modified` behavior and returned bytes, then remove it and verify `404` plus recorded status.
-- [ ] Run `cargo fmt --check`, strict Clippy, the full test suite, and a release build; record the exact commands/results in the implementation summary.
-- [ ] Commit any final validated fixes as a meaningful milestone, leaving the working tree clean.
+- [x] Start the server from a clean checkout with a temporary valid JPEG and documented configuration.
+- [x] Verify `/settings` initially reports no image request.
+- [x] Fetch `/frame/current.jpg` with `curl`; compare the response bytes to the source and inspect required headers.
+- [x] Verify `/settings` now reports the observed client IP, UTC time, and `200` status.
+- [x] Repeat the GET with `If-Modified-Since`; verify a bodyless `304` and updated status on `/settings`.
+- [x] Issue a HEAD request; verify headers/no body and confirm it did not replace the last-GET record.
+- [x] Replace the JPEG, verify the changed `Last-Modified` behavior and returned bytes, then remove it and verify `404` plus recorded status.
+- [x] Run `cargo fmt --check`, strict Clippy, the full test suite, and a release build; record the exact commands/results in the implementation summary.
+- [x] Commit any final validated fixes as a meaningful milestone, leaving the working tree clean.
 
 ## Execution contract
 
