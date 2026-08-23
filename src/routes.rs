@@ -16,7 +16,7 @@ use axum::{
     response::{Html, IntoResponse, Redirect, Response},
     routing::{get, post},
 };
-use chrono::{SecondsFormat, Utc};
+use chrono::Utc;
 use futures_util::Stream;
 use serde::{Deserialize, Serialize};
 use tokio::sync::OwnedMutexGuard;
@@ -37,6 +37,7 @@ const UPLOAD_LIMIT: usize = 101 * 1024 * 1024;
 
 pub fn router(state: Arc<AppState>) -> Router {
     Router::new()
+        .route("/", get(|| async { Redirect::to("/settings") }))
         .route("/settings", get(settings_page).post(update_settings))
         .route("/queue/reorder", post(reorder_queue))
         .route("/queue/remove", post(remove_queue_entry))
@@ -82,6 +83,7 @@ struct SettingsTemplate {
     ready: bool,
     last_request: String,
     refill_status: String,
+    refill_detail: Option<String>,
     supplier_status: String,
     target_length: String,
     max_upload_bytes: String,
@@ -251,54 +253,38 @@ async fn render_settings(
         .last_image_request()
         .await
         .map(|request| {
-            format!(
-                "{} from {} — {}",
-                request
-                    .requested_at
-                    .to_rfc3339_opts(SecondsFormat::Secs, true),
-                request.client_ip,
-                request.response_status
-            )
+            request
+                .requested_at
+                .format("%b %-d at %H:%M UTC")
+                .to_string()
         })
-        .unwrap_or_else(|| "No frame GET since startup.".into());
+        .unwrap_or_else(|| "No activity yet".into());
     let refill = state.refill_status().await;
-    let refill_status = if refill.running {
-        "Refill is running.".into()
+    let (refill_status, refill_detail) = if refill.running {
+        ("Finding new photos…".into(), None)
     } else if let Some(error) = refill.last_error {
-        format!("Last refill error: {error}")
+        ("Needs attention".into(), Some(error))
+    } else if refill.last_added == 0 {
+        ("Up to date".into(), None)
     } else {
-        format!("Last refill added {} image(s).", refill.last_added)
+        (format!("Added {} new photo(s)", refill.last_added), None)
     };
     let live = state.settings.snapshot().await.settings;
     let supplier_detail = match &live.supplier().kind {
-        SupplierKind::ManualFolder(settings) => {
-            format!(
-                "manual polling every {} seconds",
-                settings.poll_interval_seconds
-            )
-        }
-        SupplierKind::DigikamSqlite(_) => "DigiKam SQL query order".to_owned(),
+        SupplierKind::ManualFolder(_) => "Photo folder",
+        SupplierKind::DigikamSqlite(_) => "DigiKam",
     };
     let advancement_detail = match &live.advancement {
-        AdvancementSettings::EveryFetch { .. } => {
-            "advance after completed qualifying fetch".to_owned()
-        }
-        AdvancementSettings::Manual => "manual advancement only".to_owned(),
+        AdvancementSettings::EveryFetch { .. } => "Changes when requested".to_owned(),
+        AdvancementSettings::Manual => "Manual controls".to_owned(),
         AdvancementSettings::Scheduled { timezone, times } => {
             match crate::scheduler::next_scheduled(timezone, times, Utc::now()) {
-                Ok(next) => format!(
-                    "next scheduled advance {}",
-                    next.to_rfc3339_opts(SecondsFormat::Secs, true)
-                ),
-                Err(error) => format!("invalid next schedule: {error}"),
+                Ok(next) => format!("Next at {}", next.format("%H:%M")),
+                Err(_) => "Schedule needs attention".to_owned(),
             }
         }
     };
-    let supplier_status = format!(
-        "Configured supplier: {} ({supplier_detail}); {advancement_detail}. Queue contains {} image(s).",
-        live.supplier().id,
-        queue.entries.len()
-    );
+    let supplier_status = format!("{supplier_detail} · {advancement_detail}");
     let template = SettingsTemplate {
         generation,
         queue_generation: queue.generation,
@@ -308,6 +294,7 @@ async fn render_settings(
         ready: !queue.entries.is_empty(),
         last_request,
         refill_status,
+        refill_detail,
         supplier_status,
         target_length: form.target_length,
         max_upload_bytes: form.max_upload_bytes,
@@ -341,10 +328,11 @@ async fn render_settings(
 }
 
 fn queue_view(index: usize, entry: &QueueEntry) -> QueueView {
-    let provenance = entry
-        .supplier_id
-        .clone()
-        .unwrap_or_else(|| "web upload".into());
+    let provenance = if entry.supplier_id.is_some() {
+        "photo library".into()
+    } else {
+        "your uploads".into()
+    };
     QueueView {
         id: entry.id.clone(),
         display_name: entry.display_name.clone(),
@@ -985,7 +973,7 @@ mod tests {
             .await
             .unwrap();
         let html = String::from_utf8(bytes(response).await).unwrap();
-        assert!(html.contains("Current and upcoming images"));
+        assert!(html.contains("Your photo queue"));
         assert!(html.contains("a.jpg"));
         assert_eq!(
             fs::read(directory.path().join("source/a.jpg")).unwrap(),
