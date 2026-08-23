@@ -807,7 +807,12 @@ mod tests {
 
     use axum::{body::Body, http::Request};
     use http_body_util::BodyExt;
+    use rusqlite::Connection;
     use tempfile::tempdir;
+    use tokio::{
+        sync::watch,
+        time::{Duration as TokioDuration, timeout},
+    };
     use tower::ServiceExt;
 
     use crate::{cache::CacheStore, config::SettingsManager};
@@ -924,6 +929,23 @@ mod tests {
             bytes(app.oneshot(frame_request("GET")).await.unwrap()).await,
             JPEG_A
         );
+    }
+
+    #[tokio::test]
+    async fn settings_escapes_folder_filenames() {
+        let (directory, state) = folder_state().await;
+        fs::write(directory.path().join("images/<script>.jpg"), JPEG_A).unwrap();
+        if let ActiveMode::Folder(folder) = state.active_mode().await {
+            let generation = folder.snapshot().await.generation;
+            folder.refresh(generation).await.unwrap();
+        }
+        let response = router(state)
+            .oneshot(Request::get("/settings").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        let html = String::from_utf8(bytes(response).await).unwrap();
+        assert!(html.contains("&#60;script&#62;.jpg"));
+        assert!(!html.contains("<script>.jpg"));
     }
 
     #[tokio::test]
@@ -1050,6 +1072,76 @@ mod tests {
             .unwrap();
         assert_eq!(response.status(), StatusCode::FORBIDDEN);
         assert_eq!(folder.snapshot().await.generation, current_generation);
+    }
+
+    #[tokio::test]
+    async fn settings_http_switches_modes_and_triggers_immediate_digikam_selection() {
+        let (directory, state) = folder_state().await;
+        let photos = directory.path().join("photos");
+        fs::create_dir(&photos).unwrap();
+        fs::write(photos.join("selected.jpg"), JPEG_B).unwrap();
+        let database = directory.path().join("digikam.db");
+        Connection::open(&database).unwrap();
+
+        let snapshot = state.settings.snapshot().await;
+        let mut form = SettingsForm::from_settings(
+            snapshot.generation,
+            state.csrf_token(),
+            &snapshot.settings,
+        );
+        form.active_mode = "digikam_sqlite".into();
+        form.database_path = database.display().to_string();
+        form.query = "SELECT 7 AS image_id, '/library' AS root_path, '/' AS album_path, 'selected.jpg' AS file_name".into();
+        form.path_mappings = format!("/library => {}", photos.display());
+        form.selection_mode = "first".into();
+        form.timezone = "UTC".into();
+        form.rollover_time = "00:00".into();
+        form.max_candidates = "10".into();
+
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        let scheduler = tokio::spawn(crate::scheduler::run(state.clone(), shutdown_rx));
+        let response = router(state.clone())
+            .oneshot(
+                Request::post("/settings")
+                    .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
+                    .body(Body::from(serde_urlencoded::to_string(&form).unwrap()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::SEE_OTHER);
+        timeout(TokioDuration::from_secs(1), async {
+            while !state.cache.is_ready() {
+                tokio::time::sleep(TokioDuration::from_millis(2)).await;
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(fs::read(state.cache.current_path()).unwrap(), JPEG_B);
+        assert!(matches!(state.active_mode().await, ActiveMode::Digikam));
+
+        let snapshot = state.settings.snapshot().await;
+        let mut back = SettingsForm::from_settings(
+            snapshot.generation,
+            state.csrf_token(),
+            &snapshot.settings,
+        );
+        back.active_mode = "folder_sequence".into();
+        back.folder_directory = directory.path().join("images").display().to_string();
+        back.max_upload_bytes = "1024".into();
+        let response = router(state.clone())
+            .oneshot(
+                Request::post("/settings")
+                    .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
+                    .body(Body::from(serde_urlencoded::to_string(&back).unwrap()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::SEE_OTHER);
+        assert!(matches!(state.active_mode().await, ActiveMode::Folder(_)));
+        shutdown_tx.send(true).unwrap();
+        scheduler.await.unwrap();
     }
 
     #[tokio::test]

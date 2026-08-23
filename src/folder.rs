@@ -686,6 +686,27 @@ mod tests {
     }
 
     #[test]
+    fn failed_batch_rename_rolls_staged_files_back_without_overwrite() {
+        let directory = tempdir().unwrap();
+        let root = directory.path();
+        fs::write(root.join("a.jpg"), A).unwrap();
+        fs::write(root.join("b.jpg"), B).unwrap();
+        fs::create_dir(root.join("000001--a.jpg")).unwrap();
+        let result = rename_in_order(
+            root,
+            vec![
+                (root.join("a.jpg"), "a.jpg".into()),
+                (root.join("b.jpg"), "b.jpg".into()),
+            ],
+        );
+        assert!(result.is_err());
+        assert_eq!(fs::read(root.join("a.jpg")).unwrap(), A);
+        assert_eq!(fs::read(root.join("b.jpg")).unwrap(), B);
+        assert!(root.join("000001--a.jpg").is_dir());
+        assert_eq!(fs::read_dir(root).unwrap().count(), 3);
+    }
+
+    #[test]
     fn recovers_staged_reorder_and_removes_abandoned_upload() {
         let directory = tempdir().unwrap();
         let root = directory.path();
