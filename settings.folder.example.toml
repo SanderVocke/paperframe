@@ -1,18 +1,28 @@
+# Manual-folder example. Copy this file to the settings_path from config.toml,
+# then replace directory with an existing ABSOLUTE path outside queue_dir.
+
 [queue]
+# Refill up to this length. This is not a maximum; uploads may exceed it.
 target_length = 10
+# Maximum size of one complete upload request (25 MiB here).
 max_upload_bytes = 26214400
 
 [advancement]
+# Options: "manual", "scheduled", or "every_fetch".
 type = "every_fetch"
 
 [advancement.settings]
-# Empty means every direct peer advances. Configure the frame's IP to keep browser GETs non-advancing.
+# Only these direct client IPs advance after a completed frame GET.
+# Empty means every direct client, including browsers, will qualify.
 frame_client_ips = ["192.168.1.50"]
 
+# Exactly one supplier is currently supported. Keep its ID stable so imported
+# history remains associated with the same supplier.
 [[suppliers]]
 id = "primary"
 type = "manual_folder"
 
 [suppliers.settings]
-directory = "/data/source-images"
+# Top-level .jpg/.jpeg files are discovered alphabetically. No recursion.
+directory = "/absolute/path/to/source-images"
 poll_interval_seconds = 60

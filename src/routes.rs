@@ -985,7 +985,7 @@ mod tests {
             .await
             .unwrap();
         let html = String::from_utf8(bytes(response).await).unwrap();
-        assert!(html.contains("Current and upcoming queue"));
+        assert!(html.contains("Current and upcoming images"));
         assert!(html.contains("a.jpg"));
         assert_eq!(
             fs::read(directory.path().join("source/a.jpg")).unwrap(),

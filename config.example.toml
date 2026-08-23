@@ -1,4 +1,5 @@
-# Immutable process/bootstrap configuration.
+# Process settings. Changes require a restart.
+# Relative paths are resolved from the directory where the server is started.
 bind = "0.0.0.0:8080"
 settings_path = "data/settings.toml"
 queue_dir = "data/queue"
