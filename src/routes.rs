@@ -269,9 +269,34 @@ async fn render_settings(
     } else {
         format!("Last refill added {} image(s).", refill.last_added)
     };
+    let live = state.settings.snapshot().await.settings;
+    let supplier_detail = match &live.supplier().kind {
+        SupplierKind::ManualFolder(settings) => {
+            format!(
+                "manual polling every {} seconds",
+                settings.poll_interval_seconds
+            )
+        }
+        SupplierKind::DigikamSqlite(_) => "DigiKam SQL query order".to_owned(),
+    };
+    let advancement_detail = match &live.advancement {
+        AdvancementSettings::EveryFetch { .. } => {
+            "advance after completed qualifying fetch".to_owned()
+        }
+        AdvancementSettings::Manual => "manual advancement only".to_owned(),
+        AdvancementSettings::Scheduled { timezone, times } => {
+            match crate::scheduler::next_scheduled(timezone, times, Utc::now()) {
+                Ok(next) => format!(
+                    "next scheduled advance {}",
+                    next.to_rfc3339_opts(SecondsFormat::Secs, true)
+                ),
+                Err(error) => format!("invalid next schedule: {error}"),
+            }
+        }
+    };
     let supplier_status = format!(
-        "Configured supplier: {}. Queue contains {} image(s).",
-        form.supplier_id,
+        "Configured supplier: {} ({supplier_detail}); {advancement_detail}. Queue contains {} image(s).",
+        live.supplier().id,
         queue.entries.len()
     );
     let template = SettingsTemplate {
@@ -1009,20 +1034,49 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn in_flight_completion_cannot_advance_a_new_current_after_reorder() {
+        let (_directory, state) = manual_state(AdvancementSettings::EveryFetch {
+            frame_client_ips: Vec::new(),
+        })
+        .await;
+        let response = router(state.clone())
+            .oneshot(frame_request("GET", [127, 0, 0, 1]))
+            .await
+            .unwrap();
+        let snapshot = state.queue.snapshot().await;
+        let reversed = snapshot
+            .entries
+            .iter()
+            .rev()
+            .map(|entry| entry.id.clone())
+            .collect();
+        state
+            .queue
+            .reorder(snapshot.generation, reversed)
+            .await
+            .unwrap();
+        assert_eq!(state.queue.current().await.unwrap().unwrap().bytes, C);
+        assert_eq!(bytes(response).await, A);
+        tokio::time::sleep(TokioDuration::from_millis(10)).await;
+        assert_eq!(state.queue.current().await.unwrap().unwrap().bytes, C);
+    }
+
+    #[tokio::test]
     async fn client_allowlist_head_and_manual_policy_do_not_advance_on_fetch() {
         let (_directory, state) = manual_state(AdvancementSettings::EveryFetch {
             frame_client_ips: vec![IpAddr::from([10, 0, 0, 2])],
         })
         .await;
         let app = router(state.clone());
+        let unmatched = Request::builder()
+            .uri("/frame/current.jpg")
+            .header("x-forwarded-for", "10.0.0.2")
+            .header(header::USER_AGENT, "PaperlessPaper-like-browser")
+            .extension(ConnectInfo(SocketAddr::from(([10, 0, 0, 3], 1))))
+            .body(Body::empty())
+            .unwrap();
         assert_eq!(
-            bytes(
-                app.clone()
-                    .oneshot(frame_request("GET", [10, 0, 0, 3]))
-                    .await
-                    .unwrap()
-            )
-            .await,
+            bytes(app.clone().oneshot(unmatched).await.unwrap()).await,
             A
         );
         assert_eq!(
