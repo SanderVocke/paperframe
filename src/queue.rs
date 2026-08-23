@@ -748,6 +748,21 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn descriptor_persistence_failure_keeps_live_queue_unchanged() {
+        let dir = tempdir().unwrap();
+        let queue = QueueStore::new(dir.path(), false).await.unwrap();
+        fs::remove_file(dir.path().join(STATE_FILE)).unwrap();
+        fs::create_dir(dir.path().join(STATE_FILE)).unwrap();
+        let result = queue.enqueue("a".into(), A.to_vec(), None, None).await;
+        assert!(result.is_err());
+        assert!(queue.snapshot().await.entries.is_empty());
+        assert_eq!(
+            fs::read_dir(dir.path().join(OBJECTS_DIR)).unwrap().count(),
+            0
+        );
+    }
+
+    #[tokio::test]
     async fn rejects_stale_reorder_and_recovers_orphans() {
         let dir = tempdir().unwrap();
         let queue = QueueStore::new(dir.path(), false).await.unwrap();

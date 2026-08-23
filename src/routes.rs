@@ -1,4 +1,5 @@
 use std::{
+    future::Future,
     net::{IpAddr, SocketAddr},
     pin::Pin,
     sync::Arc,
@@ -615,30 +616,39 @@ fn completion_response(
     image: PreparedImage,
     permit: OwnedMutexGuard<()>,
 ) -> Response {
-    let length = image.bytes.len();
     let id = image.entry.id;
     let stream = CompletionStream {
-        bytes: Some(Bytes::from(image.bytes)),
+        bytes: Bytes::from(image.bytes),
         completion: Some((queue, id, permit)),
+        delay: None,
     };
-    jpeg_response(
-        StatusCode::OK,
-        Body::from_stream(stream),
-        length,
-        None,
-        Some("no-store"),
-    )
+    Response::builder()
+        .status(StatusCode::OK)
+        .header(header::CONTENT_TYPE, "image/jpeg")
+        .header(header::CACHE_CONTROL, "no-store")
+        .body(Body::from_stream(stream))
+        .unwrap_or_else(|_| Response::new(Body::empty()))
 }
 
 struct CompletionStream {
-    bytes: Option<Bytes>,
+    bytes: Bytes,
     completion: Option<(Arc<crate::queue::QueueStore>, String, OwnedMutexGuard<()>)>,
+    delay: Option<Pin<Box<tokio::time::Sleep>>>,
 }
 impl Stream for CompletionStream {
     type Item = Result<Bytes, std::io::Error>;
-    fn poll_next(mut self: Pin<&mut Self>, _cx: &mut TaskContext<'_>) -> Poll<Option<Self::Item>> {
-        if let Some(bytes) = self.bytes.take() {
-            return Poll::Ready(Some(Ok(bytes)));
+    fn poll_next(mut self: Pin<&mut Self>, cx: &mut TaskContext<'_>) -> Poll<Option<Self::Item>> {
+        if let Some(delay) = self.delay.as_mut() {
+            if delay.as_mut().poll(cx).is_pending() {
+                return Poll::Pending;
+            }
+            self.delay = None;
+        }
+        if !self.bytes.is_empty() {
+            let count = self.bytes.len().min(64 * 1024);
+            let chunk = self.bytes.split_to(count);
+            self.delay = Some(Box::pin(tokio::time::sleep(Duration::from_millis(1))));
+            return Poll::Ready(Some(Ok(chunk)));
         }
         if let Some((queue, id, permit)) = self.completion.take() {
             tokio::spawn(async move {

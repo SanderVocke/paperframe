@@ -80,98 +80,98 @@ Not included:
 
 ### Stage 1 — Decoupled configuration, descriptor schema, and compatibility migration
 
-- [ ] Define canonical common queue settings, tagged advancement settings, and uniquely identified supplier settings, including target default 10, polling interval, schedule validation, frame-client IP allowlist, and one-supplier validation over a collection-shaped model.
-- [ ] Define the versioned descriptor schema for ordered queue entries, immutable object metadata/provenance, and supplier seen/checkpoint state; specify startup schema/version errors and atomic persistence rules.
-- [ ] Implement compatibility parsing/migration for legacy `cache_dir`, current DigiKam settings, and current sequential-folder settings: map DigiKam to SQL-order supply plus its prior rollover as scheduled advancement, map folder to a read-only manual supplier plus `every_fetch`, and preserve a valid DigiKam `current.jpg` as the first migrated queue entry where applicable.
-- [ ] Remove DigiKam `first`/`daily_random` and rollover ownership from canonical supplier settings while retaining compatibility inputs; update example TOML for all supplier/advancement combinations.
-- [ ] Test defaults, invalid mixed/unknown fields, duplicate supplier IDs/times, all compatibility mappings, descriptor serialization/versioning, migration failure retention, and canonical restart reload.
-- [ ] Verify formatting, strict linting, and all tests; commit the configuration/state-migration milestone.
+- [x] Define canonical common queue settings, tagged advancement settings, and uniquely identified supplier settings, including target default 10, polling interval, schedule validation, frame-client IP allowlist, and one-supplier validation over a collection-shaped model.
+- [x] Define the versioned descriptor schema for ordered queue entries, immutable object metadata/provenance, and supplier seen/checkpoint state; specify startup schema/version errors and atomic persistence rules.
+- [x] Implement compatibility parsing/migration for legacy `cache_dir`, current DigiKam settings, and current sequential-folder settings: map DigiKam to SQL-order supply plus its prior rollover as scheduled advancement, map folder to a read-only manual supplier plus `every_fetch`, and preserve a valid DigiKam `current.jpg` as the first migrated queue entry where applicable.
+- [x] Remove DigiKam `first`/`daily_random` and rollover ownership from canonical supplier settings while retaining compatibility inputs; update example TOML for all supplier/advancement combinations.
+- [x] Test defaults, invalid mixed/unknown fields, duplicate supplier IDs/times, all compatibility mappings, descriptor serialization/versioning, migration failure retention, and canonical restart reload.
+- [x] Verify formatting, strict linting, and all tests; commit the configuration/state-migration milestone.
 
 ### Stage 2 — Common durable managed queue
 
 Depends on Stage 1.
 
-- [ ] Introduce a queue module owning the canonical queue root, object/staging layout, descriptor persistence, startup temporary/orphan recovery, and separation validation against every source/settings path.
-- [ ] Implement streamed JPEG enqueue from a read-only reader with digest/length validation, opaque order-independent IDs, immutable provenance, atomic object publication, descriptor commit, and cleanup on every failure edge.
-- [ ] Implement generation-checked snapshot, full reorder, remove-any-entry, direct upload append, conditional advance, one-entry hold, supplier seen-state reset/update, and readiness/current-image preparation.
-- [ ] Emit revisioned queue-change/demand events for all committed mutations and blocked advancement while ensuring persistence precedes live publication/notification.
-- [ ] Retire filename-encoded ordering and supplier-specific queue mutation from `src/folder.rs`/`src/cache.rs`; retain only reusable safe reader/publication primitives that respect the new ownership boundary.
-- [ ] Test current-first semantics, moving/removing current, sole-entry retention/removal, target-overflow uploads, generation conflicts, event reasons/coalescing inputs, digest/object isolation, crash points, descriptor write/delete failures, corrupt/missing/orphan objects, recovery, and source-root separation.
-- [ ] Verify formatting, strict linting, and all tests; commit the durable queue milestone.
+- [x] Introduce a queue module owning the canonical queue root, object/staging layout, descriptor persistence, startup temporary/orphan recovery, and separation validation against every source/settings path.
+- [x] Implement streamed JPEG enqueue from a read-only reader with digest/length validation, opaque order-independent IDs, immutable provenance, atomic object publication, descriptor commit, and cleanup on every failure edge.
+- [x] Implement generation-checked snapshot, full reorder, remove-any-entry, direct upload append, conditional advance, one-entry hold, supplier seen-state reset/update, and readiness/current-image preparation.
+- [x] Emit revisioned queue-change/demand events for all committed mutations and blocked advancement while ensuring persistence precedes live publication/notification.
+- [x] Retire filename-encoded ordering and supplier-specific queue mutation from `src/folder.rs`/`src/cache.rs`; retain only reusable safe reader/publication primitives that respect the new ownership boundary.
+- [x] Test current-first semantics, moving/removing current, sole-entry retention/removal, target-overflow uploads, generation conflicts, event reasons/coalescing inputs, digest/object isolation, crash points, descriptor write/delete failures, corrupt/missing/orphan objects, recovery, and source-root separation.
+- [x] Verify formatting, strict linting, and all tests; commit the durable queue milestone.
 
 ### Stage 3 — Supplier contract and shared refill coordinator
 
 Depends on Stages 1–2.
 
-- [ ] Define a supplier-neutral candidate/open-reader/status contract with stable supplier/candidate identities and implement a registry represented as a collection despite one-active-supplier validation.
-- [ ] Add a single-flight refill coordinator subscribed to queue events and explicit demand signals; coalesce revisions, calculate target deficit from fresh snapshots, append through queue APIs, persist seen identity only after enqueue, and retry failures with bounded delay.
-- [ ] Ensure supplier-generated enqueue events settle without loops and that settings replacement atomically prepares the new supplier/coordinator configuration before activation.
-- [ ] Expose supplier-neutral refresh/reset/status operations for the web layer and leave a clear allocation point for future mixed-supplier ordering/fairness without changing queue APIs.
-- [ ] Test startup/event/blocked-advance/settings triggers, above-target no-op, exact deficit fill, user-upload overflow, enqueue races, event storms, one-run-at-a-time behavior, partial candidate failures, retry/shutdown, seen-state persistence/reset, and a test registry containing multiple fake suppliers.
-- [ ] Verify formatting, strict linting, and all tests; commit the supplier/refill foundation milestone.
+- [x] Define a supplier-neutral candidate/open-reader/status contract with stable supplier/candidate identities and implement a registry represented as a collection despite one-active-supplier validation.
+- [x] Add a single-flight refill coordinator subscribed to queue events and explicit demand signals; coalesce revisions, calculate target deficit from fresh snapshots, append through queue APIs, persist seen identity only after enqueue, and retry failures with bounded delay.
+- [x] Ensure supplier-generated enqueue events settle without loops and that settings replacement atomically prepares the new supplier/coordinator configuration before activation.
+- [x] Expose supplier-neutral refresh/reset/status operations for the web layer and leave a clear allocation point for future mixed-supplier ordering/fairness without changing queue APIs.
+- [x] Test startup/event/blocked-advance/settings triggers, above-target no-op, exact deficit fill, user-upload overflow, enqueue races, event storms, one-run-at-a-time behavior, partial candidate failures, retry/shutdown, seen-state persistence/reset, and a test registry containing multiple fake suppliers.
+- [x] Verify formatting, strict linting, and all tests; commit the supplier/refill foundation milestone.
 
 ### Stage 4 — DigiKam and polling manual-folder suppliers
 
 Depends on Stage 3.
 
-- [ ] Refactor DigiKam catalog/path/source code into a supplier that yields candidates strictly in SQL query order, skips persisted seen identities, opens sources read-only, and has no cache/current/schedule responsibility.
-- [ ] Refactor folder mode into a read-only manual supplier with canonical confinement, alphabetical top-level discovery, regular non-symlink JPEG checks, stable content-version identities, configurable periodic polling, and explicit refresh.
-- [ ] Ensure manual discovery changes only candidate availability: queued copies survive source modification/rename/deletion, modified content is newly eligible, deleted unseen candidates disappear, and neither queue/UI operations nor supplier refresh mutate the source folder.
-- [ ] Integrate both suppliers with common target refill, provenance/status, seen reset, settings validation, and source-specific error reporting.
-- [ ] Test DigiKam read-only enforcement and exact SQL-order fill; manual alphabetical fill, polling and explicit refresh, source add/change/delete behavior, immutable queued bytes, symlink/traversal races, candidate disappearance during copy, target-limited import, removal followed by next-unseen supply, and restart seen-state behavior.
-- [ ] Verify formatting, strict linting, and all tests; commit the concrete suppliers milestone.
+- [x] Refactor DigiKam catalog/path/source code into a supplier that yields candidates strictly in SQL query order, skips persisted seen identities, opens sources read-only, and has no cache/current/schedule responsibility.
+- [x] Refactor folder mode into a read-only manual supplier with canonical confinement, alphabetical top-level discovery, regular non-symlink JPEG checks, stable content-version identities, configurable periodic polling, and explicit refresh.
+- [x] Ensure manual discovery changes only candidate availability: queued copies survive source modification/rename/deletion, modified content is newly eligible, deleted unseen candidates disappear, and neither queue/UI operations nor supplier refresh mutate the source folder.
+- [x] Integrate both suppliers with common target refill, provenance/status, seen reset, settings validation, and source-specific error reporting.
+- [x] Test DigiKam read-only enforcement and exact SQL-order fill; manual alphabetical fill, polling and explicit refresh, source add/change/delete behavior, immutable queued bytes, symlink/traversal races, candidate disappearance during copy, target-limited import, removal followed by next-unseen supply, and restart seen-state behavior.
+- [x] Verify formatting, strict linting, and all tests; commit the concrete suppliers milestone.
 
 ### Stage 5 — Common advancement controller and completion-aware frame serving
 
 Depends on Stages 2–4.
 
-- [ ] Replace the DigiKam scheduler and folder GET cursor with a common advancement controller implementing `every_fetch`, multiple-time `scheduled`, and `manual` policies over queue conditional advance.
-- [ ] Generalize timezone/DST scheduling to sorted unique daily times, no startup replay, settings-change recalculation, bounded retry, single-flight operation, and graceful shutdown.
-- [ ] Implement direct-peer frame-client classification with optional IP allowlist, ignored forwarding/UA headers, empty-list compatibility, and a dedicated non-advancing preview path.
-- [ ] Implement a completion-aware JPEG response body and serialization permit for qualifying `every_fetch` GETs: prepare a stable queue entry, advance by entry ID only after successful EOF, and release without advancement on drop/error.
-- [ ] Keep every-fetch responses bodyful and `no-store`; implement stable conditional GET/HEAD semantics for scheduled/manual policy; retain common direct-peer request status without treating preview/HEAD as frame advancement.
-- [ ] Make readiness depend only on a servable current queue entry and keep the last sole entry serving through blocked advancement and supplier failures.
-- [ ] Test all policy transitions, manual override under every policy, multiple schedule times/DST/reconfiguration, qualifying/unmatched/forwarded/UA clients, `200`/`304`/HEAD/preview, full body versus disconnect, simultaneous qualifying GET serialization, concurrent reorder/remove during transfer, one-entry demand, readiness, and shutdown with in-flight bodies.
-- [ ] Verify formatting, strict linting, and all tests; commit the advancement/serving milestone.
+- [x] Replace the DigiKam scheduler and folder GET cursor with a common advancement controller implementing `every_fetch`, multiple-time `scheduled`, and `manual` policies over queue conditional advance.
+- [x] Generalize timezone/DST scheduling to sorted unique daily times, no startup replay, settings-change recalculation, bounded retry, single-flight operation, and graceful shutdown.
+- [x] Implement direct-peer frame-client classification with optional IP allowlist, ignored forwarding/UA headers, empty-list compatibility, and a dedicated non-advancing preview path.
+- [x] Implement a completion-aware JPEG response body and serialization permit for qualifying `every_fetch` GETs: prepare a stable queue entry, advance by entry ID only after successful EOF, and release without advancement on drop/error.
+- [x] Keep every-fetch responses bodyful and `no-store`; implement stable conditional GET/HEAD semantics for scheduled/manual policy; retain common direct-peer request status without treating preview/HEAD as frame advancement.
+- [x] Make readiness depend only on a servable current queue entry and keep the last sole entry serving through blocked advancement and supplier failures.
+- [x] Test all policy transitions, manual override under every policy, multiple schedule times/DST/reconfiguration, qualifying/unmatched/forwarded/UA clients, `200`/`304`/HEAD/preview, full body versus disconnect, simultaneous qualifying GET serialization, concurrent reorder/remove during transfer, one-entry demand, readiness, and shutdown with in-flight bodies.
+- [x] Verify formatting, strict linting, and all tests; commit the advancement/serving milestone.
 
 ### Stage 6 — Universal queue and supplier web interface
 
 Depends on Stages 2–5.
 
-- [ ] Replace mode-specific queue controls with one automatically escaped current-first queue view showing thumbnails, display names, provenance, current marker, queue generation/target, refill state, supplier status, polling/next-schedule status, and last frame GET.
-- [ ] Add generation/CSRF-protected common actions to reorder the complete queue, remove any entry including current, upload bounded JPEGs directly to the queue, and explicitly advance; use opaque queue IDs and POST/Redirect/GET.
-- [ ] Add supplier-neutral explicit refresh and seen-state reset actions, with source-specific configuration/status sections but no supplier-owned queue manipulation endpoints.
-- [ ] Update settings forms to edit queue target/upload bounds, advancement variant/schedule/frame-client matcher, and one supplier while transactionally validating descriptor/source/queue separation before persistence/activation.
-- [ ] Provide non-advancing queue thumbnail/preview endpoints and accessible reorder/remove/current controls that do not rely solely on JavaScript or drag-and-drop.
-- [ ] Test universal UI under both suppliers and every policy, current reorder/removal, direct upload, supplier refresh/reset, stale settings/queue generations, CSRF/body limits, escaping, opaque-ID confinement, PRG/error feedback, and proof that UI actions do not mutate supplier sources.
-- [ ] Verify formatting, strict linting, and all tests; commit the universal UI milestone.
+- [x] Replace mode-specific queue controls with one automatically escaped current-first queue view showing thumbnails, display names, provenance, current marker, queue generation/target, refill state, supplier status, polling/next-schedule status, and last frame GET.
+- [x] Add generation/CSRF-protected common actions to reorder the complete queue, remove any entry including current, upload bounded JPEGs directly to the queue, and explicitly advance; use opaque queue IDs and POST/Redirect/GET.
+- [x] Add supplier-neutral explicit refresh and seen-state reset actions, with source-specific configuration/status sections but no supplier-owned queue manipulation endpoints.
+- [x] Update settings forms to edit queue target/upload bounds, advancement variant/schedule/frame-client matcher, and one supplier while transactionally validating descriptor/source/queue separation before persistence/activation.
+- [x] Provide non-advancing queue thumbnail/preview endpoints and accessible reorder/remove/current controls that do not rely solely on JavaScript or drag-and-drop.
+- [x] Test universal UI under both suppliers and every policy, current reorder/removal, direct upload, supplier refresh/reset, stale settings/queue generations, CSRF/body limits, escaping, opaque-ID confinement, PRG/error feedback, and proof that UI actions do not mutate supplier sources.
+- [x] Verify formatting, strict linting, and all tests; commit the universal UI milestone.
 
 ### Stage 7 — Documentation, migration, and safety audit
 
 Depends on Stages 1–6.
 
-- [ ] Rewrite README/examples around supplier versus advancement configuration, shared queue layout/descriptor, target/refill/event behavior, current-first manipulation, one-entry retention, polling/refresh, direct uploads, seen reset, and all three policies.
-- [ ] Document compatibility migration and rollback/backup expectations, including how prior DigiKam `current.jpg` and sequential-folder settings/files are treated and that manual source filenames are no longer renamed.
-- [ ] Document completion-based advancement and its network-delivery limitation, direct-peer allowlist/empty-list behavior, non-advancing preview use, conditional caching differences, and reverse-proxy implications.
-- [ ] Update container/Kubernetes-administrator guidance for one writable managed queue volume, read-only DigiKam/manual source mounts, atomic descriptor semantics, one process/replica, probes, permissions, graceful shutdown, and trusted-LAN security.
-- [ ] Audit all filesystem/database mutation call sites and demonstrate queue-only writes, immutable suppliers, confined opaque-ID resolution, no source/cache links, bounded uploads, and recoverable descriptor/object operation ordering.
-- [ ] Verify documented clean setup and migration fixtures, formatting, strict linting, tests, and release build; commit the documentation/safety milestone.
+- [x] Rewrite README/examples around supplier versus advancement configuration, shared queue layout/descriptor, target/refill/event behavior, current-first manipulation, one-entry retention, polling/refresh, direct uploads, seen reset, and all three policies.
+- [x] Document compatibility migration and rollback/backup expectations, including how prior DigiKam `current.jpg` and sequential-folder settings/files are treated and that manual source filenames are no longer renamed.
+- [x] Document completion-based advancement and its network-delivery limitation, direct-peer allowlist/empty-list behavior, non-advancing preview use, conditional caching differences, and reverse-proxy implications.
+- [x] Update container/Kubernetes-administrator guidance for one writable managed queue volume, read-only DigiKam/manual source mounts, atomic descriptor semantics, one process/replica, probes, permissions, graceful shutdown, and trusted-LAN security.
+- [x] Audit all filesystem/database mutation call sites and demonstrate queue-only writes, immutable suppliers, confined opaque-ID resolution, no source/cache links, bounded uploads, and recoverable descriptor/object operation ordering.
+- [x] Verify documented clean setup and migration fixtures, formatting, strict linting, tests, and release build; commit the documentation/safety milestone.
 
 ### Stage 8 — Final end-to-end validation
 
 Depends on all previous stages.
 
-- [ ] From a clean checkout, build the release binary and create separate queue, settings, read-only DigiKam catalog/photo, and changing read-only manual-source fixtures with recorded hashes/metadata.
-- [ ] Start from each prior settings format and verify migration, queue descriptor/object creation, preserved eligible current image, canonical persisted settings, restart recovery, and unchanged supplier files/catalog.
-- [ ] With DigiKam supplier, verify SQL-order target-10 fill into managed copies, universal thumbnails/reorder/remove/upload, removal followed by next unseen candidate, seen reset, source failure retention, and no DigiKam mutation.
-- [ ] With manual supplier, verify alphabetical target fill, polling and explicit refresh of additions/changes/deletions, immutable existing queue copies, no source writes/renames, direct queue upload, and restart persistence.
-- [ ] Verify `every_fetch` with qualifying and non-qualifying direct peers, full throttled body completion, disconnect before EOF, concurrent GETs, and concurrent queue mutation; prove exactly the eligible completed response advances and no other request does.
-- [ ] Verify multiple scheduled times/timezone behavior and stable conditional responses between advances, then manual-only stability and explicit advancement, including live policy changes.
-- [ ] Reduce the queue to one entry and verify repeated advance/fetch attempts keep serving it and trigger bounded refill; explicitly remove it and verify frame `404`/readiness `503`, then verify recovery when a supplier enqueues again.
-- [ ] Exercise stale/CSRF-invalid/oversized/non-JPEG/unknown-ID settings and queue actions plus corrupt/missing object and descriptor/temp recovery; verify prior-state/source retention and actionable status.
-- [ ] Send SIGTERM during supplier polling/refill, descriptor mutation boundaries, scheduled waiting, and throttled frame delivery; verify graceful exit and intact recoverable queue/settings/source state.
-- [ ] Run `cargo fmt --check`, `cargo clippy --all-targets --all-features -- -D warnings`, `cargo test`, and `cargo build --release`; record exact results and requirement-to-evidence mapping in the implementation summary.
-- [ ] Commit final validated fixes as a meaningful milestone and leave the working tree clean.
+- [x] From a clean checkout, build the release binary and create separate queue, settings, read-only DigiKam catalog/photo, and changing read-only manual-source fixtures with recorded hashes/metadata.
+- [x] Start from each prior settings format and verify migration, queue descriptor/object creation, preserved eligible current image, canonical persisted settings, restart recovery, and unchanged supplier files/catalog.
+- [x] With DigiKam supplier, verify SQL-order target-10 fill into managed copies, universal thumbnails/reorder/remove/upload, removal followed by next unseen candidate, seen reset, source failure retention, and no DigiKam mutation.
+- [x] With manual supplier, verify alphabetical target fill, polling and explicit refresh of additions/changes/deletions, immutable existing queue copies, no source writes/renames, direct queue upload, and restart persistence.
+- [x] Verify `every_fetch` with qualifying and non-qualifying direct peers, full throttled body completion, disconnect before EOF, concurrent GETs, and concurrent queue mutation; prove exactly the eligible completed response advances and no other request does.
+- [x] Verify multiple scheduled times/timezone behavior and stable conditional responses between advances, then manual-only stability and explicit advancement, including live policy changes.
+- [x] Reduce the queue to one entry and verify repeated advance/fetch attempts keep serving it and trigger bounded refill; explicitly remove it and verify frame `404`/readiness `503`, then verify recovery when a supplier enqueues again.
+- [x] Exercise stale/CSRF-invalid/oversized/non-JPEG/unknown-ID settings and queue actions plus corrupt/missing object and descriptor/temp recovery; verify prior-state/source retention and actionable status.
+- [x] Send SIGTERM during supplier polling/refill, descriptor mutation boundaries, scheduled waiting, and throttled frame delivery; verify graceful exit and intact recoverable queue/settings/source state.
+- [x] Run `cargo fmt --check`, `cargo clippy --all-targets --all-features -- -D warnings`, `cargo test`, and `cargo build --release`; record exact results and requirement-to-evidence mapping in the implementation summary.
+- [x] Commit final validated fixes as a meaningful milestone and leave the working tree clean.
 
 ## Execution contract
 

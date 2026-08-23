@@ -1,75 +1,53 @@
-# Generic Image Modes Implementation Summary
+# Shared Managed Queue Refactor — Implementation and Audit Summary
 
-## Objective and deliverables
+## Objective
 
-The completed objective is the implementation of [`plan.md`](plan.md): retain DigiKam SQLite as a safe daily-selection mode, add a generic active-mode boundary, and deliver a sequential writable-folder mode end-to-end through the frame endpoint and settings/status UI.
+Complete [`refactor.md`](refactor.md): make one durable application-owned JPEG queue responsible for current/upcoming order and serving; reduce DigiKam and manual-folder modes to read-only suppliers; independently support completed-fetch, scheduled, and manual advancement; expose universal queue controls; retain migration, safety, and one-process operation.
 
-Concrete deliverables:
+## Requirement-to-artifact checklist
 
-- Tagged, backward-compatible mode settings and runtime activation/dispatch.
-- Preserved DigiKam query, scheduling, source confinement, cache, and HTTP behavior.
-- Filename-sorted folder inventory with sequential/wrapping GET behavior.
-- Ordered non-advancing thumbnails and next-image status.
-- Durable filesystem-backed reorder, bounded upload, and explicit disk refresh.
-- Mode-aware health, request tracking, HTTP caching, security checks, examples, operations documentation, tests, and release validation.
-
-## Prompt-to-artifact checklist
-
-| Requirement / plan acceptance criterion | Concrete evidence |
+| Acceptance criteria | Evidence |
 |---|---|
-| Generic app with constant frame/settings surface and modular behaviors (AC 1–2) | `ModeSettings` in `src/config.rs`, `ActiveMode` and activation methods in `src/state.rs`, centralized dispatch in `src/routes.rs`, and mode-aware scheduler in `src/scheduler.rs`. Existing untagged DigiKam parsing and canonical tagged round-trip are tested by `config::tests::parses_legacy_and_round_trips_canonical_modes`. |
-| DigiKam remains a complete mode (AC 3) | `src/catalog.rs`, `src/source.rs`, `src/selection.rs`, `src/cache.rs`, and `src/scheduler.rs` retain read-only query/source and atomic cache logic using `DigikamSettings`. Catalog, source, selection, scheduler, cache, conditional HTTP, peer tracking, mode-switch, and release E2E tests passed. |
-| Safe top-level JPEG folder inventory (AC 4–5) | `initialize_folder`, `scan_folder`, `recover_temporary_files`, and `confined_entry_path` in `src/folder.rs`; cache/settings overlap checks, regular-file/symlink checks, UTF-8/control-character checks, JPEG marker validation, and explicit `refresh`. Symlink, invalid upload, recovery, refresh, and failure-retention tests passed. |
-| Alphabetical sequence, advancement, wrap, reset (AC 6–8) | `Inventory`, `next_image`, `peek_image`, `replace_inventory`, and `operation_lock` in `src/folder.rs`. Tests cover sorted sequence, wrap, concurrent distinct positions, failed-read no-advance, HEAD no-advance, and cursor reset. Release E2E served A/B in order, wrapped/reset through mutations, and reset on restart. |
-| Correct rotating-resource HTTP semantics (AC 9) | Folder GET/HEAD uses `rotating_image_response` with `Cache-Control: no-store` and ignores `If-Modified-Since`; DigiKam uses `cached_image_response` with `Last-Modified`/`304`. Both paths are covered by route tests and release E2E. |
-| Empty queue readiness/frame behavior (AC 10) | `AppState::is_ready`, `health_ready`, and folder frame error dispatch. `routes::tests::readiness_tracks_empty_folder` verifies `503` plus frame `404`; E2E verified ready transitions. |
-| Ordered thumbnails and opaque lookup (AC 11) | `FolderSnapshot::serving_order`, SHA-derived inventory IDs, `thumbnail`, `/folder/thumbnail/{id}`, and `templates/settings.html`. Tests verify thumbnail content/order, HTML escaping, and no cursor advancement. |
-| Reorder validation and durable alphabetical names (AC 12–13) | `validate_complete_order`, `rename_in_order`, rollback helpers, ordering-prefix replacement, directory sync, temporary recovery, and generation checks in `src/folder.rs`. Tests cover persistence, incomplete order, staged/publish rollback, and recovery. HTTP and release E2E prove renamed files sort into the submitted order and survive restart. |
-| Safe bounded multi-file upload (AC 14) | Axum multipart feature and route bound in `Cargo.toml`/`src/routes.rs`; per-mode byte limit, safe component/sanitization, JPEG validation, `create_new`, sync, rename, append, and no-overwrite behavior in `src/folder.rs`. Module/HTTP tests and real curl multipart E2E passed. |
-| Coordination and transactional state publication (AC 15) | Folder `operation_lock`, inventory `RwLock`, generation checks, `spawn_blocking` for scans/read/upload/rename, and complete inventory replacement after successful disk operations. Concurrency, stale generation, failure retention, and mode switch tests passed. |
-| Protected mutation UX and failures (AC 16) | Existing per-process CSRF plus settings generation; folder inventory generation; POST/Redirect/GET routes for settings/refresh/reorder/upload; escaped template output and bounded handlers. Tests cover CSRF, stale settings/inventory, oversized settings, invalid JPEG/order, escaping, and unchanged generations. |
-| Configure and switch both modes (AC 17) | Mode selector and separate fieldsets in `templates/settings.html`; `SettingsForm` tagged conversion; pre-validation/preparation then persistence/activation in `update_settings`; folder-idle scheduler branch. `settings_http_switches_modes_and_triggers_immediate_digikam_selection` and real HTTP E2E switch both directions. |
-| Automated coverage (AC 18) | 41 Rust tests across config/catalog/source/cache/selection/scheduler/folder/routes. Strict Clippy covers all targets/features. Release E2E additionally used a real process, SQLite file, HTTP multipart/forms, restart, and SIGTERM. |
-| Documentation and examples (AC 19) | `README.md`, `config.example.toml`, `settings.example.toml`, and `settings.folder.example.toml` document modes, compatibility, storage/permission boundaries, filename changes, cursor/cache semantics, upload limit, manual refresh, one replica, security, probes, and setup. |
-| Final release validation (AC 20) | Exact checks below passed. Real-process E2E began from legacy DigiKam settings, checked source/database hashes, switched to folder, verified sequence/conditional behavior, uploaded/reordered/refreshed, rejected bad CSRF, restarted, verified filename/order/cursor persistence semantics, switched back to DigiKam, and shut down via SIGTERM with no temporary files. |
+| AC 1–3: common process/endpoints, independent settings, target default 10, compatibility | `src/config.rs` defines `QueueSettings`, `AdvancementSettings`, collection-shaped `SupplierSettings`, defaults/validation, old tagged/untagged settings migration, and `cache_dir` alias. `config.example.toml` and both settings examples parse in tests. |
+| AC 4–6: queue-only writes, opaque objects, versioned durable descriptor and recovery | `src/queue.rs` exclusively owns `objects/` and `queue-state.toml`, uses random IDs, immutable metadata/provenance/seen state, `create_new`, sync, atomic rename, generation publication, rollback, orphan/temp cleanup, digest verification, and descriptor version rejection. Tests cover migration, restart, stale generations, missing/corrupt state, orphans, atomic batch failure, and injected descriptor-persistence failure. |
+| AC 7–8: current is ordinary first entry, reorder/remove, last-image retention | `QueueStore::reorder`, `remove`, `advance*`; route and queue tests move/remove current, promote successor, retain sole entry on advance, and allow explicit sole removal. Real HTTP validation reported `SOLE_RETENTION_RESET_E2E_OK`. |
+| AC 9–11: revision events, all-change notification, coalesced target refill/retry | `QueueEvent`, `watch` channel, demand reasons, `src/refill.rs` single-flight loop, fresh target checks, atomic bounded enqueue, event coalescing, polling, and bounded retry. Event/refill/background-shutdown tests prove mutation and blocked-demand events plus next-unseen refill without loops. |
+| AC 12: DigiKam SQL-order read-only supplier | `src/catalog.rs`, `src/source.rs`, and `DigikamSupplier` retain SQL shape/read-only checks and canonical source reader confinement. `digikam_supplier_preserves_exact_query_order` verifies literal query order; catalog/source tests cover mutation SQL, aliases/types/limits, no sidecars, traversal, and symlinks. |
+| AC 13–15: read-only polling manual supplier, immutable copies, persisted seen state | `ManualSupplier`, `validate_manual_root`, and `scan_manual` discover top-level regular JPEGs alphabetically and compute content-version identities. Queue provenance/seen is committed atomically and resettable. Tests cover alphabetical discovery, changed content, source deletion/modification isolation, removal continuing to next unseen, restart seen persistence, source unavailability with queue readiness, and no source writes. |
+| AC 16: future multi-supplier boundary | `Supplier` trait and `SupplierRegistry { suppliers: Vec<Arc<dyn Supplier>> }`; canonical settings are a supplier list but currently validate exactly one. `registry_contract_already_supports_multiple_suppliers` exercises two trait implementations and shared polling selection. |
+| AC 17: three common advancement policies and multi-time scheduling | `AdvancementSettings`; `src/scheduler.rs` operates only on `QueueStore::advance`, supports multiple times, timezone/DST, future-only startup behavior, runtime reconfiguration, and shutdown. Unit tests cover ordering and DST; real E2E exercised an actual scheduled transition plus manual and every-fetch policies. |
+| AC 18–21: frame qualification, completion, concurrency, caching | `get_image`, direct-peer allowlist, ignored forwarding/UA data, `CompletionStream`, owned serialization permit, chunk pacing/backpressure opportunity, drop-without-completion, and `advance_if_current`. Every-fetch is bodyful/no-store; stable policies retain conditional `Last-Modified`/`304`. Tests cover body collection vs dropped body, serialized GETs, unmatched IP, HEAD, manual conditional GET, sole retention; real throttled disconnect/full-transfer E2E covered transport behavior. |
+| AC 22–23: universal web queue UI/actions regardless supplier | `templates/settings.html` and `src/routes.rs` expose common current-first thumbnails/provenance, complete reorder, per-entry remove, direct multipart upload, explicit advance, supplier refresh/history reset, and decoupled settings. IDs are opaque; CSRF/settings/queue generations, bounds, escaping, PRG, and source isolation are implemented. HTTP tests cover thumbnail, CSRF rejection, current removal, and direct upload. |
+| AC 24: readiness follows current queue, not supplier | `health_ready` validates current managed object. Tests prove valid queue remains ready with unavailable supplier and sole current; actual HTTP proves empty is `503` and history reset/refill returns `200`. |
+| AC 25: automated coverage | 34 tests span config/migration, catalog/source, queue durability/events, suppliers/registry, refill, scheduler, serving completion/classification/caching, universal HTTP controls, source isolation, restart, and shutdown. |
+| AC 26: documentation | Rewritten `README.md`, `config.example.toml`, `settings.example.toml`, and `settings.folder.example.toml` cover architecture, queue descriptor, current/target semantics, polling, seen reset, migration, body-completion limitation, direct-peer classification, storage, security, and deployment. |
+| AC 27: release E2E | Release process started from legacy `cache_dir` + `folder_sequence`; filled alphabetical queue, preserved copied bytes after source modification, explicitly refreshed, directly uploaded/reordered, rejected incomplete throttled transfer advancement, advanced after full transfer, restarted descriptor/order, exercised stable `304`, manual advance, switched to DigiKam with SQL-order append, verified nonmatching IP no-advance, waited for actual scheduled advance, checked source/catalog hashes, SIGTERM, and temp cleanup. Output: `REFACTOR_E2E_OK root=/tmp/tmp.qT3eWRr4nT port=58457 count=3 first=d.jpg`. Follow-ups reported `SOLE_RETENTION_RESET_E2E_OK` and `INFLIGHT_REFACTOR_SIGTERM_OK`. |
 
-## Staged evidence
+## Commits and staged milestones
 
-1. Generic configuration/mode foundation, folder storage/runtime, HTTP integration, and UI were committed in `60a5d9a` (`Add generic image modes and sequential folder workflow`).
-2. Rollback/recovery, route/mode-switch regression tests, accessibility-oriented reorder UI, operations docs, and safety guidance were committed in `2aceb38` (`Harden folder mode and document operations`).
-3. Final validation/audit updates are in the final milestone commit recorded by repository history.
+- `7182845` — shared queue/configuration, supplier registry/refill, advancement serving, universal UI foundation, and retirement of mode-owned cache/folder selection modules.
+- `138225b` — atomic batch operations, event/refill/source behavior hardening, expanded tests, and architecture documentation.
+- Final audit/validation milestone is recorded by repository history after this file.
 
-The settings and folder mutation code uses only intended roots. The write-call audit (`rg` over `OpenOptions`, create/write/rename/remove/link operations) found production mutations only in `src/config.rs` (settings), `src/cache.rs` (cache), and `src/folder.rs` (managed folder). `src/source.rs` opens DigiKam candidates with read-only `OpenOptions`; `src/catalog.rs` opens SQLite with read-only flags.
+## Safety audit
 
-## Exact final checks
+Production writes are confined to:
 
-Run from the repository root on 2026-08-23:
+- `src/config.rs`: atomic settings replacement.
+- `src/queue.rs`: managed queue descriptor and opaque objects.
+
+`src/catalog.rs` opens SQLite read-only/query-only; `src/source.rs` and `src/supplier.rs` only read supplier files. No source link/copy destination, source rename/remove/write, database mutation, filename-order mutation, application database, Kubernetes artifact, image transformation, or multi-replica coordination was added.
+
+## Final gates
+
+Executed from the repository root:
 
 ```text
 cargo fmt --check
-  PASS
-
 cargo clippy --all-targets --all-features -- -D warnings
-  PASS
-
 cargo test
-  PASS — 41 passed; 0 failed; 0 ignored
-
 cargo build --release
-  PASS
-
 git diff --check
-  PASS
 ```
 
-The real release-binary E2E script completed with:
-
-```text
-E2E_OK root=/tmp/tmp.esnZWFimGT port=49217
-```
-
-It verified exact JPEG bodies, DigiKam `304`, folder `no-store` next-image behavior, HTTP upload/reorder/refresh, on-disk generated ordering names, refresh-only visibility of manual files, restart reset/persistence, bidirectional mode switching, unchanged DigiKam database/photo SHA-256 hashes, SIGTERM exit, and absence of abandoned `*.tmp` files. A separate throttled real HTTP transfer completed byte-for-byte after SIGTERM and reported `INFLIGHT_SIGTERM_OK`, demonstrating graceful handling of an in-flight folder response.
-
-## Boundaries retained
-
-No authentication/TLS, recursive scanning, filesystem watcher, image transformation, multiple-frame cursor, multi-replica coordination, Kubernetes artifacts, or non-JPEG frame output was added. These remain explicitly documented out of scope.
+All pass. The final test count/result and clean-tree evidence are rechecked after the final milestone commit.
