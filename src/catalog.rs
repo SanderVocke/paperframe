@@ -121,7 +121,7 @@ mod tests {
     use sha2::{Digest, Sha256};
     use tempfile::tempdir;
 
-    use crate::config::{PathMapping, SelectionMode, SelectionSettings};
+    use crate::config::PathMapping;
 
     use super::*;
 
@@ -154,12 +154,6 @@ mod tests {
                 database_root: PathBuf::from("/library"),
                 mounted_root: PathBuf::from("/photos"),
             }],
-            selection: SelectionSettings {
-                mode: SelectionMode::First,
-                random_seed: String::new(),
-                timezone: "UTC".into(),
-                rollover_time: "00:00".into(),
-            },
             max_candidates: 100,
         }
     }

@@ -2,7 +2,7 @@ use std::{
     collections::HashSet,
     fs::{self, OpenOptions},
     io::Write,
-    net::SocketAddr,
+    net::{IpAddr, SocketAddr},
     path::{Path, PathBuf},
     sync::{
         Arc,
@@ -17,13 +17,15 @@ use serde::{Deserialize, Deserializer, Serialize, de::Error as _};
 use tokio::sync::{Mutex, RwLock};
 
 static TEMP_FILE_COUNTER: AtomicU64 = AtomicU64::new(0);
+const DEFAULT_UPLOAD_BYTES: u64 = 25 * 1024 * 1024;
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct Config {
     pub bind: SocketAddr,
     pub settings_path: PathBuf,
-    pub cache_dir: PathBuf,
+    #[serde(alias = "cache_dir")]
+    pub queue_dir: PathBuf,
 }
 
 impl Config {
@@ -40,36 +42,66 @@ impl Config {
                 path.display()
             )
         })?;
-        config.validate()?;
-        Ok(config)
-    }
-
-    fn validate(&self) -> Result<()> {
-        if self.settings_path.as_os_str().is_empty() {
+        if config.settings_path.as_os_str().is_empty() {
             bail!("settings_path must not be empty");
         }
-        if self.cache_dir.as_os_str().is_empty() {
-            bail!("cache_dir must not be empty");
+        if config.queue_dir.as_os_str().is_empty() {
+            bail!("queue_dir must not be empty");
         }
-        Ok(())
-    }
-
-    pub fn current_image_path(&self) -> PathBuf {
-        self.cache_dir.join("current.jpg")
+        Ok(config)
     }
 }
 
 #[derive(Clone, Debug, Serialize, PartialEq, Eq)]
 pub struct Settings {
-    #[serde(flatten)]
-    pub mode: ModeSettings,
+    pub queue: QueueSettings,
+    pub advancement: AdvancementSettings,
+    pub suppliers: Vec<SupplierSettings>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
-#[serde(tag = "mode", content = "mode_settings", rename_all = "snake_case")]
-pub enum ModeSettings {
+#[serde(deny_unknown_fields)]
+pub struct QueueSettings {
+    #[serde(default = "default_target")]
+    pub target_length: usize,
+    #[serde(default = "default_upload_bytes")]
+    pub max_upload_bytes: u64,
+}
+
+fn default_target() -> usize {
+    10
+}
+fn default_upload_bytes() -> u64 {
+    DEFAULT_UPLOAD_BYTES
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(tag = "type", content = "settings", rename_all = "snake_case")]
+pub enum AdvancementSettings {
+    EveryFetch {
+        #[serde(default)]
+        frame_client_ips: Vec<IpAddr>,
+    },
+    Scheduled {
+        timezone: String,
+        times: Vec<String>,
+    },
+    Manual,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct SupplierSettings {
+    pub id: String,
+    #[serde(flatten)]
+    pub kind: SupplierKind,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(tag = "type", content = "settings", rename_all = "snake_case")]
+pub enum SupplierKind {
     DigikamSqlite(DigikamSettings),
-    FolderSequence(FolderSettings),
+    ManualFolder(ManualFolderSettings),
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
@@ -78,15 +110,19 @@ pub struct DigikamSettings {
     pub database_path: PathBuf,
     pub query: String,
     pub path_mappings: Vec<PathMapping>,
-    pub selection: SelectionSettings,
     pub max_candidates: usize,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
-pub struct FolderSettings {
+pub struct ManualFolderSettings {
     pub directory: PathBuf,
-    pub max_upload_bytes: u64,
+    #[serde(default = "default_poll_seconds")]
+    pub poll_interval_seconds: u64,
+}
+
+fn default_poll_seconds() -> u64 {
+    60
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
@@ -96,26 +132,59 @@ pub struct PathMapping {
     pub mounted_root: PathBuf,
 }
 
-#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+// Compatibility shapes from the two previously released settings formats.
+#[derive(Clone, Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub struct SelectionSettings {
-    pub mode: SelectionMode,
-    pub random_seed: String,
-    pub timezone: String,
-    pub rollover_time: String,
+struct OldDigikamSettings {
+    database_path: PathBuf,
+    query: String,
+    path_mappings: Vec<PathMapping>,
+    selection: OldSelectionSettings,
+    max_candidates: usize,
 }
 
-#[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[derive(Clone, Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct OldFolderSettings {
+    directory: PathBuf,
+    max_upload_bytes: u64,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct OldSelectionSettings {
+    mode: OldSelectionMode,
+    random_seed: String,
+    timezone: String,
+    rollover_time: String,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize)]
 #[serde(rename_all = "snake_case")]
-pub enum SelectionMode {
+enum OldSelectionMode {
     First,
     DailyRandom,
 }
 
 #[derive(Deserialize)]
-struct CurrentSettings {
+#[serde(tag = "mode", content = "mode_settings", rename_all = "snake_case")]
+enum OldModeSettings {
+    DigikamSqlite(OldDigikamSettings),
+    FolderSequence(OldFolderSettings),
+}
+
+#[derive(Deserialize)]
+struct OldTagged {
     #[serde(flatten)]
-    mode: ModeSettings,
+    mode: OldModeSettings,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CanonicalSettings {
+    queue: QueueSettings,
+    advancement: AdvancementSettings,
+    suppliers: Vec<SupplierSettings>,
 }
 
 impl<'de> Deserialize<'de> for Settings {
@@ -126,24 +195,66 @@ impl<'de> Deserialize<'de> for Settings {
         let value = toml::Value::deserialize(deserializer)?;
         let table = value
             .as_table()
-            .ok_or_else(|| D::Error::custom("settings must be a TOML table"))?;
-        if table.contains_key("mode") {
-            if let Some(unknown) = table
-                .keys()
-                .find(|key| key.as_str() != "mode" && key.as_str() != "mode_settings")
-            {
-                return Err(D::Error::custom(format!(
-                    "unknown top-level field in tagged settings: {unknown}"
-                )));
-            }
-            let current: CurrentSettings = value.try_into().map_err(D::Error::custom)?;
-            Ok(Self { mode: current.mode })
-        } else {
-            let legacy: DigikamSettings = value.try_into().map_err(D::Error::custom)?;
-            Ok(Self {
-                mode: ModeSettings::DigikamSqlite(legacy),
-            })
+            .ok_or_else(|| D::Error::custom("settings must be a table"))?;
+        if table.contains_key("queue") || table.contains_key("suppliers") {
+            let current: CanonicalSettings = value.try_into().map_err(D::Error::custom)?;
+            return Ok(Self {
+                queue: current.queue,
+                advancement: current.advancement,
+                suppliers: current.suppliers,
+            });
         }
+        if table.contains_key("mode") {
+            let old: OldTagged = value.try_into().map_err(D::Error::custom)?;
+            return Ok(migrate_old_mode(old.mode));
+        }
+        let old: OldDigikamSettings = value.try_into().map_err(D::Error::custom)?;
+        Ok(migrate_digikam(old))
+    }
+}
+
+fn migrate_old_mode(mode: OldModeSettings) -> Settings {
+    match mode {
+        OldModeSettings::DigikamSqlite(settings) => migrate_digikam(settings),
+        OldModeSettings::FolderSequence(settings) => Settings {
+            queue: QueueSettings {
+                target_length: 10,
+                max_upload_bytes: settings.max_upload_bytes,
+            },
+            advancement: AdvancementSettings::EveryFetch {
+                frame_client_ips: Vec::new(),
+            },
+            suppliers: vec![SupplierSettings {
+                id: "primary".into(),
+                kind: SupplierKind::ManualFolder(ManualFolderSettings {
+                    directory: settings.directory,
+                    poll_interval_seconds: 60,
+                }),
+            }],
+        },
+    }
+}
+
+fn migrate_digikam(old: OldDigikamSettings) -> Settings {
+    let _ = (old.selection.mode, old.selection.random_seed);
+    Settings {
+        queue: QueueSettings {
+            target_length: 10,
+            max_upload_bytes: DEFAULT_UPLOAD_BYTES,
+        },
+        advancement: AdvancementSettings::Scheduled {
+            timezone: old.selection.timezone,
+            times: vec![old.selection.rollover_time],
+        },
+        suppliers: vec![SupplierSettings {
+            id: "primary".into(),
+            kind: SupplierKind::DigikamSqlite(DigikamSettings {
+                database_path: old.database_path,
+                query: old.query,
+                path_mappings: old.path_mappings,
+                max_candidates: old.max_candidates,
+            }),
+        }],
     }
 }
 
@@ -154,34 +265,70 @@ impl Settings {
             .with_context(|| format!("failed to read settings from {}", path.display()))?;
         let settings: Self = toml::from_str(&contents)
             .with_context(|| format!("failed to parse settings from {}", path.display()))?;
-        settings.validate_basic()?;
+        settings.validate()?;
         Ok(settings)
     }
 
-    pub fn validate_basic(&self) -> Result<()> {
-        match &self.mode {
-            ModeSettings::DigikamSqlite(settings) => settings.validate_basic(),
-            ModeSettings::FolderSequence(settings) => settings.validate_basic(),
+    pub fn validate(&self) -> Result<()> {
+        if self.queue.target_length == 0 || self.queue.target_length > 100_000 {
+            bail!("target_length must be between 1 and 100000");
         }
+        if self.queue.max_upload_bytes == 0 || self.queue.max_upload_bytes > 100 * 1024 * 1024 {
+            bail!("max_upload_bytes must be between 1 and 104857600");
+        }
+        if self.suppliers.len() != 1 {
+            bail!("exactly one supplier is currently supported");
+        }
+        let mut ids = HashSet::new();
+        for supplier in &self.suppliers {
+            if supplier.id.trim().is_empty() || !ids.insert(&supplier.id) {
+                bail!("supplier IDs must be non-empty and unique");
+            }
+            supplier.validate()?;
+        }
+        if let AdvancementSettings::Scheduled { timezone, times } = &self.advancement {
+            let _: Tz = timezone
+                .parse()
+                .with_context(|| format!("invalid IANA timezone: {timezone}"))?;
+            if times.is_empty() {
+                bail!("scheduled advancement requires at least one time");
+            }
+            let mut unique = HashSet::new();
+            for time in times {
+                NaiveTime::parse_from_str(time, "%H:%M")
+                    .with_context(|| format!("invalid scheduled time (expected HH:MM): {time}"))?;
+                if !unique.insert(time) {
+                    bail!("scheduled times must be unique");
+                }
+            }
+        }
+        Ok(())
     }
 
-    pub fn digikam(&self) -> Option<&DigikamSettings> {
-        match &self.mode {
-            ModeSettings::DigikamSqlite(settings) => Some(settings),
-            ModeSettings::FolderSequence(_) => None,
-        }
+    pub fn supplier(&self) -> &SupplierSettings {
+        &self.suppliers[0]
     }
+}
 
-    pub fn folder(&self) -> Option<&FolderSettings> {
-        match &self.mode {
-            ModeSettings::FolderSequence(settings) => Some(settings),
-            ModeSettings::DigikamSqlite(_) => None,
+impl SupplierSettings {
+    fn validate(&self) -> Result<()> {
+        match &self.kind {
+            SupplierKind::DigikamSqlite(settings) => settings.validate(),
+            SupplierKind::ManualFolder(settings) => {
+                if !settings.directory.is_absolute() {
+                    bail!("manual folder directory must be absolute");
+                }
+                if settings.poll_interval_seconds == 0 || settings.poll_interval_seconds > 86400 {
+                    bail!("poll_interval_seconds must be between 1 and 86400");
+                }
+                Ok(())
+            }
         }
     }
 }
 
 impl DigikamSettings {
-    pub fn validate_basic(&self) -> Result<()> {
+    pub fn validate(&self) -> Result<()> {
         if self.database_path.as_os_str().is_empty() {
             bail!("database_path must not be empty");
         }
@@ -193,68 +340,17 @@ impl DigikamSettings {
         }
         let mut roots = HashSet::new();
         for mapping in &self.path_mappings {
-            if !mapping.database_root.is_absolute() {
-                bail!(
-                    "database_root must be absolute: {}",
-                    mapping.database_root.display()
-                );
-            }
-            if !mapping.mounted_root.is_absolute() {
-                bail!(
-                    "mounted_root must be absolute: {}",
-                    mapping.mounted_root.display()
-                );
+            if !mapping.database_root.is_absolute() || !mapping.mounted_root.is_absolute() {
+                bail!("path mapping roots must be absolute");
             }
             if !roots.insert(mapping.database_root.clone()) {
                 bail!("database_root values must be unique");
             }
         }
-        if self.max_candidates == 0 {
-            bail!("max_candidates must be greater than zero");
-        }
-        if self.max_candidates > 1_000_000 {
-            bail!("max_candidates must not exceed 1000000");
-        }
-        if self.selection.mode == SelectionMode::DailyRandom
-            && self.selection.random_seed.trim().is_empty()
-        {
-            bail!("random_seed must not be empty in daily_random mode");
-        }
-        self.selection.timezone()?;
-        self.selection.rollover_time()?;
-        Ok(())
-    }
-}
-
-impl FolderSettings {
-    pub fn validate_basic(&self) -> Result<()> {
-        if self.directory.as_os_str().is_empty() {
-            bail!("folder directory must not be empty");
-        }
-        if !self.directory.is_absolute() {
-            bail!("folder directory must be absolute");
-        }
-        if self.max_upload_bytes == 0 || self.max_upload_bytes > 100 * 1024 * 1024 {
-            bail!("max_upload_bytes must be between 1 and 104857600");
+        if self.max_candidates == 0 || self.max_candidates > 1_000_000 {
+            bail!("max_candidates must be between 1 and 1000000");
         }
         Ok(())
-    }
-}
-
-impl SelectionSettings {
-    pub fn timezone(&self) -> Result<Tz> {
-        self.timezone
-            .parse()
-            .with_context(|| format!("invalid IANA timezone: {}", self.timezone))
-    }
-
-    pub fn rollover_time(&self) -> Result<NaiveTime> {
-        NaiveTime::parse_from_str(&self.rollover_time, "%H:%M").with_context(|| {
-            format!(
-                "invalid rollover_time (expected HH:MM): {}",
-                self.rollover_time
-            )
-        })
     }
 }
 
@@ -308,27 +404,27 @@ impl SettingsManager {
 
     pub async fn replace(
         &self,
-        expected_generation: u64,
+        expected: u64,
         settings: Settings,
     ) -> std::result::Result<SettingsSnapshot, ReplaceSettingsError> {
         settings
-            .validate_basic()
+            .validate()
             .map_err(|error| ReplaceSettingsError::Invalid(error.to_string()))?;
         let _guard = self.update_lock.lock().await;
-        let current_generation = self.snapshot.read().await.generation;
-        if current_generation != expected_generation {
-            return Err(ReplaceSettingsError::Stale { current_generation });
+        let generation = self.snapshot.read().await.generation;
+        if generation != expected {
+            return Err(ReplaceSettingsError::Stale {
+                current_generation: generation,
+            });
         }
-
         let path = self.path.clone();
-        let to_persist = settings.clone();
-        tokio::task::spawn_blocking(move || persist_settings(&path, &to_persist))
+        let persisted = settings.clone();
+        tokio::task::spawn_blocking(move || persist_settings(&path, &persisted))
             .await
             .map_err(|error| ReplaceSettingsError::Persistence(error.to_string()))?
             .map_err(|error| ReplaceSettingsError::Persistence(error.to_string()))?;
-
         let next = SettingsSnapshot {
-            generation: current_generation.saturating_add(1),
+            generation: generation.saturating_add(1),
             settings,
         };
         *self.snapshot.write().await = next.clone();
@@ -341,147 +437,115 @@ fn persist_settings(path: &Path, settings: &Settings) -> Result<()> {
     let file_name = path
         .file_name()
         .and_then(|name| name.to_str())
-        .context("settings path must have a UTF-8 file name")?;
-    let temporary_path = parent.join(format!(
+        .context("settings path must have a UTF-8 filename")?;
+    let temporary = parent.join(format!(
         ".{file_name}.{}.{}.tmp",
         std::process::id(),
         TEMP_FILE_COUNTER.fetch_add(1, Ordering::Relaxed)
     ));
     let serialized = toml::to_string_pretty(settings).context("failed to serialize settings")?;
-
     let result = (|| -> Result<()> {
         let mut file = OpenOptions::new()
             .write(true)
             .create_new(true)
-            .open(&temporary_path)
-            .with_context(|| {
-                format!(
-                    "failed to create temporary settings file in {}",
-                    parent.display()
-                )
-            })?;
+            .open(&temporary)
+            .context("failed to create settings temporary")?;
         file.write_all(serialized.as_bytes())
-            .context("failed to write temporary settings file")?;
+            .context("failed to write settings temporary")?;
         file.sync_all()
-            .context("failed to sync temporary settings file")?;
-        fs::rename(&temporary_path, path).context("failed to atomically replace settings file")?;
+            .context("failed to sync settings temporary")?;
+        fs::rename(&temporary, path).context("failed to atomically replace settings")?;
         sync_directory(parent)?;
         Ok(())
     })();
     if result.is_err() {
-        let _ = fs::remove_file(&temporary_path);
+        let _ = fs::remove_file(&temporary);
     }
     result
 }
 
-fn cleanup_temporary_files(settings_path: &Path) -> Result<()> {
-    let parent = settings_path.parent().unwrap_or_else(|| Path::new("."));
-    let Some(file_name) = settings_path.file_name().and_then(|name| name.to_str()) else {
-        bail!("settings path must have a UTF-8 file name");
-    };
-    let prefix = format!(".{file_name}.");
-    for entry in fs::read_dir(parent)
-        .with_context(|| format!("failed to inspect settings directory {}", parent.display()))?
-    {
-        let entry = entry.context("failed to inspect settings temporary file")?;
-        let name = entry.file_name();
-        let name = name.to_string_lossy();
-        if name.starts_with(&prefix) && name.ends_with(".tmp") {
-            fs::remove_file(entry.path())
-                .context("failed to remove abandoned settings temporary file")?;
+fn cleanup_temporary_files(path: &Path) -> Result<()> {
+    let parent = path.parent().unwrap_or_else(|| Path::new("."));
+    let name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .context("settings filename must be UTF-8")?;
+    let prefix = format!(".{name}.");
+    for entry in fs::read_dir(parent).context("failed to inspect settings directory")? {
+        let entry = entry?;
+        let entry_name = entry.file_name();
+        let entry_name = entry_name.to_string_lossy();
+        if entry_name.starts_with(&prefix) && entry_name.ends_with(".tmp") {
+            fs::remove_file(entry.path())?;
         }
     }
     Ok(())
 }
 
 fn sync_directory(path: &Path) -> Result<()> {
-    fs::File::open(path)
-        .with_context(|| format!("failed to open directory {} for sync", path.display()))?
+    fs::File::open(path)?
         .sync_all()
-        .context("failed to sync settings directory")
+        .context("failed to sync directory")
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use tempfile::tempdir;
-
-    fn digikam() -> DigikamSettings {
-        DigikamSettings {
-            database_path: "/catalog/digikam.db".into(),
-            query: "SELECT 1".into(),
-            path_mappings: vec![PathMapping {
-                database_root: "/library".into(),
-                mounted_root: "/photos".into(),
-            }],
-            selection: SelectionSettings {
-                mode: SelectionMode::First,
-                random_seed: String::new(),
-                timezone: "UTC".into(),
-                rollover_time: "00:00".into(),
-            },
-            max_candidates: 10,
-        }
-    }
 
     #[test]
-    fn parses_legacy_and_round_trips_canonical_modes() {
-        let legacy = toml::to_string(&digikam()).unwrap();
-        let parsed: Settings = toml::from_str(&legacy).unwrap();
-        assert!(parsed.digikam().is_some());
-
-        let folder = Settings {
-            mode: ModeSettings::FolderSequence(FolderSettings {
-                directory: "/srv/frame-images".into(),
-                max_upload_bytes: 1024,
-            }),
-        };
+    fn migrates_old_modes_and_round_trips_canonical() {
+        let old_folder =
+            "mode='folder_sequence'\n[mode_settings]\ndirectory='/images'\nmax_upload_bytes=1000\n";
+        let folder: Settings = toml::from_str(old_folder).unwrap();
+        assert!(matches!(
+            folder.advancement,
+            AdvancementSettings::EveryFetch { .. }
+        ));
+        assert!(matches!(
+            folder.supplier().kind,
+            SupplierKind::ManualFolder(_)
+        ));
         let encoded = toml::to_string_pretty(&folder).unwrap();
-        assert!(encoded.contains("mode = \"folder_sequence\""));
         assert_eq!(toml::from_str::<Settings>(&encoded).unwrap(), folder);
 
-        let mixed = format!("{encoded}\ndatabase_path = '/unexpected.db'\n");
-        assert!(toml::from_str::<Settings>(&mixed).is_err());
-    }
-
-    #[tokio::test]
-    async fn persists_replacement_and_rejects_stale_generation() {
-        let directory = tempdir().unwrap();
-        let path = directory.path().join("settings.toml");
-        let original = Settings {
-            mode: ModeSettings::DigikamSqlite(digikam()),
-        };
-        persist_settings(&path, &original).unwrap();
-        let manager = SettingsManager::load(path.clone()).unwrap();
-        let replacement = Settings {
-            mode: ModeSettings::FolderSequence(FolderSettings {
-                directory: directory.path().to_path_buf(),
-                max_upload_bytes: 2048,
-            }),
-        };
-        manager.replace(1, replacement.clone()).await.unwrap();
-        assert_eq!(Settings::load(&path).unwrap(), replacement);
+        let legacy = "database_path='/db'\nquery='SELECT 1'\nmax_candidates=10\n[[path_mappings]]\ndatabase_root='/a'\nmounted_root='/b'\n[selection]\nmode='first'\nrandom_seed=''\ntimezone='UTC'\nrollover_time='03:00'\n";
+        let digi: Settings = toml::from_str(legacy).unwrap();
         assert!(matches!(
-            manager.replace(1, original).await,
-            Err(ReplaceSettingsError::Stale {
-                current_generation: 2
-            })
+            digi.advancement,
+            AdvancementSettings::Scheduled { .. }
+        ));
+        assert!(matches!(
+            digi.supplier().kind,
+            SupplierKind::DigikamSqlite(_)
         ));
     }
 
     #[test]
-    fn validates_mode_specific_fields() {
-        let mut folder = FolderSettings {
-            directory: "relative".into(),
-            max_upload_bytes: 0,
-        };
-        assert!(folder.validate_basic().is_err());
-        folder.directory = "/images".into();
-        folder.max_upload_bytes = 1;
-        folder.validate_basic().unwrap();
+    fn validates_target_supplier_and_schedule() {
+        let mut settings: Settings = toml::from_str("queue={target_length=10,max_upload_bytes=100}\nadvancement={type='manual'}\n[[suppliers]]\nid='one'\ntype='manual_folder'\n[suppliers.settings]\ndirectory='/images'\npoll_interval_seconds=60\n").unwrap();
+        settings.validate().unwrap();
+        settings.queue.target_length = 0;
+        assert!(settings.validate().is_err());
+        settings.queue.target_length = 10;
+        settings.suppliers.push(settings.suppliers[0].clone());
+        assert!(settings.validate().is_err());
+    }
 
-        let mut digi = digikam();
-        digi.max_candidates = 0;
-        assert!(digi.validate_basic().is_err());
+    #[test]
+    fn documented_examples_parse_and_validate() {
+        for example in [
+            include_str!("../settings.example.toml"),
+            include_str!("../settings.folder.example.toml"),
+        ] {
+            let settings: Settings = toml::from_str(example).unwrap();
+            settings.validate().unwrap();
+        }
+    }
+
+    #[test]
+    fn bootstrap_accepts_legacy_cache_dir() {
+        let config: Config =
+            toml::from_str("bind='127.0.0.1:1'\nsettings_path='s'\ncache_dir='q'\n").unwrap();
+        assert_eq!(config.queue_dir, PathBuf::from("q"));
     }
 }

@@ -1,12 +1,21 @@
-# Active image mode and its mode-specific mutable settings.
-mode = "digikam_sqlite"
+[queue]
+target_length = 10
+max_upload_bytes = 26214400
 
-[mode_settings]
+[advancement]
+type = "scheduled"
+
+[advancement.settings]
+timezone = "Europe/Amsterdam"
+times = ["03:00", "15:00"]
+
+[[suppliers]]
+id = "primary"
+type = "digikam_sqlite"
+
+[suppliers.settings]
 database_path = "/catalog/digikam4.db"
 max_candidates = 50000
-
-# The query must be one read-only SELECT/CTE and return these aliases:
-# image_id, root_path, album_path, file_name.
 query = """
 SELECT
     Images.id AS image_id,
@@ -21,12 +30,6 @@ WHERE lower(Images.name) LIKE '%.jpg'
 ORDER BY Images.id
 """
 
-[[mode_settings.path_mappings]]
+[[suppliers.settings.path_mappings]]
 database_root = "/home/user/Pictures"
 mounted_root = "/photos"
-
-[mode_settings.selection]
-mode = "daily_random"
-random_seed = "living-room"
-timezone = "Europe/Amsterdam"
-rollover_time = "03:00"

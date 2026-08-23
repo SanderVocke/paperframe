@@ -1,51 +1,57 @@
 use std::{
-    io::ErrorKind,
-    net::SocketAddr,
+    net::{IpAddr, SocketAddr},
+    pin::Pin,
     sync::Arc,
+    task::{Context as TaskContext, Poll},
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
 use askama::Template;
 use axum::{
     Router,
-    body::Body,
+    body::{Body, Bytes},
     extract::{ConnectInfo, DefaultBodyLimit, Form, Multipart, Path as AxumPath, State},
     http::{HeaderMap, StatusCode, header},
     response::{Html, IntoResponse, Redirect, Response},
     routing::{get, post},
 };
 use chrono::{SecondsFormat, Utc};
+use futures_util::Stream;
 use serde::{Deserialize, Serialize};
-use tokio::io::AsyncReadExt;
+use tokio::sync::OwnedMutexGuard;
 use tower_http::trace::{DefaultMakeSpan, DefaultOnFailure, DefaultOnResponse, TraceLayer};
 use tracing::{Level, error, info};
 
 use crate::{
-    catalog,
     config::{
-        DigikamSettings, FolderSettings, ModeSettings, PathMapping, ReplaceSettingsError,
-        SelectionMode, SelectionSettings, Settings,
+        AdvancementSettings, DigikamSettings, ManualFolderSettings, PathMapping, QueueSettings,
+        ReplaceSettingsError, Settings, SupplierKind, SupplierSettings,
     },
-    state::{ActiveMode, AppState, ImageRequest},
+    queue::{PreparedImage, QueueEntry, QueueEventReason},
+    state::{AppState, ImageRequest},
 };
 
-const SETTINGS_BODY_LIMIT: usize = 64 * 1024;
-const UPLOAD_BODY_LIMIT: usize = 101 * 1024 * 1024;
+const SETTINGS_LIMIT: usize = 64 * 1024;
+const UPLOAD_LIMIT: usize = 101 * 1024 * 1024;
 
 pub fn router(state: Arc<AppState>) -> Router {
     Router::new()
         .route("/settings", get(settings_page).post(update_settings))
-        .route("/folder/refresh", post(refresh_folder))
-        .route("/folder/reorder", post(reorder_folder))
+        .route("/queue/reorder", post(reorder_queue))
+        .route("/queue/remove", post(remove_queue_entry))
+        .route("/queue/advance", post(advance_queue))
         .route(
-            "/folder/upload",
-            post(upload_folder).layer(DefaultBodyLimit::max(UPLOAD_BODY_LIMIT)),
+            "/queue/upload",
+            post(upload_queue).layer(DefaultBodyLimit::max(UPLOAD_LIMIT)),
         )
-        .route("/folder/thumbnail/{id}", get(folder_thumbnail))
+        .route("/queue/thumbnail/{id}", get(queue_thumbnail))
+        .route("/queue/preview/{id}", get(queue_preview))
+        .route("/supplier/refresh", post(refresh_supplier))
+        .route("/supplier/reset-seen", post(reset_supplier_seen))
         .route("/frame/current.jpg", get(get_image).head(head_image))
-        .route("/health/live", get(health_live))
+        .route("/health/live", get(|| async { StatusCode::OK }))
         .route("/health/ready", get(health_ready))
-        .layer(DefaultBodyLimit::max(SETTINGS_BODY_LIMIT))
+        .layer(DefaultBodyLimit::max(SETTINGS_LIMIT))
         .layer(
             TraceLayer::new_for_http()
                 .make_span_with(DefaultMakeSpan::new().level(Level::INFO))
@@ -56,36 +62,43 @@ pub fn router(state: Arc<AppState>) -> Router {
 }
 
 #[derive(Clone)]
-struct FolderTemplateEntry {
+struct QueueView {
     id: String,
-    filename: String,
-    is_next: bool,
+    display_name: String,
+    provenance: String,
+    is_current: bool,
+    order_line: String,
 }
 
 #[derive(Template)]
 #[template(path = "settings.html")]
 struct SettingsTemplate {
     generation: u64,
+    queue_generation: u64,
     csrf_token: String,
-    active_digikam: bool,
-    active_folder: bool,
+    entries: Vec<QueueView>,
+    reorder_lines: String,
+    ready: bool,
+    last_request: String,
+    refill_status: String,
+    supplier_status: String,
+    target_length: String,
+    max_upload_bytes: String,
+    policy_every_fetch: bool,
+    policy_scheduled: bool,
+    policy_manual: bool,
+    frame_client_ips: String,
+    schedule_timezone: String,
+    schedule_times: String,
+    supplier_digikam: bool,
+    supplier_manual: bool,
+    supplier_id: String,
     database_path: String,
     query: String,
     path_mappings: String,
-    mode_first: bool,
-    mode_daily_random: bool,
-    random_seed: String,
-    timezone: String,
-    rollover_time: String,
     max_candidates: String,
-    folder_directory: String,
-    max_upload_bytes: String,
-    folder_generation: u64,
-    folder_entries: Vec<FolderTemplateEntry>,
-    reorder_lines: String,
-    cache_ready: bool,
-    last_request: String,
-    mode_status: String,
+    manual_directory: String,
+    poll_interval_seconds: String,
     error: Option<String>,
 }
 
@@ -93,29 +106,37 @@ struct SettingsTemplate {
 struct SettingsForm {
     generation: String,
     csrf_token: String,
-    active_mode: String,
+    target_length: String,
+    max_upload_bytes: String,
+    advancement_type: String,
+    frame_client_ips: String,
+    schedule_timezone: String,
+    schedule_times: String,
+    supplier_type: String,
+    supplier_id: String,
     database_path: String,
     query: String,
     path_mappings: String,
-    selection_mode: String,
-    random_seed: String,
-    timezone: String,
-    rollover_time: String,
     max_candidates: String,
-    folder_directory: String,
-    max_upload_bytes: String,
+    manual_directory: String,
+    poll_interval_seconds: String,
 }
 
-#[derive(Debug, Deserialize)]
-struct FolderActionForm {
+#[derive(Deserialize)]
+struct QueueActionForm {
     csrf_token: String,
-    inventory_generation: String,
+    queue_generation: String,
 }
-
-#[derive(Debug, Deserialize)]
-struct FolderReorderForm {
+#[derive(Deserialize)]
+struct RemoveForm {
     csrf_token: String,
-    inventory_generation: String,
+    queue_generation: String,
+    id: String,
+}
+#[derive(Deserialize)]
+struct ReorderForm {
+    csrf_token: String,
+    queue_generation: String,
     order: String,
 }
 
@@ -136,26 +157,30 @@ async fn update_settings(
     Form(form): Form<SettingsForm>,
 ) -> Response {
     if form.csrf_token != state.csrf_token() {
-        return render_form_error(&state, form, StatusCode::FORBIDDEN, "Invalid CSRF token").await;
+        return render_error(&state, form, StatusCode::FORBIDDEN, "Invalid CSRF token").await;
     }
-    let expected_generation = match parse_u64(&form.generation, "Settings generation") {
+    let expected = match form.generation.parse() {
         Ok(value) => value,
-        Err(message) => {
-            return render_form_error(&state, form, StatusCode::UNPROCESSABLE_ENTITY, &message)
-                .await;
+        Err(_) => {
+            return render_error(
+                &state,
+                form,
+                StatusCode::UNPROCESSABLE_ENTITY,
+                "Settings generation must be an integer",
+            )
+            .await;
         }
     };
     let proposed = match form.to_settings() {
         Ok(settings) => settings,
         Err(message) => {
-            return render_form_error(&state, form, StatusCode::UNPROCESSABLE_ENTITY, &message)
-                .await;
+            return render_error(&state, form, StatusCode::UNPROCESSABLE_ENTITY, &message).await;
         }
     };
-    let prepared = match validate_and_prepare_mode(&state, &proposed).await {
-        Ok(mode) => mode,
+    let registry = match state.prepare_registry(&proposed).await {
+        Ok(registry) => registry,
         Err(error) => {
-            return render_form_error(
+            return render_error(
                 &state,
                 form,
                 StatusCode::UNPROCESSABLE_ENTITY,
@@ -164,15 +189,14 @@ async fn update_settings(
             .await;
         }
     };
-
-    match state.settings.replace(expected_generation, proposed).await {
+    match state.settings.replace(expected, proposed).await {
         Ok(_) => {
-            state.activate_mode(prepared).await;
-            state.trigger_selection();
+            state.activate_registry(registry).await;
+            state.queue.demand(QueueEventReason::Settings);
             Redirect::to("/settings").into_response()
         }
         Err(ReplaceSettingsError::Stale { current_generation }) => {
-            render_form_error(
+            render_error(
                 &state,
                 form,
                 StatusCode::CONFLICT,
@@ -183,194 +207,24 @@ async fn update_settings(
             .await
         }
         Err(ReplaceSettingsError::Invalid(message)) => {
-            render_form_error(&state, form, StatusCode::UNPROCESSABLE_ENTITY, &message).await
+            render_error(&state, form, StatusCode::UNPROCESSABLE_ENTITY, &message).await
         }
         Err(ReplaceSettingsError::Persistence(message)) => {
-            render_form_error(
-                &state,
-                form,
-                StatusCode::INTERNAL_SERVER_ERROR,
-                &format!("Failed to persist settings: {message}"),
-            )
-            .await
+            render_error(&state, form, StatusCode::INTERNAL_SERVER_ERROR, &message).await
         }
     }
 }
 
-async fn validate_and_prepare_mode(
-    state: &Arc<AppState>,
-    settings: &Settings,
-) -> anyhow::Result<ActiveMode> {
-    settings.validate_basic()?;
-    if let ModeSettings::DigikamSqlite(digikam) = &settings.mode {
-        catalog::validate(digikam.clone()).await?;
-    }
-    state.prepare_mode(&settings.mode).await
-}
-
-async fn refresh_folder(
-    State(state): State<Arc<AppState>>,
-    Form(form): Form<FolderActionForm>,
-) -> Response {
-    let generation =
-        match validate_folder_form(&state, &form.csrf_token, &form.inventory_generation) {
-            Ok(value) => value,
-            Err((status, message)) => return plain_error(status, &message),
-        };
-    let ActiveMode::Folder(folder) = state.active_mode().await else {
-        return plain_error(StatusCode::CONFLICT, "Folder mode is not active");
-    };
-    match folder.refresh(generation).await {
-        Ok(_) => Redirect::to("/settings").into_response(),
-        Err(error) => plain_error(StatusCode::CONFLICT, &error.to_string()),
-    }
-}
-
-async fn reorder_folder(
-    State(state): State<Arc<AppState>>,
-    Form(form): Form<FolderReorderForm>,
-) -> Response {
-    let generation =
-        match validate_folder_form(&state, &form.csrf_token, &form.inventory_generation) {
-            Ok(value) => value,
-            Err((status, message)) => return plain_error(status, &message),
-        };
-    let ActiveMode::Folder(folder) = state.active_mode().await else {
-        return plain_error(StatusCode::CONFLICT, "Folder mode is not active");
-    };
-    let order = form
-        .order
-        .lines()
-        .map(str::trim)
-        .filter(|line| !line.is_empty())
-        .map(str::to_owned)
-        .collect();
-    match folder.reorder(generation, order).await {
-        Ok(_) => Redirect::to("/settings").into_response(),
-        Err(error) => plain_error(StatusCode::CONFLICT, &error.to_string()),
-    }
-}
-
-async fn upload_folder(State(state): State<Arc<AppState>>, mut multipart: Multipart) -> Response {
-    let ActiveMode::Folder(folder) = state.active_mode().await else {
-        return plain_error(StatusCode::CONFLICT, "Folder mode is not active");
-    };
-    let mut csrf_token = None;
-    let mut generation = None;
-    let mut uploads = Vec::new();
-    let mut total = 0_u64;
-    loop {
-        let field = match multipart.next_field().await {
-            Ok(Some(field)) => field,
-            Ok(None) => break,
-            Err(error) => {
-                return plain_error(
-                    StatusCode::BAD_REQUEST,
-                    &format!("Invalid multipart upload: {error}"),
-                );
-            }
-        };
-        let name = field.name().unwrap_or_default().to_owned();
-        if name == "csrf_token" {
-            match field.text().await {
-                Ok(value) => csrf_token = Some(value),
-                Err(error) => {
-                    return plain_error(
-                        StatusCode::BAD_REQUEST,
-                        &format!("Invalid CSRF field: {error}"),
-                    );
-                }
-            }
-        } else if name == "inventory_generation" {
-            match field.text().await {
-                Ok(value) => generation = Some(value),
-                Err(error) => {
-                    return plain_error(
-                        StatusCode::BAD_REQUEST,
-                        &format!("Invalid generation field: {error}"),
-                    );
-                }
-            }
-        } else if name == "images" {
-            let Some(filename) = field.file_name().map(str::to_owned) else {
-                continue;
-            };
-            let bytes = match field.bytes().await {
-                Ok(bytes) => bytes,
-                Err(error) => {
-                    return plain_error(
-                        StatusCode::BAD_REQUEST,
-                        &format!("Failed to read upload: {error}"),
-                    );
-                }
-            };
-            total = match total.checked_add(bytes.len() as u64) {
-                Some(value) => value,
-                None => return plain_error(StatusCode::PAYLOAD_TOO_LARGE, "Upload is too large"),
-            };
-            if total > folder.max_upload_bytes() {
-                return plain_error(
-                    StatusCode::PAYLOAD_TOO_LARGE,
-                    "Upload exceeds the configured limit",
-                );
-            }
-            uploads.push((filename, bytes.to_vec()));
-        }
-    }
-    let Some(csrf_token) = csrf_token else {
-        return plain_error(StatusCode::FORBIDDEN, "Missing CSRF token");
-    };
-    let Some(generation) = generation else {
-        return plain_error(
-            StatusCode::UNPROCESSABLE_ENTITY,
-            "Missing inventory generation",
-        );
-    };
-    let generation = match validate_folder_form(&state, &csrf_token, &generation) {
-        Ok(value) => value,
-        Err((status, message)) => return plain_error(status, &message),
-    };
-    match folder.upload(generation, uploads).await {
-        Ok(_) => Redirect::to("/settings").into_response(),
-        Err(error) => plain_error(StatusCode::UNPROCESSABLE_ENTITY, &error.to_string()),
-    }
-}
-
-fn validate_folder_form(
-    state: &AppState,
-    csrf: &str,
-    generation: &str,
-) -> Result<u64, (StatusCode, String)> {
-    if csrf != state.csrf_token() {
-        return Err((StatusCode::FORBIDDEN, "Invalid CSRF token".into()));
-    }
-    parse_u64(generation, "Inventory generation")
-        .map_err(|message| (StatusCode::UNPROCESSABLE_ENTITY, message))
-}
-
-async fn folder_thumbnail(
-    State(state): State<Arc<AppState>>,
-    AxumPath(id): AxumPath<String>,
-) -> Response {
-    let ActiveMode::Folder(folder) = state.active_mode().await else {
-        return plain_error(StatusCode::NOT_FOUND, "Thumbnail not found");
-    };
-    match folder.thumbnail(&id).await {
-        Ok(image) => rotating_image_response(StatusCode::OK, image.bytes, true),
-        Err(_) => plain_error(StatusCode::NOT_FOUND, "Thumbnail not found"),
-    }
-}
-
-async fn render_form_error(
+async fn render_error(
     state: &Arc<AppState>,
     mut form: SettingsForm,
     status: StatusCode,
-    error: &str,
+    message: &str,
 ) -> Response {
     let generation = state.settings.snapshot().await.generation;
     form.generation = generation.to_string();
-    form.csrf_token = state.csrf_token().to_owned();
-    render_settings(state, generation, form, Some(error.to_owned()), status).await
+    form.csrf_token = state.csrf_token().into();
+    render_settings(state, generation, form, Some(message.into()), status).await
 }
 
 async fn render_settings(
@@ -380,201 +234,285 @@ async fn render_settings(
     error: Option<String>,
     status: StatusCode,
 ) -> Response {
-    let last_request = match state.last_image_request().await {
-        Some(request) => format!(
-            "{} from {} — {} {}",
-            request
-                .requested_at
-                .to_rfc3339_opts(SecondsFormat::Secs, true),
-            request.client_ip,
-            request.response_status.as_u16(),
-            request
-                .response_status
-                .canonical_reason()
-                .unwrap_or("Unknown")
-        ),
-        None => "No image GET has occurred since the server started.".to_owned(),
+    let queue = state.queue.snapshot().await;
+    let entries = queue
+        .entries
+        .iter()
+        .enumerate()
+        .map(|(index, entry)| queue_view(index, entry))
+        .collect::<Vec<_>>();
+    let reorder_lines = entries
+        .iter()
+        .map(|entry| entry.order_line.as_str())
+        .collect::<Vec<_>>()
+        .join("\n");
+    let last_request = state
+        .last_image_request()
+        .await
+        .map(|request| {
+            format!(
+                "{} from {} — {}",
+                request
+                    .requested_at
+                    .to_rfc3339_opts(SecondsFormat::Secs, true),
+                request.client_ip,
+                request.response_status
+            )
+        })
+        .unwrap_or_else(|| "No frame GET since startup.".into());
+    let refill = state.refill_status().await;
+    let refill_status = if refill.running {
+        "Refill is running.".into()
+    } else if let Some(error) = refill.last_error {
+        format!("Last refill error: {error}")
+    } else {
+        format!("Last refill added {} image(s).", refill.last_added)
     };
-    let (folder_generation, folder_entries, reorder_lines) = match state.active_mode().await {
-        ActiveMode::Digikam => (0, Vec::new(), String::new()),
-        ActiveMode::Folder(folder) => {
-            let snapshot = folder.snapshot().await;
-            let serving_order = snapshot.serving_order();
-            let lines = serving_order
-                .iter()
-                .map(|entry| entry.filename.as_str())
-                .collect::<Vec<_>>()
-                .join("\n");
-            let entries = serving_order
-                .into_iter()
-                .enumerate()
-                .map(|(index, entry)| FolderTemplateEntry {
-                    id: entry.id,
-                    filename: entry.filename,
-                    is_next: index == 0,
-                })
-                .collect();
-            (snapshot.generation, entries, lines)
-        }
-    };
+    let supplier_status = format!(
+        "Configured supplier: {}. Queue contains {} image(s).",
+        form.supplier_id,
+        queue.entries.len()
+    );
     let template = SettingsTemplate {
         generation,
-        csrf_token: state.csrf_token().to_owned(),
-        active_digikam: form.active_mode == "digikam_sqlite",
-        active_folder: form.active_mode == "folder_sequence",
+        queue_generation: queue.generation,
+        csrf_token: state.csrf_token().into(),
+        entries,
+        reorder_lines,
+        ready: !queue.entries.is_empty(),
+        last_request,
+        refill_status,
+        supplier_status,
+        target_length: form.target_length,
+        max_upload_bytes: form.max_upload_bytes,
+        policy_every_fetch: form.advancement_type == "every_fetch",
+        policy_scheduled: form.advancement_type == "scheduled",
+        policy_manual: form.advancement_type == "manual",
+        frame_client_ips: form.frame_client_ips,
+        schedule_timezone: form.schedule_timezone,
+        schedule_times: form.schedule_times,
+        supplier_digikam: form.supplier_type == "digikam_sqlite",
+        supplier_manual: form.supplier_type == "manual_folder",
+        supplier_id: form.supplier_id,
         database_path: form.database_path,
         query: form.query,
         path_mappings: form.path_mappings,
-        mode_first: form.selection_mode == "first",
-        mode_daily_random: form.selection_mode == "daily_random",
-        random_seed: form.random_seed,
-        timezone: form.timezone,
-        rollover_time: form.rollover_time,
         max_candidates: form.max_candidates,
-        folder_directory: form.folder_directory,
-        max_upload_bytes: form.max_upload_bytes,
-        folder_generation,
-        folder_entries,
-        reorder_lines,
-        cache_ready: state.is_ready().await,
-        last_request,
-        mode_status: state.mode_status().await,
+        manual_directory: form.manual_directory,
+        poll_interval_seconds: form.poll_interval_seconds,
         error,
     };
     match template.render() {
         Ok(html) => (status, Html(html)).into_response(),
         Err(error) => {
-            tracing::error!(%error, "failed to render settings page");
-            plain_error(
+            error!(%error, "failed to render settings");
+            plain(
                 StatusCode::INTERNAL_SERVER_ERROR,
-                "failed to render settings page",
+                "failed to render settings",
             )
         }
     }
 }
 
-impl SettingsForm {
-    fn from_settings(generation: u64, csrf_token: &str, settings: &Settings) -> Self {
-        let mut form = Self {
-            generation: generation.to_string(),
-            csrf_token: csrf_token.to_owned(),
-            active_mode: String::new(),
-            database_path: String::new(),
-            query: String::new(),
-            path_mappings: String::new(),
-            selection_mode: "first".into(),
-            random_seed: String::new(),
-            timezone: "UTC".into(),
-            rollover_time: "00:00".into(),
-            max_candidates: "50000".into(),
-            folder_directory: String::new(),
-            max_upload_bytes: (25 * 1024 * 1024).to_string(),
-        };
-        match &settings.mode {
-            ModeSettings::DigikamSqlite(settings) => {
-                form.active_mode = "digikam_sqlite".into();
-                form.database_path = settings.database_path.display().to_string();
-                form.query = settings.query.clone();
-                form.path_mappings = settings
-                    .path_mappings
-                    .iter()
-                    .map(|mapping| {
-                        format!(
-                            "{} => {}",
-                            mapping.database_root.display(),
-                            mapping.mounted_root.display()
-                        )
-                    })
-                    .collect::<Vec<_>>()
-                    .join("\n");
-                form.selection_mode = match settings.selection.mode {
-                    SelectionMode::First => "first",
-                    SelectionMode::DailyRandom => "daily_random",
-                }
-                .into();
-                form.random_seed = settings.selection.random_seed.clone();
-                form.timezone = settings.selection.timezone.clone();
-                form.rollover_time = settings.selection.rollover_time.clone();
-                form.max_candidates = settings.max_candidates.to_string();
-            }
-            ModeSettings::FolderSequence(settings) => {
-                form.active_mode = "folder_sequence".into();
-                form.folder_directory = settings.directory.display().to_string();
-                form.max_upload_bytes = settings.max_upload_bytes.to_string();
-            }
-        }
-        form
-    }
-
-    fn to_settings(&self) -> Result<Settings, String> {
-        let mode = match self.active_mode.as_str() {
-            "digikam_sqlite" => {
-                let selection_mode = match self.selection_mode.as_str() {
-                    "first" => SelectionMode::First,
-                    "daily_random" => SelectionMode::DailyRandom,
-                    _ => return Err("Selection mode must be first or daily_random".into()),
-                };
-                ModeSettings::DigikamSqlite(DigikamSettings {
-                    database_path: self.database_path.trim().into(),
-                    query: self.query.clone(),
-                    path_mappings: parse_path_mappings(&self.path_mappings)?,
-                    selection: SelectionSettings {
-                        mode: selection_mode,
-                        random_seed: self.random_seed.clone(),
-                        timezone: self.timezone.trim().to_owned(),
-                        rollover_time: self.rollover_time.trim().to_owned(),
-                    },
-                    max_candidates: self
-                        .max_candidates
-                        .parse()
-                        .map_err(|_| "Maximum candidates must be an integer".to_owned())?,
-                })
-            }
-            "folder_sequence" => ModeSettings::FolderSequence(FolderSettings {
-                directory: self.folder_directory.trim().into(),
-                max_upload_bytes: self
-                    .max_upload_bytes
-                    .parse()
-                    .map_err(|_| "Maximum upload bytes must be an integer".to_owned())?,
-            }),
-            _ => return Err("Active mode must be digikam_sqlite or folder_sequence".into()),
-        };
-        let settings = Settings { mode };
-        settings
-            .validate_basic()
-            .map_err(|error| error.to_string())?;
-        Ok(settings)
+fn queue_view(index: usize, entry: &QueueEntry) -> QueueView {
+    let provenance = entry
+        .supplier_id
+        .clone()
+        .unwrap_or_else(|| "web upload".into());
+    QueueView {
+        id: entry.id.clone(),
+        display_name: entry.display_name.clone(),
+        provenance,
+        is_current: index == 0,
+        order_line: format!("{}\t{}", entry.id, entry.display_name),
     }
 }
 
-fn parse_path_mappings(input: &str) -> Result<Vec<PathMapping>, String> {
-    input
+async fn reorder_queue(
+    State(state): State<Arc<AppState>>,
+    Form(form): Form<ReorderForm>,
+) -> Response {
+    let generation = match validate_action(&state, &form.csrf_token, &form.queue_generation) {
+        Ok(value) => value,
+        Err((status, message)) => return plain(status, &message),
+    };
+    let ids = form
+        .order
         .lines()
-        .filter(|line| !line.trim().is_empty())
-        .map(|line| {
-            let (database_root, mounted_root) = line.split_once("=>").ok_or_else(|| {
-                "Each path mapping must use: database root => mounted root".to_owned()
-            })?;
-            Ok(PathMapping {
-                database_root: database_root.trim().into(),
-                mounted_root: mounted_root.trim().into(),
-            })
-        })
+        .filter_map(|line| line.split_whitespace().next())
+        .map(str::to_owned)
+        .collect();
+    mutation_response(state.queue.reorder(generation, ids).await)
+}
+async fn remove_queue_entry(
+    State(state): State<Arc<AppState>>,
+    Form(form): Form<RemoveForm>,
+) -> Response {
+    let generation = match validate_action(&state, &form.csrf_token, &form.queue_generation) {
+        Ok(value) => value,
+        Err((status, message)) => return plain(status, &message),
+    };
+    mutation_response(state.queue.remove(generation, &form.id).await)
+}
+async fn advance_queue(
+    State(state): State<Arc<AppState>>,
+    Form(form): Form<QueueActionForm>,
+) -> Response {
+    if let Err((status, message)) =
+        validate_action(&state, &form.csrf_token, &form.queue_generation)
+    {
+        return plain(status, &message);
+    }
+    match state.queue.advance().await {
+        Ok(_) => Redirect::to("/settings").into_response(),
+        Err(error) => plain(StatusCode::CONFLICT, &error.to_string()),
+    }
+}
+async fn refresh_supplier(
+    State(state): State<Arc<AppState>>,
+    Form(form): Form<QueueActionForm>,
+) -> Response {
+    if let Err((status, message)) =
+        validate_action(&state, &form.csrf_token, &form.queue_generation)
+    {
+        return plain(status, &message);
+    }
+    state.queue.demand(QueueEventReason::SupplierRefresh);
+    Redirect::to("/settings").into_response()
+}
+async fn reset_supplier_seen(
+    State(state): State<Arc<AppState>>,
+    Form(form): Form<QueueActionForm>,
+) -> Response {
+    let generation = match validate_action(&state, &form.csrf_token, &form.queue_generation) {
+        Ok(value) => value,
+        Err((status, message)) => return plain(status, &message),
+    };
+    let supplier_id = state
+        .settings
+        .snapshot()
+        .await
+        .settings
+        .supplier()
+        .id
+        .clone();
+    mutation_response(state.queue.reset_seen(generation, &supplier_id).await)
+}
+fn mutation_response(result: anyhow::Result<crate::queue::QueueSnapshot>) -> Response {
+    match result {
+        Ok(_) => Redirect::to("/settings").into_response(),
+        Err(error) => plain(StatusCode::CONFLICT, &error.to_string()),
+    }
+}
+fn validate_action(
+    state: &AppState,
+    csrf: &str,
+    generation: &str,
+) -> Result<u64, (StatusCode, String)> {
+    if csrf != state.csrf_token() {
+        return Err((StatusCode::FORBIDDEN, "Invalid CSRF token".into()));
+    }
+    generation.parse().map_err(|_| {
+        (
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "Queue generation must be an integer".into(),
+        )
+    })
+}
+
+async fn upload_queue(State(state): State<Arc<AppState>>, mut multipart: Multipart) -> Response {
+    let settings = state.settings.snapshot().await.settings;
+    let mut csrf = None;
+    let mut generation = None;
+    let mut uploads = Vec::new();
+    let mut total = 0_u64;
+    loop {
+        let field = match multipart.next_field().await {
+            Ok(Some(field)) => field,
+            Ok(None) => break,
+            Err(error) => return plain(StatusCode::BAD_REQUEST, &error.to_string()),
+        };
+        match field.name().unwrap_or_default() {
+            "csrf_token" => match field.text().await {
+                Ok(value) => csrf = Some(value),
+                Err(error) => return plain(StatusCode::BAD_REQUEST, &error.to_string()),
+            },
+            "queue_generation" => match field.text().await {
+                Ok(value) => generation = Some(value),
+                Err(error) => return plain(StatusCode::BAD_REQUEST, &error.to_string()),
+            },
+            "images" => {
+                let Some(filename) = field.file_name().map(str::to_owned) else {
+                    continue;
+                };
+                let bytes = match field.bytes().await {
+                    Ok(bytes) => bytes,
+                    Err(error) => return plain(StatusCode::BAD_REQUEST, &error.to_string()),
+                };
+                total = total.saturating_add(bytes.len() as u64);
+                if total > settings.queue.max_upload_bytes {
+                    return plain(
+                        StatusCode::PAYLOAD_TOO_LARGE,
+                        "Upload exceeds configured limit",
+                    );
+                }
+                uploads.push((safe_display_name(&filename), bytes.to_vec()));
+            }
+            _ => {}
+        }
+    }
+    let csrf = csrf.unwrap_or_default();
+    let generation = generation.unwrap_or_default();
+    if let Err((status, message)) = validate_action(&state, &csrf, &generation) {
+        return plain(status, &message);
+    }
+    if uploads.is_empty() {
+        return plain(StatusCode::UNPROCESSABLE_ENTITY, "Select at least one JPEG");
+    }
+    for (name, bytes) in uploads {
+        if let Err(error) = state.queue.enqueue(name, bytes, None, None).await {
+            return plain(StatusCode::UNPROCESSABLE_ENTITY, &error.to_string());
+        }
+    }
+    Redirect::to("/settings").into_response()
+}
+fn safe_display_name(name: &str) -> String {
+    std::path::Path::new(name)
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("upload.jpg")
+        .chars()
+        .map(|c| if c.is_control() { '_' } else { c })
         .collect()
 }
 
-fn parse_u64(value: &str, label: &str) -> Result<u64, String> {
-    value
-        .parse::<u64>()
-        .map_err(|_| format!("{label} must be an integer"))
+async fn queue_thumbnail(
+    State(state): State<Arc<AppState>>,
+    AxumPath(id): AxumPath<String>,
+) -> Response {
+    preview_response(state.queue.prepare(&id).await)
 }
-
-async fn health_live() -> StatusCode {
-    StatusCode::OK
+async fn queue_preview(
+    State(state): State<Arc<AppState>>,
+    AxumPath(id): AxumPath<String>,
+) -> Response {
+    preview_response(state.queue.prepare(&id).await)
+}
+fn preview_response(result: anyhow::Result<PreparedImage>) -> Response {
+    match result {
+        Ok(image) => jpeg_response(
+            StatusCode::OK,
+            Body::from(image.bytes.clone()),
+            image.bytes.len(),
+            None,
+            Some("no-store"),
+        ),
+        Err(_) => plain(StatusCode::NOT_FOUND, "Queue image not found"),
+    }
 }
 
 async fn health_ready(State(state): State<Arc<AppState>>) -> StatusCode {
-    if state.is_ready().await {
+    if state.queue.current().await.ok().flatten().is_some() {
         StatusCode::OK
     } else {
         StatusCode::SERVICE_UNAVAILABLE
@@ -586,21 +524,23 @@ async fn get_image(
     ConnectInfo(peer): ConnectInfo<SocketAddr>,
     headers: HeaderMap,
 ) -> Response {
-    let response = match state.active_mode().await {
-        ActiveMode::Digikam => cached_image_response(&state, &headers, true).await,
-        ActiveMode::Folder(folder) => match folder.next_image().await {
-            Ok(image) => rotating_image_response(StatusCode::OK, image.bytes, true),
-            Err(error) if !folder.is_ready().await => {
-                plain_error(StatusCode::NOT_FOUND, &error.to_string())
-            }
-            Err(error) => {
-                error!(%error, "failed to prepare next folder image");
-                plain_error(
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    "failed to read next image",
-                )
-            }
-        },
+    let settings = state.settings.snapshot().await.settings;
+    let every_fetch = matches!(settings.advancement, AdvancementSettings::EveryFetch { .. });
+    let qualifies = match &settings.advancement {
+        AdvancementSettings::EveryFetch { frame_client_ips } => {
+            frame_client_ips.is_empty() || frame_client_ips.contains(&peer.ip())
+        }
+        _ => false,
+    };
+    let response = if every_fetch && qualifies {
+        let permit = state.frame_serialization.clone().lock_owned().await;
+        match state.queue.current().await {
+            Ok(Some(image)) => completion_response(state.queue.clone(), image, permit),
+            Ok(None) => plain(StatusCode::NOT_FOUND, "Queue is empty"),
+            Err(error) => plain(StatusCode::INTERNAL_SERVER_ERROR, &error.to_string()),
+        }
+    } else {
+        stable_current_response(&state, &headers, true, every_fetch).await
     };
     let status = response.status();
     state
@@ -610,138 +550,132 @@ async fn get_image(
             response_status: status,
         })
         .await;
-    info!(client_ip = %peer.ip(), %status, "image requested");
+    info!(client_ip = %peer.ip(), qualifies, %status, "frame image requested");
     response
 }
 
 async fn head_image(State(state): State<Arc<AppState>>, headers: HeaderMap) -> Response {
-    match state.active_mode().await {
-        ActiveMode::Digikam => cached_image_response(&state, &headers, false).await,
-        ActiveMode::Folder(folder) => match folder.peek_image().await {
-            Ok(image) => rotating_image_response(StatusCode::OK, image.bytes, false),
-            Err(error) if !folder.is_ready().await => {
-                plain_error(StatusCode::NOT_FOUND, &error.to_string())
-            }
-            Err(error) => {
-                error!(%error, "failed to inspect next folder image");
-                plain_error(
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    "failed to read next image",
-                )
-            }
-        },
-    }
+    let every_fetch = matches!(
+        state.settings.snapshot().await.settings.advancement,
+        AdvancementSettings::EveryFetch { .. }
+    );
+    stable_current_response(&state, &headers, false, every_fetch).await
 }
 
-fn rotating_image_response(status: StatusCode, bytes: Vec<u8>, include_body: bool) -> Response {
-    let length = bytes.len();
-    Response::builder()
-        .status(status)
-        .header(header::CONTENT_TYPE, "image/jpeg")
-        .header(header::CONTENT_LENGTH, length)
-        .header(header::CACHE_CONTROL, "no-store")
-        .body(if include_body {
-            Body::from(bytes)
-        } else {
-            Body::empty()
-        })
-        .unwrap_or_else(|_| Response::new(Body::empty()))
-}
-
-async fn cached_image_response(
+async fn stable_current_response(
     state: &AppState,
     headers: &HeaderMap,
     include_body: bool,
+    no_store: bool,
 ) -> Response {
-    let mut file = match tokio::fs::File::open(state.cache.current_path()).await {
-        Ok(file) => file,
-        Err(error) if error.kind() == ErrorKind::NotFound => {
-            return plain_error(StatusCode::NOT_FOUND, "image not found");
-        }
-        Err(error) => {
-            error!(%error, "failed to open cached image");
-            return plain_error(StatusCode::INTERNAL_SERVER_ERROR, "failed to read image");
-        }
+    let image = match state.queue.current().await {
+        Ok(Some(image)) => image,
+        Ok(None) => return plain(StatusCode::NOT_FOUND, "Queue is empty"),
+        Err(error) => return plain(StatusCode::INTERNAL_SERVER_ERROR, &error.to_string()),
     };
-    let metadata = match file.metadata().await {
-        Ok(metadata) => metadata,
-        Err(error) => {
-            error!(%error, "failed to inspect cached image");
-            return plain_error(StatusCode::INTERNAL_SERVER_ERROR, "failed to read image");
-        }
-    };
-    let modified = match metadata.modified() {
-        Ok(modified) => modified,
-        Err(error) => {
-            error!(%error, "cached image has no modification time");
-            return plain_error(StatusCode::INTERNAL_SERVER_ERROR, "failed to read image");
-        }
-    };
-    let last_modified = httpdate::fmt_http_date(modified);
-    if is_not_modified(headers, modified) {
-        return build_cached_response(
+    let modified = httpdate::fmt_http_date(image.modified);
+    if !no_store && is_not_modified(headers, image.modified) {
+        return jpeg_response(
             StatusCode::NOT_MODIFIED,
             Body::empty(),
+            0,
+            Some(&modified),
             None,
-            &last_modified,
         );
     }
-    if !include_body {
-        return build_cached_response(
-            StatusCode::OK,
-            Body::empty(),
-            Some(metadata.len()),
-            &last_modified,
-        );
-    }
-    let mut bytes = Vec::new();
-    if let Err(error) = file.read_to_end(&mut bytes).await {
-        error!(%error, "failed to read cached image");
-        return plain_error(StatusCode::INTERNAL_SERVER_ERROR, "failed to read image");
-    }
-    build_cached_response(
+    let length = image.bytes.len();
+    jpeg_response(
         StatusCode::OK,
-        Body::from(bytes),
-        Some(metadata.len()),
-        &last_modified,
+        if include_body {
+            Body::from(image.bytes)
+        } else {
+            Body::empty()
+        },
+        length,
+        if no_store { None } else { Some(&modified) },
+        if no_store { Some("no-store") } else { None },
     )
 }
 
-fn is_not_modified(headers: &HeaderMap, modified: SystemTime) -> bool {
-    let Some(value) = headers.get(header::IF_MODIFIED_SINCE) else {
-        return false;
+fn completion_response(
+    queue: Arc<crate::queue::QueueStore>,
+    image: PreparedImage,
+    permit: OwnedMutexGuard<()>,
+) -> Response {
+    let length = image.bytes.len();
+    let id = image.entry.id;
+    let stream = CompletionStream {
+        bytes: Some(Bytes::from(image.bytes)),
+        completion: Some((queue, id, permit)),
     };
-    let Ok(value) = value.to_str() else {
-        return false;
-    };
-    let Ok(since) = httpdate::parse_http_date(value) else {
-        return false;
-    };
-    let Ok(since_epoch) = modified.duration_since(UNIX_EPOCH) else {
-        return false;
-    };
-    UNIX_EPOCH + Duration::from_secs(since_epoch.as_secs()) <= since
+    jpeg_response(
+        StatusCode::OK,
+        Body::from_stream(stream),
+        length,
+        None,
+        Some("no-store"),
+    )
 }
 
-fn build_cached_response(
+struct CompletionStream {
+    bytes: Option<Bytes>,
+    completion: Option<(Arc<crate::queue::QueueStore>, String, OwnedMutexGuard<()>)>,
+}
+impl Stream for CompletionStream {
+    type Item = Result<Bytes, std::io::Error>;
+    fn poll_next(mut self: Pin<&mut Self>, _cx: &mut TaskContext<'_>) -> Poll<Option<Self::Item>> {
+        if let Some(bytes) = self.bytes.take() {
+            return Poll::Ready(Some(Ok(bytes)));
+        }
+        if let Some((queue, id, permit)) = self.completion.take() {
+            tokio::spawn(async move {
+                if let Err(error) = queue.advance_if_current(&id).await {
+                    error!(%error, "completed-response advancement failed");
+                }
+                drop(permit);
+            });
+        }
+        Poll::Ready(None)
+    }
+}
+
+fn jpeg_response(
     status: StatusCode,
     body: Body,
-    content_length: Option<u64>,
-    last_modified: &str,
+    length: usize,
+    modified: Option<&str>,
+    cache: Option<&str>,
 ) -> Response {
     let mut builder = Response::builder()
         .status(status)
-        .header(header::CONTENT_TYPE, "image/jpeg")
-        .header(header::LAST_MODIFIED, last_modified);
-    if let Some(length) = content_length {
+        .header(header::CONTENT_TYPE, "image/jpeg");
+    if status != StatusCode::NOT_MODIFIED {
         builder = builder.header(header::CONTENT_LENGTH, length);
+    }
+    if let Some(value) = modified {
+        builder = builder.header(header::LAST_MODIFIED, value);
+    }
+    if let Some(value) = cache {
+        builder = builder.header(header::CACHE_CONTROL, value);
     }
     builder
         .body(body)
         .unwrap_or_else(|_| Response::new(Body::empty()))
 }
-
-fn plain_error(status: StatusCode, message: &str) -> Response {
+fn is_not_modified(headers: &HeaderMap, modified: SystemTime) -> bool {
+    let Some(value) = headers
+        .get(header::IF_MODIFIED_SINCE)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| httpdate::parse_http_date(value).ok())
+    else {
+        return false;
+    };
+    let Ok(duration) = modified.duration_since(UNIX_EPOCH) else {
+        return false;
+    };
+    UNIX_EPOCH + Duration::from_secs(duration.as_secs()) <= value
+}
+fn plain(status: StatusCode, message: &str) -> Response {
     (
         status,
         [(header::CONTENT_TYPE, "text/plain; charset=utf-8")],
@@ -750,63 +684,214 @@ fn plain_error(status: StatusCode, message: &str) -> Response {
         .into_response()
 }
 
+impl SettingsForm {
+    fn from_settings(generation: u64, csrf: &str, settings: &Settings) -> Self {
+        let mut form = Self {
+            generation: generation.to_string(),
+            csrf_token: csrf.into(),
+            target_length: settings.queue.target_length.to_string(),
+            max_upload_bytes: settings.queue.max_upload_bytes.to_string(),
+            advancement_type: "manual".into(),
+            frame_client_ips: String::new(),
+            schedule_timezone: "UTC".into(),
+            schedule_times: "03:00".into(),
+            supplier_type: String::new(),
+            supplier_id: settings.supplier().id.clone(),
+            database_path: String::new(),
+            query: String::new(),
+            path_mappings: String::new(),
+            max_candidates: "50000".into(),
+            manual_directory: String::new(),
+            poll_interval_seconds: "60".into(),
+        };
+        match &settings.advancement {
+            AdvancementSettings::EveryFetch { frame_client_ips } => {
+                form.advancement_type = "every_fetch".into();
+                form.frame_client_ips = frame_client_ips
+                    .iter()
+                    .map(ToString::to_string)
+                    .collect::<Vec<_>>()
+                    .join("\n");
+            }
+            AdvancementSettings::Scheduled { timezone, times } => {
+                form.advancement_type = "scheduled".into();
+                form.schedule_timezone = timezone.clone();
+                form.schedule_times = times.join("\n");
+            }
+            AdvancementSettings::Manual => form.advancement_type = "manual".into(),
+        }
+        match &settings.supplier().kind {
+            SupplierKind::DigikamSqlite(digi) => {
+                form.supplier_type = "digikam_sqlite".into();
+                form.database_path = digi.database_path.display().to_string();
+                form.query = digi.query.clone();
+                form.path_mappings = digi
+                    .path_mappings
+                    .iter()
+                    .map(|m| {
+                        format!(
+                            "{} => {}",
+                            m.database_root.display(),
+                            m.mounted_root.display()
+                        )
+                    })
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                form.max_candidates = digi.max_candidates.to_string();
+            }
+            SupplierKind::ManualFolder(manual) => {
+                form.supplier_type = "manual_folder".into();
+                form.manual_directory = manual.directory.display().to_string();
+                form.poll_interval_seconds = manual.poll_interval_seconds.to_string();
+            }
+        }
+        form
+    }
+
+    fn to_settings(&self) -> Result<Settings, String> {
+        let advancement = match self.advancement_type.as_str() {
+            "every_fetch" => AdvancementSettings::EveryFetch {
+                frame_client_ips: self
+                    .frame_client_ips
+                    .lines()
+                    .filter(|line| !line.trim().is_empty())
+                    .map(|line| {
+                        line.trim()
+                            .parse::<IpAddr>()
+                            .map_err(|_| format!("Invalid frame client IP: {line}"))
+                    })
+                    .collect::<Result<_, _>>()?,
+            },
+            "scheduled" => AdvancementSettings::Scheduled {
+                timezone: self.schedule_timezone.trim().into(),
+                times: self
+                    .schedule_times
+                    .lines()
+                    .filter(|line| !line.trim().is_empty())
+                    .map(|line| line.trim().into())
+                    .collect(),
+            },
+            "manual" => AdvancementSettings::Manual,
+            _ => return Err("Unknown advancement policy".into()),
+        };
+        let kind = match self.supplier_type.as_str() {
+            "digikam_sqlite" => SupplierKind::DigikamSqlite(DigikamSettings {
+                database_path: self.database_path.trim().into(),
+                query: self.query.clone(),
+                path_mappings: parse_mappings(&self.path_mappings)?,
+                max_candidates: self
+                    .max_candidates
+                    .parse()
+                    .map_err(|_| "Maximum candidates must be an integer")?,
+            }),
+            "manual_folder" => SupplierKind::ManualFolder(ManualFolderSettings {
+                directory: self.manual_directory.trim().into(),
+                poll_interval_seconds: self
+                    .poll_interval_seconds
+                    .parse()
+                    .map_err(|_| "Poll interval must be an integer")?,
+            }),
+            _ => return Err("Unknown supplier type".into()),
+        };
+        let settings = Settings {
+            queue: QueueSettings {
+                target_length: self
+                    .target_length
+                    .parse()
+                    .map_err(|_| "Target length must be an integer")?,
+                max_upload_bytes: self
+                    .max_upload_bytes
+                    .parse()
+                    .map_err(|_| "Maximum upload bytes must be an integer")?,
+            },
+            advancement,
+            suppliers: vec![SupplierSettings {
+                id: self.supplier_id.trim().into(),
+                kind,
+            }],
+        };
+        settings.validate().map_err(|error| error.to_string())?;
+        Ok(settings)
+    }
+}
+fn parse_mappings(input: &str) -> Result<Vec<PathMapping>, String> {
+    input
+        .lines()
+        .filter(|line| !line.trim().is_empty())
+        .map(|line| {
+            let (a, b) = line
+                .split_once("=>")
+                .ok_or("Path mappings must use source => mounted")?;
+            Ok(PathMapping {
+                database_root: a.trim().into(),
+                mounted_root: b.trim().into(),
+            })
+        })
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
-    use std::{fs, path::PathBuf};
+    use std::{fs, net::IpAddr, path::Path};
 
-    use axum::{body::Body, http::Request};
+    use axum::{body::Body, extract::ConnectInfo, http::Request};
     use http_body_util::BodyExt;
-    use rusqlite::Connection;
     use tempfile::tempdir;
-    use tokio::{
-        sync::watch,
-        time::{Duration as TokioDuration, timeout},
-    };
+    use tokio::time::{Duration as TokioDuration, timeout};
     use tower::ServiceExt;
 
-    use crate::{cache::CacheStore, config::SettingsManager};
+    use crate::{config::SettingsManager, refill};
 
     use super::*;
 
-    const JPEG_A: &[u8] = b"\xff\xd8\xffA\xff\xd9";
-    const JPEG_B: &[u8] = b"\xff\xd8\xffB\xff\xd9";
+    const A: &[u8] = b"\xff\xd8\xffA\xff\xd9";
+    const B: &[u8] = b"\xff\xd8\xffB\xff\xd9";
+    const C: &[u8] = b"\xff\xd8\xffC\xff\xd9";
 
-    async fn folder_state() -> (tempfile::TempDir, Arc<AppState>) {
+    async fn manual_state(policy: AdvancementSettings) -> (tempfile::TempDir, Arc<AppState>) {
         let directory = tempdir().unwrap();
-        let images = directory.path().join("images");
-        let cache = directory.path().join("cache");
-        fs::create_dir(&images).unwrap();
-        fs::create_dir(&cache).unwrap();
-        fs::write(images.join("a.jpg"), JPEG_A).unwrap();
-        fs::write(images.join("b.jpg"), JPEG_B).unwrap();
-        let settings_path = directory.path().join("settings.toml");
+        let source = directory.path().join("source");
+        let queue = directory.path().join("queue");
+        fs::create_dir(&source).unwrap();
+        fs::create_dir(&queue).unwrap();
+        fs::write(source.join("b.jpg"), B).unwrap();
+        fs::write(source.join("a.jpg"), A).unwrap();
+        fs::write(source.join("c.jpg"), C).unwrap();
         let settings = Settings {
-            mode: ModeSettings::FolderSequence(FolderSettings {
-                directory: images,
+            queue: QueueSettings {
+                target_length: 3,
                 max_upload_bytes: 1024,
-            }),
+            },
+            advancement: policy,
+            suppliers: vec![SupplierSettings {
+                id: "manual".into(),
+                kind: SupplierKind::ManualFolder(ManualFolderSettings {
+                    directory: source,
+                    poll_interval_seconds: 60,
+                }),
+            }],
         };
+        let settings_path = directory.path().join("settings.toml");
         fs::write(&settings_path, toml::to_string_pretty(&settings).unwrap()).unwrap();
-        let config = crate::config::Config {
-            bind: "127.0.0.1:0".parse().unwrap(),
-            settings_path: settings_path.clone(),
-            cache_dir: cache.clone(),
-        };
         let state = AppState::initialize(
-            config,
+            crate::config::Config {
+                bind: "127.0.0.1:0".parse().unwrap(),
+                settings_path: settings_path.clone(),
+                queue_dir: queue,
+            },
             SettingsManager::load(settings_path).unwrap(),
-            CacheStore::new(&cache).unwrap(),
         )
         .await
         .unwrap();
+        refill::refill_once(&state).await.unwrap();
         (directory, state)
     }
 
-    fn frame_request(method: &str) -> Request<Body> {
+    fn frame_request(method: &str, ip: [u8; 4]) -> Request<Body> {
         Request::builder()
             .method(method)
             .uri("/frame/current.jpg")
-            .extension(ConnectInfo(SocketAddr::from(([127, 0, 0, 1], 1234))))
+            .extension(ConnectInfo(SocketAddr::from((ip, 1234))))
             .body(Body::empty())
             .unwrap()
     }
@@ -821,414 +906,166 @@ mod tests {
             .to_vec()
     }
 
-    #[tokio::test]
-    async fn folder_get_advances_head_does_not_and_wraps() {
-        let (_directory, state) = folder_state().await;
-        let app = router(state.clone());
-        let head = app.clone().oneshot(frame_request("HEAD")).await.unwrap();
-        assert_eq!(head.status(), StatusCode::OK);
-        assert_eq!(head.headers()[header::CACHE_CONTROL], "no-store");
-        assert!(bytes(head).await.is_empty());
-        assert!(state.last_image_request().await.is_none());
-        assert_eq!(
-            bytes(app.clone().oneshot(frame_request("GET")).await.unwrap()).await,
-            JPEG_A
-        );
-        let conditional = Request::builder()
-            .method("GET")
-            .uri("/frame/current.jpg")
-            .header(header::IF_MODIFIED_SINCE, "Wed, 31 Dec 2099 23:59:59 GMT")
-            .extension(ConnectInfo(SocketAddr::from(([127, 0, 0, 1], 1234))))
-            .body(Body::empty())
-            .unwrap();
-        let conditional = app.clone().oneshot(conditional).await.unwrap();
-        assert_eq!(conditional.status(), StatusCode::OK);
-        assert_eq!(bytes(conditional).await, JPEG_B);
-        assert_eq!(
-            bytes(app.oneshot(frame_request("GET")).await.unwrap()).await,
-            JPEG_A
-        );
-        assert_eq!(
-            state.last_image_request().await.unwrap().client_ip,
-            "127.0.0.1".parse::<std::net::IpAddr>().unwrap()
-        );
-    }
-
-    #[tokio::test]
-    async fn thumbnails_and_settings_do_not_advance() {
-        let (_directory, state) = folder_state().await;
-        let snapshot = match state.active_mode().await {
-            ActiveMode::Folder(folder) => folder.snapshot().await,
-            ActiveMode::Digikam => unreachable!(),
-        };
-        let app = router(state);
-        let settings = app
-            .clone()
-            .oneshot(Request::get("/settings").body(Body::empty()).unwrap())
-            .await
-            .unwrap();
-        let html = String::from_utf8(bytes(settings).await).unwrap();
-        assert!(html.contains("a.jpg"));
-        let thumbnail = app
-            .clone()
-            .oneshot(
-                Request::get(format!("/folder/thumbnail/{}", snapshot.entries[0].id))
-                    .body(Body::empty())
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-        assert_eq!(bytes(thumbnail).await, JPEG_A);
-        assert_eq!(
-            bytes(app.oneshot(frame_request("GET")).await.unwrap()).await,
-            JPEG_A
-        );
-    }
-
-    #[tokio::test]
-    async fn settings_escapes_folder_filenames() {
-        let (directory, state) = folder_state().await;
-        fs::write(directory.path().join("images/<script>.jpg"), JPEG_A).unwrap();
-        if let ActiveMode::Folder(folder) = state.active_mode().await {
-            let generation = folder.snapshot().await.generation;
-            folder.refresh(generation).await.unwrap();
-        }
-        let response = router(state)
-            .oneshot(Request::get("/settings").body(Body::empty()).unwrap())
-            .await
-            .unwrap();
-        let html = String::from_utf8(bytes(response).await).unwrap();
-        assert!(html.contains("&#60;script&#62;.jpg"));
-        assert!(!html.contains("<script>.jpg"));
-    }
-
-    #[tokio::test]
-    async fn settings_rejects_csrf_stale_generation_and_oversized_bodies() {
-        let (_directory, state) = folder_state().await;
-        let snapshot = state.settings.snapshot().await;
-        let mut form = SettingsForm::from_settings(
-            snapshot.generation,
-            state.csrf_token(),
-            &snapshot.settings,
-        );
-        form.csrf_token = "wrong".into();
-        let app = router(state.clone());
-        let response = app
-            .clone()
-            .oneshot(
-                Request::post("/settings")
-                    .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
-                    .body(Body::from(serde_urlencoded::to_string(&form).unwrap()))
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-        assert_eq!(response.status(), StatusCode::FORBIDDEN);
-        assert_eq!(
-            state.settings.snapshot().await.generation,
-            snapshot.generation
-        );
-
-        form.csrf_token = state.csrf_token().into();
-        form.generation = "99".into();
-        let response = app
-            .clone()
-            .oneshot(
-                Request::post("/settings")
-                    .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
-                    .body(Body::from(serde_urlencoded::to_string(&form).unwrap()))
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-        assert_eq!(response.status(), StatusCode::CONFLICT);
-        assert_eq!(
-            state.settings.snapshot().await.generation,
-            snapshot.generation
-        );
-
-        let response = app
-            .oneshot(
-                Request::post("/settings")
-                    .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
-                    .body(Body::from("x".repeat(70 * 1024)))
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-        assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
-    }
-
-    #[tokio::test]
-    async fn readiness_tracks_empty_folder() {
-        let (_directory, state) = folder_state().await;
-        let app = router(state.clone());
-        assert_eq!(
-            app.clone()
-                .oneshot(Request::get("/health/ready").body(Body::empty()).unwrap())
-                .await
-                .unwrap()
-                .status(),
-            StatusCode::OK
-        );
-        if let ActiveMode::Folder(folder) = state.active_mode().await {
-            for entry in folder.snapshot().await.entries {
-                fs::remove_file(folder.root().join(entry.filename)).unwrap();
-            }
-            let generation = folder.snapshot().await.generation;
-            folder.refresh(generation).await.unwrap();
-        }
-        assert_eq!(
-            app.clone()
-                .oneshot(Request::get("/health/ready").body(Body::empty()).unwrap())
-                .await
-                .unwrap()
-                .status(),
-            StatusCode::SERVICE_UNAVAILABLE
-        );
-        assert_eq!(
-            app.oneshot(frame_request("GET")).await.unwrap().status(),
-            StatusCode::NOT_FOUND
-        );
-    }
-
-    #[tokio::test]
-    async fn folder_http_upload_reorder_refresh_and_csrf_protection_work() {
-        let (directory, state) = folder_state().await;
-        let (generation, token) = match state.active_mode().await {
-            ActiveMode::Folder(folder) => (
-                folder.snapshot().await.generation,
-                state.csrf_token().to_owned(),
-            ),
-            ActiveMode::Digikam => unreachable!(),
-        };
-        let boundary = "paperframe-boundary";
-        let mut body = Vec::new();
-        for (name, value) in [
-            ("csrf_token", token.as_str()),
-            ("inventory_generation", &generation.to_string()),
-        ] {
-            body.extend_from_slice(format!("--{boundary}\r\nContent-Disposition: form-data; name=\"{name}\"\r\n\r\n{value}\r\n").as_bytes());
-        }
-        body.extend_from_slice(format!("--{boundary}\r\nContent-Disposition: form-data; name=\"images\"; filename=\"c.jpg\"\r\nContent-Type: image/jpeg\r\n\r\n").as_bytes());
-        body.extend_from_slice(JPEG_A);
-        body.extend_from_slice(format!("\r\n--{boundary}--\r\n").as_bytes());
-        let app = router(state.clone());
-        let upload = app
-            .clone()
-            .oneshot(
-                Request::post("/folder/upload")
-                    .header(
-                        header::CONTENT_TYPE,
-                        format!("multipart/form-data; boundary={boundary}"),
-                    )
-                    .body(Body::from(body))
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-        assert_eq!(upload.status(), StatusCode::SEE_OTHER);
-
-        let folder = match state.active_mode().await {
-            ActiveMode::Folder(folder) => folder,
-            ActiveMode::Digikam => unreachable!(),
-        };
-        let snapshot = folder.snapshot().await;
-        assert_eq!(snapshot.entries.len(), 3);
-        let reversed = snapshot
-            .entries
-            .iter()
-            .rev()
-            .map(|entry| entry.filename.as_str())
-            .collect::<Vec<_>>()
-            .join("\n");
-        let reorder_body = serde_urlencoded::to_string([
-            ("csrf_token", token.as_str()),
-            ("inventory_generation", &snapshot.generation.to_string()),
-            ("order", reversed.as_str()),
-        ])
-        .unwrap();
-        let reorder = app
-            .clone()
-            .oneshot(
-                Request::post("/folder/reorder")
-                    .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
-                    .body(Body::from(reorder_body))
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-        assert_eq!(reorder.status(), StatusCode::SEE_OTHER);
-        assert!(
-            fs::read_dir(directory.path().join("images"))
-                .unwrap()
-                .all(|entry| {
-                    entry
-                        .unwrap()
-                        .file_name()
-                        .to_string_lossy()
-                        .starts_with('0')
-                })
-        );
-
-        let current_generation = folder.snapshot().await.generation;
-        let bad_refresh = serde_urlencoded::to_string([
-            ("csrf_token", "wrong"),
-            ("inventory_generation", &current_generation.to_string()),
-        ])
-        .unwrap();
-        let response = app
-            .oneshot(
-                Request::post("/folder/refresh")
-                    .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
-                    .body(Body::from(bad_refresh))
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-        assert_eq!(response.status(), StatusCode::FORBIDDEN);
-        assert_eq!(folder.snapshot().await.generation, current_generation);
-    }
-
-    #[tokio::test]
-    async fn settings_http_switches_modes_and_triggers_immediate_digikam_selection() {
-        let (directory, state) = folder_state().await;
-        let photos = directory.path().join("photos");
-        fs::create_dir(&photos).unwrap();
-        fs::write(photos.join("selected.jpg"), JPEG_B).unwrap();
-        let database = directory.path().join("digikam.db");
-        Connection::open(&database).unwrap();
-
-        let snapshot = state.settings.snapshot().await;
-        let mut form = SettingsForm::from_settings(
-            snapshot.generation,
-            state.csrf_token(),
-            &snapshot.settings,
-        );
-        form.active_mode = "digikam_sqlite".into();
-        form.database_path = database.display().to_string();
-        form.query = "SELECT 7 AS image_id, '/library' AS root_path, '/' AS album_path, 'selected.jpg' AS file_name".into();
-        form.path_mappings = format!("/library => {}", photos.display());
-        form.selection_mode = "first".into();
-        form.timezone = "UTC".into();
-        form.rollover_time = "00:00".into();
-        form.max_candidates = "10".into();
-
-        let (shutdown_tx, shutdown_rx) = watch::channel(false);
-        let scheduler = tokio::spawn(crate::scheduler::run(state.clone(), shutdown_rx));
-        let response = router(state.clone())
-            .oneshot(
-                Request::post("/settings")
-                    .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
-                    .body(Body::from(serde_urlencoded::to_string(&form).unwrap()))
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-        assert_eq!(response.status(), StatusCode::SEE_OTHER);
+    async fn wait_for_current(state: &AppState, expected: &[u8]) {
         timeout(TokioDuration::from_secs(1), async {
-            while !state.cache.is_ready() {
+            loop {
+                if state.queue.current().await.unwrap().unwrap().bytes == expected {
+                    break;
+                }
                 tokio::time::sleep(TokioDuration::from_millis(2)).await;
             }
         })
         .await
         .unwrap();
-        assert_eq!(fs::read(state.cache.current_path()).unwrap(), JPEG_B);
-        assert!(matches!(state.active_mode().await, ActiveMode::Digikam));
-
-        let snapshot = state.settings.snapshot().await;
-        let mut back = SettingsForm::from_settings(
-            snapshot.generation,
-            state.csrf_token(),
-            &snapshot.settings,
-        );
-        back.active_mode = "folder_sequence".into();
-        back.folder_directory = directory.path().join("images").display().to_string();
-        back.max_upload_bytes = "1024".into();
-        let response = router(state.clone())
-            .oneshot(
-                Request::post("/settings")
-                    .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
-                    .body(Body::from(serde_urlencoded::to_string(&back).unwrap()))
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-        assert_eq!(response.status(), StatusCode::SEE_OTHER);
-        assert!(matches!(state.active_mode().await, ActiveMode::Folder(_)));
-        shutdown_tx.send(true).unwrap();
-        scheduler.await.unwrap();
     }
 
     #[tokio::test]
-    async fn digikam_cached_endpoint_retains_conditional_behavior_and_peer_tracking() {
-        let directory = tempdir().unwrap();
-        let cache_dir = directory.path().join("cache");
-        fs::create_dir(&cache_dir).unwrap();
-        fs::write(cache_dir.join("current.jpg"), JPEG_A).unwrap();
-        let settings = Settings {
-            mode: ModeSettings::DigikamSqlite(DigikamSettings {
-                database_path: "/unused.db".into(),
-                query: "SELECT 1".into(),
-                path_mappings: vec![PathMapping {
-                    database_root: "/library".into(),
-                    mounted_root: "/photos".into(),
-                }],
-                selection: SelectionSettings {
-                    mode: SelectionMode::First,
-                    random_seed: String::new(),
-                    timezone: "UTC".into(),
-                    rollover_time: "00:00".into(),
-                },
-                max_candidates: 1,
-            }),
-        };
-        let config = crate::config::Config {
-            bind: "127.0.0.1:0".parse().unwrap(),
-            settings_path: directory.path().join("settings.toml"),
-            cache_dir: cache_dir.clone(),
-        };
-        let state = AppState::new(
-            config,
-            SettingsManager::in_memory(settings),
-            CacheStore::new(&cache_dir).unwrap(),
+    async fn manual_supplier_fills_alphabetically_and_common_ui_is_source_independent() {
+        let (directory, state) = manual_state(AdvancementSettings::Manual).await;
+        let snapshot = state.queue.snapshot().await;
+        assert_eq!(
+            snapshot
+                .entries
+                .iter()
+                .map(|entry| entry.display_name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["a.jpg", "b.jpg", "c.jpg"]
         );
+        let source_hash = fs::read(directory.path().join("source/a.jpg")).unwrap();
+        let response = router(state)
+            .oneshot(Request::get("/settings").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        let html = String::from_utf8(bytes(response).await).unwrap();
+        assert!(html.contains("Current and upcoming queue"));
+        assert!(html.contains("a.jpg"));
+        assert_eq!(
+            fs::read(directory.path().join("source/a.jpg")).unwrap(),
+            source_hash
+        );
+    }
+
+    #[tokio::test]
+    async fn every_fetch_advances_only_after_complete_body_and_serializes() {
+        let (_directory, state) = manual_state(AdvancementSettings::EveryFetch {
+            frame_client_ips: Vec::new(),
+        })
+        .await;
         let app = router(state.clone());
-        let first = app.clone().oneshot(frame_request("GET")).await.unwrap();
-        assert_eq!(first.status(), StatusCode::OK);
+        let response = app
+            .clone()
+            .oneshot(frame_request("GET", [127, 0, 0, 1]))
+            .await
+            .unwrap();
+        assert_eq!(state.queue.current().await.unwrap().unwrap().bytes, A);
+        assert_eq!(bytes(response).await, A);
+        wait_for_current(&state, B).await;
+
+        let dropped = app
+            .clone()
+            .oneshot(frame_request("GET", [127, 0, 0, 1]))
+            .await
+            .unwrap();
+        drop(dropped);
+        tokio::time::sleep(TokioDuration::from_millis(10)).await;
+        assert_eq!(state.queue.current().await.unwrap().unwrap().bytes, B);
+
+        let first = app
+            .clone()
+            .oneshot(frame_request("GET", [127, 0, 0, 1]))
+            .await
+            .unwrap();
+        let first_body = tokio::spawn(bytes(first));
+        let second = app
+            .oneshot(frame_request("GET", [127, 0, 0, 1]))
+            .await
+            .unwrap();
+        assert_eq!(first_body.await.unwrap(), B);
+        assert_eq!(bytes(second).await, C);
+        wait_for_current(&state, C).await; // C is retained as the sole last image.
+    }
+
+    #[tokio::test]
+    async fn client_allowlist_head_and_manual_policy_do_not_advance_on_fetch() {
+        let (_directory, state) = manual_state(AdvancementSettings::EveryFetch {
+            frame_client_ips: vec![IpAddr::from([10, 0, 0, 2])],
+        })
+        .await;
+        let app = router(state.clone());
+        assert_eq!(
+            bytes(
+                app.clone()
+                    .oneshot(frame_request("GET", [10, 0, 0, 3]))
+                    .await
+                    .unwrap()
+            )
+            .await,
+            A
+        );
+        assert_eq!(
+            bytes(
+                app.clone()
+                    .oneshot(frame_request("HEAD", [10, 0, 0, 2]))
+                    .await
+                    .unwrap()
+            )
+            .await,
+            b""
+        );
+        assert_eq!(state.queue.current().await.unwrap().unwrap().bytes, A);
+
+        let (_directory, manual) = manual_state(AdvancementSettings::Manual).await;
+        let app = router(manual.clone());
+        let first = app
+            .clone()
+            .oneshot(frame_request("GET", [127, 0, 0, 1]))
+            .await
+            .unwrap();
         let modified = first.headers()[header::LAST_MODIFIED].clone();
-        assert_eq!(bytes(first).await, JPEG_A);
+        assert_eq!(bytes(first).await, A);
         let conditional = Request::builder()
-            .method("GET")
             .uri("/frame/current.jpg")
             .header(header::IF_MODIFIED_SINCE, modified)
-            .extension(ConnectInfo(SocketAddr::from(([192, 168, 1, 9], 1234))))
+            .extension(ConnectInfo(SocketAddr::from(([127, 0, 0, 1], 1))))
             .body(Body::empty())
             .unwrap();
         assert_eq!(
             app.oneshot(conditional).await.unwrap().status(),
             StatusCode::NOT_MODIFIED
         );
-        assert_eq!(
-            state.last_image_request().await.unwrap().client_ip,
-            "192.168.1.9".parse::<std::net::IpAddr>().unwrap()
-        );
+        assert_eq!(manual.queue.current().await.unwrap().unwrap().bytes, A);
     }
 
-    #[test]
-    fn form_builds_both_modes_and_rejects_invalid_mode() {
-        let folder = Settings {
-            mode: ModeSettings::FolderSequence(FolderSettings {
-                directory: PathBuf::from("/images"),
-                max_upload_bytes: 10,
-            }),
-        };
-        let mut form = SettingsForm::from_settings(1, "token", &folder);
-        assert!(matches!(
-            form.to_settings().unwrap().mode,
-            ModeSettings::FolderSequence(_)
-        ));
-        form.active_mode = "invalid".into();
-        assert!(form.to_settings().is_err());
+    #[tokio::test]
+    async fn queue_reorder_remove_and_manual_advance_include_current() {
+        let (_directory, state) = manual_state(AdvancementSettings::Manual).await;
+        let snapshot = state.queue.snapshot().await;
+        let reversed = snapshot
+            .entries
+            .iter()
+            .rev()
+            .map(|entry| entry.id.clone())
+            .collect();
+        state
+            .queue
+            .reorder(snapshot.generation, reversed)
+            .await
+            .unwrap();
+        assert_eq!(state.queue.current().await.unwrap().unwrap().bytes, C);
+        state.queue.advance().await.unwrap();
+        assert_eq!(state.queue.current().await.unwrap().unwrap().bytes, B);
+        let snapshot = state.queue.snapshot().await;
+        let current = snapshot.entries[0].id.clone();
+        state
+            .queue
+            .remove(snapshot.generation, &current)
+            .await
+            .unwrap();
+        assert_eq!(state.queue.current().await.unwrap().unwrap().bytes, A);
+        assert_eq!(
+            fs::read(Path::new(state.config.settings_path.parent().unwrap()).join("source/b.jpg"))
+                .unwrap(),
+            B
+        );
     }
 }

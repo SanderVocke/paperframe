@@ -10,6 +10,7 @@ askama = "0.14"
 axum = { version = "0.8", features = ["multipart"] }
 chrono = { version = "0.4", default-features = false, features = ["clock"] }
 chrono-tz = "0.10"
+futures-util = "0.3"
 httpdate = "1.0"
 rand = "0.9"
 rusqlite = { version = "0.37", features = ["bundled"] }

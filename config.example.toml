@@ -1,4 +1,4 @@
 # Immutable process/bootstrap configuration.
 bind = "0.0.0.0:8080"
 settings_path = "data/settings.toml"
-cache_dir = "data/cache"
+queue_dir = "data/queue"

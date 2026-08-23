@@ -1,6 +1,18 @@
-# Sequential folder mode manages and renames top-level JPEG files in this directory.
-mode = "folder_sequence"
-
-[mode_settings]
-directory = "/data/frame-images"
+[queue]
+target_length = 10
 max_upload_bytes = 26214400
+
+[advancement]
+type = "every_fetch"
+
+[advancement.settings]
+# Empty means every direct peer advances. Configure the frame's IP to keep browser GETs non-advancing.
+frame_client_ips = ["192.168.1.50"]
+
+[[suppliers]]
+id = "primary"
+type = "manual_folder"
+
+[suppliers.settings]
+directory = "/data/source-images"
+poll_interval_seconds = 60

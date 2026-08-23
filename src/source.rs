@@ -149,8 +149,6 @@ mod tests {
 
     use tempfile::tempdir;
 
-    use crate::config::{SelectionMode, SelectionSettings};
-
     use super::*;
 
     fn settings(root: &Path) -> DigikamSettings {
@@ -161,12 +159,6 @@ mod tests {
                 database_root: PathBuf::from("/original/library"),
                 mounted_root: root.join("photos"),
             }],
-            selection: SelectionSettings {
-                mode: SelectionMode::First,
-                random_seed: String::new(),
-                timezone: "UTC".into(),
-                rollover_time: "00:00".into(),
-            },
             max_candidates: 10,
         }
     }
