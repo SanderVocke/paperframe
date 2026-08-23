@@ -1,12 +1,14 @@
 use std::{net::IpAddr, sync::Arc};
 
+use anyhow::Result;
 use axum::http::StatusCode;
 use chrono::{DateTime, Utc};
 use tokio::sync::{RwLock, watch};
 
 use crate::{
     cache::CacheStore,
-    config::{Config, SettingsManager},
+    config::{Config, ModeSettings, SettingsManager},
+    folder::FolderMode,
     selection::SelectionResult,
 };
 
@@ -33,12 +35,19 @@ pub struct SelectorStatus {
     pub next_attempt: Option<DateTime<Utc>>,
 }
 
+#[derive(Clone)]
+pub enum ActiveMode {
+    Digikam,
+    Folder(Arc<FolderMode>),
+}
+
 pub struct AppState {
     pub config: Config,
     pub settings: Arc<SettingsManager>,
     pub cache: CacheStore,
     last_image_request: RwLock<Option<ImageRequest>>,
     selector_status: RwLock<SelectorStatus>,
+    active_mode: RwLock<ActiveMode>,
     selection_trigger: watch::Sender<u64>,
     csrf_token: String,
 }
@@ -52,6 +61,7 @@ impl AppState {
             cache,
             last_image_request: RwLock::new(None),
             selector_status: RwLock::new(SelectorStatus::default()),
+            active_mode: RwLock::new(ActiveMode::Digikam),
             selection_trigger,
             csrf_token: random_token(),
         })
@@ -71,9 +81,55 @@ impl AppState {
             cache,
             last_image_request: RwLock::new(Some(request)),
             selector_status: RwLock::new(SelectorStatus::default()),
+            active_mode: RwLock::new(ActiveMode::Digikam),
             selection_trigger,
             csrf_token: random_token(),
         })
+    }
+
+    pub async fn initialize(
+        config: Config,
+        settings: Arc<SettingsManager>,
+        cache: CacheStore,
+    ) -> Result<Arc<Self>> {
+        let state = Self::new(config, settings, cache);
+        let snapshot = state.settings.snapshot().await;
+        let mode = state.prepare_mode(&snapshot.settings.mode).await?;
+        state.activate_mode(mode).await;
+        Ok(state)
+    }
+
+    pub async fn prepare_mode(&self, settings: &ModeSettings) -> Result<ActiveMode> {
+        match settings {
+            ModeSettings::DigikamSqlite(settings) => {
+                let settings = settings.clone();
+                let cache_root = self.cache.root().to_path_buf();
+                tokio::task::spawn_blocking(move || {
+                    crate::source::SourceStore::new(&settings, &cache_root).map(|_| ())
+                })
+                .await
+                .map_err(|error| anyhow::anyhow!("source validation worker stopped: {error}"))??;
+                Ok(ActiveMode::Digikam)
+            }
+            ModeSettings::FolderSequence(settings) => Ok(ActiveMode::Folder(
+                FolderMode::new(settings, self.cache.root(), &self.config.settings_path).await?,
+            )),
+        }
+    }
+
+    pub async fn activate_mode(&self, mode: ActiveMode) {
+        *self.active_mode.write().await = mode;
+    }
+
+    pub async fn active_mode(&self) -> ActiveMode {
+        self.active_mode.read().await.clone()
+    }
+
+    pub async fn is_ready(&self) -> bool {
+        match self.active_mode().await {
+            ActiveMode::Digikam => self.cache.is_ready(),
+            ActiveMode::Folder(folder) => folder.is_ready().await,
+        }
     }
 
     pub fn csrf_token(&self) -> &str {

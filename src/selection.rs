@@ -8,7 +8,7 @@ use tracing::warn;
 use crate::{
     cache::{CacheStore, Publication},
     catalog::{self, Candidate},
-    config::{SelectionMode, Settings},
+    config::{DigikamSettings, SelectionMode},
     source::SourceStore,
 };
 
@@ -22,7 +22,7 @@ pub struct SelectionResult {
 }
 
 pub async fn select_and_cache(
-    settings: Settings,
+    settings: DigikamSettings,
     cache_dir: &Path,
     now: DateTime<Utc>,
 ) -> Result<SelectionResult> {
@@ -37,7 +37,7 @@ pub async fn select_and_cache(
     .context("selection worker stopped")?
 }
 
-pub fn selection_date(settings: &Settings, now: DateTime<Utc>) -> Result<NaiveDate> {
+pub fn selection_date(settings: &DigikamSettings, now: DateTime<Utc>) -> Result<NaiveDate> {
     let timezone = settings.selection.timezone()?;
     let rollover = settings.selection.rollover_time()?;
     let local = now.with_timezone(&timezone);
@@ -49,7 +49,7 @@ pub fn selection_date(settings: &Settings, now: DateTime<Utc>) -> Result<NaiveDa
 }
 
 fn select_from_candidates(
-    settings: &Settings,
+    settings: &DigikamSettings,
     cache_dir: &Path,
     date: NaiveDate,
     candidates: Vec<Candidate>,
@@ -96,7 +96,7 @@ fn result(image_id: i64, date: NaiveDate, publication: Publication) -> Selection
 }
 
 fn rank_candidates(
-    settings: &Settings,
+    settings: &DigikamSettings,
     date: NaiveDate,
     mut candidates: Vec<Candidate>,
 ) -> Vec<Candidate> {
@@ -132,8 +132,8 @@ mod tests {
     const JPEG_A: &[u8] = b"\xff\xd8\xfffirst source\xff\xd9";
     const JPEG_B: &[u8] = b"\xff\xd8\xffsecond source\xff\xd9";
 
-    fn settings(root: &Path) -> Settings {
-        Settings {
+    fn settings(root: &Path) -> DigikamSettings {
+        DigikamSettings {
             database_path: root.join("digikam.db"),
             query: "unused".into(),
             path_mappings: vec![PathMapping {

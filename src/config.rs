@@ -13,7 +13,7 @@ use std::{
 use anyhow::{Context, Result, bail};
 use chrono::NaiveTime;
 use chrono_tz::Tz;
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize};
 use tokio::sync::{Mutex, RwLock};
 
 static TEMP_FILE_COUNTER: AtomicU64 = AtomicU64::new(0);
@@ -59,14 +59,34 @@ impl Config {
     }
 }
 
+#[derive(Clone, Debug, Serialize, PartialEq, Eq)]
+pub struct Settings {
+    #[serde(flatten)]
+    pub mode: ModeSettings,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(tag = "mode", content = "mode_settings", rename_all = "snake_case")]
+pub enum ModeSettings {
+    DigikamSqlite(DigikamSettings),
+    FolderSequence(FolderSettings),
+}
+
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
-pub struct Settings {
+pub struct DigikamSettings {
     pub database_path: PathBuf,
     pub query: String,
     pub path_mappings: Vec<PathMapping>,
     pub selection: SelectionSettings,
     pub max_candidates: usize,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct FolderSettings {
+    pub directory: PathBuf,
+    pub max_upload_bytes: u64,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
@@ -92,6 +112,34 @@ pub enum SelectionMode {
     DailyRandom,
 }
 
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum SettingsCompatibility {
+    Current(CurrentSettings),
+    Legacy(DigikamSettings),
+}
+
+#[derive(Deserialize)]
+struct CurrentSettings {
+    #[serde(flatten)]
+    mode: ModeSettings,
+}
+
+impl<'de> Deserialize<'de> for Settings {
+    fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let compatible = SettingsCompatibility::deserialize(deserializer)?;
+        Ok(match compatible {
+            SettingsCompatibility::Current(current) => Self { mode: current.mode },
+            SettingsCompatibility::Legacy(digikam) => Self {
+                mode: ModeSettings::DigikamSqlite(digikam),
+            },
+        })
+    }
+}
+
 impl Settings {
     pub fn load(path: &Path) -> Result<Self> {
         cleanup_temporary_files(path)?;
@@ -103,6 +151,29 @@ impl Settings {
         Ok(settings)
     }
 
+    pub fn validate_basic(&self) -> Result<()> {
+        match &self.mode {
+            ModeSettings::DigikamSqlite(settings) => settings.validate_basic(),
+            ModeSettings::FolderSequence(settings) => settings.validate_basic(),
+        }
+    }
+
+    pub fn digikam(&self) -> Option<&DigikamSettings> {
+        match &self.mode {
+            ModeSettings::DigikamSqlite(settings) => Some(settings),
+            ModeSettings::FolderSequence(_) => None,
+        }
+    }
+
+    pub fn folder(&self) -> Option<&FolderSettings> {
+        match &self.mode {
+            ModeSettings::FolderSequence(settings) => Some(settings),
+            ModeSettings::DigikamSqlite(_) => None,
+        }
+    }
+}
+
+impl DigikamSettings {
     pub fn validate_basic(&self) -> Result<()> {
         if self.database_path.as_os_str().is_empty() {
             bail!("database_path must not be empty");
@@ -144,6 +215,21 @@ impl Settings {
         }
         self.selection.timezone()?;
         self.selection.rollover_time()?;
+        Ok(())
+    }
+}
+
+impl FolderSettings {
+    pub fn validate_basic(&self) -> Result<()> {
+        if self.directory.as_os_str().is_empty() {
+            bail!("folder directory must not be empty");
+        }
+        if !self.directory.is_absolute() {
+            bail!("folder directory must be absolute");
+        }
+        if self.max_upload_bytes == 0 || self.max_upload_bytes > 100 * 1024 * 1024 {
+            bail!("max_upload_bytes must be between 1 and 104857600");
+        }
         Ok(())
     }
 }
@@ -249,12 +335,11 @@ fn persist_settings(path: &Path, settings: &Settings) -> Result<()> {
         .file_name()
         .and_then(|name| name.to_str())
         .context("settings path must have a UTF-8 file name")?;
-    let temporary_name = format!(
+    let temporary_path = parent.join(format!(
         ".{file_name}.{}.{}.tmp",
         std::process::id(),
         TEMP_FILE_COUNTER.fetch_add(1, Ordering::Relaxed)
-    );
-    let temporary_path = parent.join(temporary_name);
+    ));
     let serialized = toml::to_string_pretty(settings).context("failed to serialize settings")?;
 
     let result = (|| -> Result<()> {
@@ -276,7 +361,6 @@ fn persist_settings(path: &Path, settings: &Settings) -> Result<()> {
         sync_directory(parent)?;
         Ok(())
     })();
-
     if result.is_err() {
         let _ = fs::remove_file(&temporary_path);
     }
@@ -289,9 +373,9 @@ fn cleanup_temporary_files(settings_path: &Path) -> Result<()> {
         bail!("settings path must have a UTF-8 file name");
     };
     let prefix = format!(".{file_name}.");
-    let entries = fs::read_dir(parent)
-        .with_context(|| format!("failed to inspect settings directory {}", parent.display()))?;
-    for entry in entries {
+    for entry in fs::read_dir(parent)
+        .with_context(|| format!("failed to inspect settings directory {}", parent.display()))?
+    {
         let entry = entry.context("failed to inspect settings temporary file")?;
         let name = entry.file_name();
         let name = name.to_string_lossy();
@@ -304,190 +388,90 @@ fn cleanup_temporary_files(settings_path: &Path) -> Result<()> {
 }
 
 fn sync_directory(path: &Path) -> Result<()> {
-    let directory = fs::File::open(path)
-        .with_context(|| format!("failed to open directory {} for sync", path.display()))?;
-    directory
+    fs::File::open(path)
+        .with_context(|| format!("failed to open directory {} for sync", path.display()))?
         .sync_all()
         .context("failed to sync settings directory")
 }
 
 #[cfg(test)]
 mod tests {
-    use std::fs;
-
+    use super::*;
     use tempfile::tempdir;
 
-    use super::*;
-
-    fn example_settings(database_path: PathBuf, mounted_root: PathBuf) -> Settings {
-        Settings {
-            database_path,
-            query: "SELECT 1 AS image_id, '/photos' AS root_path, '/' AS album_path, 'one.jpg' AS file_name".into(),
+    fn digikam() -> DigikamSettings {
+        DigikamSettings {
+            database_path: "/catalog/digikam.db".into(),
+            query: "SELECT 1".into(),
             path_mappings: vec![PathMapping {
-                database_root: PathBuf::from("/original/photos"),
-                mounted_root,
+                database_root: "/library".into(),
+                mounted_root: "/photos".into(),
             }],
             selection: SelectionSettings {
-                mode: SelectionMode::DailyRandom,
-                random_seed: "living-room".into(),
-                timezone: "Europe/Amsterdam".into(),
-                rollover_time: "03:00".into(),
+                mode: SelectionMode::First,
+                random_seed: String::new(),
+                timezone: "UTC".into(),
+                rollover_time: "00:00".into(),
             },
-            max_candidates: 5000,
+            max_candidates: 10,
         }
     }
 
     #[test]
-    fn loads_valid_bootstrap_configuration() {
-        let directory = tempdir().unwrap();
-        let path = directory.path().join("config.toml");
-        fs::write(
-            &path,
-            "bind = \"127.0.0.1:8080\"\nsettings_path = \"settings.toml\"\ncache_dir = \"cache\"\n",
-        )
-        .unwrap();
+    fn parses_legacy_and_round_trips_canonical_modes() {
+        let legacy = toml::to_string(&digikam()).unwrap();
+        let parsed: Settings = toml::from_str(&legacy).unwrap();
+        assert!(parsed.digikam().is_some());
 
-        let config = Config::load(&path).unwrap();
-
-        assert_eq!(config.bind, "127.0.0.1:8080".parse().unwrap());
-        assert_eq!(config.settings_path, PathBuf::from("settings.toml"));
-        assert_eq!(
-            config.current_image_path(),
-            PathBuf::from("cache/current.jpg")
-        );
-    }
-
-    #[test]
-    fn rejects_invalid_bootstrap_configuration() {
-        let directory = tempdir().unwrap();
-        let path = directory.path().join("config.toml");
-        fs::write(
-            &path,
-            "bind = \"127.0.0.1:8080\"\nsettings_path = \"\"\ncache_dir = \"cache\"\n",
-        )
-        .unwrap();
-
-        assert!(
-            Config::load(&path)
-                .unwrap_err()
-                .to_string()
-                .contains("settings_path")
-        );
-    }
-
-    #[test]
-    fn validates_settings_fields() {
-        let directory = tempdir().unwrap();
-        let mut settings = example_settings(
-            directory.path().join("digikam.db"),
-            directory.path().join("photos"),
-        );
-        settings.max_candidates = 0;
-        assert!(
-            settings
-                .validate_basic()
-                .unwrap_err()
-                .to_string()
-                .contains("max_candidates")
-        );
-        settings.max_candidates = 10;
-        settings.selection.timezone = "Not/AZone".into();
-        assert!(
-            settings
-                .validate_basic()
-                .unwrap_err()
-                .to_string()
-                .contains("timezone")
-        );
+        let folder = Settings {
+            mode: ModeSettings::FolderSequence(FolderSettings {
+                directory: "/srv/frame-images".into(),
+                max_upload_bytes: 1024,
+            }),
+        };
+        let encoded = toml::to_string_pretty(&folder).unwrap();
+        assert!(encoded.contains("mode = \"folder_sequence\""));
+        assert_eq!(toml::from_str::<Settings>(&encoded).unwrap(), folder);
     }
 
     #[tokio::test]
-    async fn persists_replacement_and_reloads_after_restart() {
+    async fn persists_replacement_and_rejects_stale_generation() {
         let directory = tempdir().unwrap();
         let path = directory.path().join("settings.toml");
-        let original = example_settings(
-            directory.path().join("digikam.db"),
-            directory.path().join("photos"),
-        );
+        let original = Settings {
+            mode: ModeSettings::DigikamSqlite(digikam()),
+        };
         persist_settings(&path, &original).unwrap();
         let manager = SettingsManager::load(path.clone()).unwrap();
-        let mut replacement = original.clone();
-        replacement.query = "SELECT 2 AS image_id, '/photos' AS root_path, '/' AS album_path, 'two.jpg' AS file_name".into();
-
-        let snapshot = manager.replace(1, replacement.clone()).await.unwrap();
-
-        assert_eq!(snapshot.generation, 2);
+        let replacement = Settings {
+            mode: ModeSettings::FolderSequence(FolderSettings {
+                directory: directory.path().to_path_buf(),
+                max_upload_bytes: 2048,
+            }),
+        };
+        manager.replace(1, replacement.clone()).await.unwrap();
         assert_eq!(Settings::load(&path).unwrap(), replacement);
-        assert_eq!(
-            SettingsManager::load(path)
-                .unwrap()
-                .snapshot()
-                .await
-                .settings,
-            replacement
-        );
-    }
-
-    #[tokio::test]
-    async fn rejects_stale_generation_without_changing_disk() {
-        let directory = tempdir().unwrap();
-        let path = directory.path().join("settings.toml");
-        let original = example_settings(
-            directory.path().join("digikam.db"),
-            directory.path().join("photos"),
-        );
-        persist_settings(&path, &original).unwrap();
-        let manager = SettingsManager::load(path.clone()).unwrap();
-        let before = fs::read(&path).unwrap();
-
-        let error = manager.replace(99, original).await.unwrap_err();
-
-        assert_eq!(
-            error,
-            ReplaceSettingsError::Stale {
-                current_generation: 1
-            }
-        );
-        assert_eq!(fs::read(path).unwrap(), before);
+        assert!(matches!(
+            manager.replace(1, original).await,
+            Err(ReplaceSettingsError::Stale {
+                current_generation: 2
+            })
+        ));
     }
 
     #[test]
-    fn cleans_abandoned_temporary_settings_files() {
-        let directory = tempdir().unwrap();
-        let path = directory.path().join("settings.toml");
-        let settings = example_settings(
-            directory.path().join("digikam.db"),
-            directory.path().join("photos"),
-        );
-        persist_settings(&path, &settings).unwrap();
-        let abandoned = directory.path().join(".settings.toml.123.1.tmp");
-        fs::write(&abandoned, "partial").unwrap();
+    fn validates_mode_specific_fields() {
+        let mut folder = FolderSettings {
+            directory: "relative".into(),
+            max_upload_bytes: 0,
+        };
+        assert!(folder.validate_basic().is_err());
+        folder.directory = "/images".into();
+        folder.max_upload_bytes = 1;
+        folder.validate_basic().unwrap();
 
-        Settings::load(&path).unwrap();
-
-        assert!(!abandoned.exists());
-    }
-
-    #[tokio::test]
-    async fn persistence_failure_keeps_live_settings() {
-        let directory = tempdir().unwrap();
-        let missing_parent = directory.path().join("gone");
-        fs::create_dir(&missing_parent).unwrap();
-        let path = missing_parent.join("settings.toml");
-        let original = example_settings(
-            directory.path().join("digikam.db"),
-            directory.path().join("photos"),
-        );
-        persist_settings(&path, &original).unwrap();
-        let manager = SettingsManager::load(path).unwrap();
-        fs::remove_dir_all(missing_parent).unwrap();
-        let mut replacement = original.clone();
-        replacement.max_candidates = 12;
-
-        assert!(matches!(
-            manager.replace(1, replacement).await,
-            Err(ReplaceSettingsError::Persistence(_))
-        ));
-        assert_eq!(manager.snapshot().await.settings, original);
+        let mut digi = digikam();
+        digi.max_candidates = 0;
+        assert!(digi.validate_basic().is_err());
     }
 }

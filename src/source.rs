@@ -8,7 +8,7 @@ use anyhow::{Context, Result, bail};
 
 use crate::{
     catalog::Candidate,
-    config::{PathMapping, Settings},
+    config::{DigikamSettings, PathMapping},
 };
 
 #[derive(Clone, Debug)]
@@ -27,7 +27,7 @@ pub struct ReadOnlySource {
 }
 
 impl SourceStore {
-    pub fn new(settings: &Settings, cache_dir: &Path) -> Result<Self> {
+    pub fn new(settings: &DigikamSettings, cache_dir: &Path) -> Result<Self> {
         let cache_root = fs::canonicalize(cache_dir).with_context(|| {
             format!(
                 "failed to canonicalize cache directory {}",
@@ -153,8 +153,8 @@ mod tests {
 
     use super::*;
 
-    fn settings(root: &Path) -> Settings {
-        Settings {
+    fn settings(root: &Path) -> DigikamSettings {
+        DigikamSettings {
             database_path: root.join("digikam.db"),
             query: "unused".into(),
             path_mappings: vec![PathMapping {

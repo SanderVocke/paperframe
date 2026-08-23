@@ -4,7 +4,7 @@ use anyhow::{Context, Result, bail};
 use rusqlite::{Connection, OpenFlags};
 use sqlparser::{ast::Statement, dialect::SQLiteDialect, parser::Parser};
 
-use crate::config::Settings;
+use crate::config::DigikamSettings;
 
 const REQUIRED_COLUMNS: [&str; 4] = ["image_id", "root_path", "album_path", "file_name"];
 
@@ -16,19 +16,19 @@ pub struct Candidate {
     pub file_name: PathBuf,
 }
 
-pub async fn validate(settings: Settings) -> Result<()> {
+pub async fn validate(settings: DigikamSettings) -> Result<()> {
     tokio::task::spawn_blocking(move || validate_blocking(&settings))
         .await
         .context("catalog validation worker stopped")?
 }
 
-pub async fn candidates(settings: Settings) -> Result<Vec<Candidate>> {
+pub async fn candidates(settings: DigikamSettings) -> Result<Vec<Candidate>> {
     tokio::task::spawn_blocking(move || candidates_blocking(&settings))
         .await
         .context("catalog query worker stopped")?
 }
 
-fn validate_blocking(settings: &Settings) -> Result<()> {
+fn validate_blocking(settings: &DigikamSettings) -> Result<()> {
     validate_statement_shape(&settings.query)?;
     let connection = open_read_only(settings)?;
     let statement = connection
@@ -37,7 +37,7 @@ fn validate_blocking(settings: &Settings) -> Result<()> {
     validate_prepared_statement(&statement)
 }
 
-fn candidates_blocking(settings: &Settings) -> Result<Vec<Candidate>> {
+fn candidates_blocking(settings: &DigikamSettings) -> Result<Vec<Candidate>> {
     validate_statement_shape(&settings.query)?;
     let connection = open_read_only(settings)?;
     let mut statement = connection
@@ -78,7 +78,7 @@ fn candidates_blocking(settings: &Settings) -> Result<Vec<Candidate>> {
     Ok(candidates)
 }
 
-fn open_read_only(settings: &Settings) -> Result<Connection> {
+fn open_read_only(settings: &DigikamSettings) -> Result<Connection> {
     let flags = OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX;
     let connection = Connection::open_with_flags(&settings.database_path, flags)
         .context("failed to open DigiKam database read-only")?;
@@ -146,8 +146,8 @@ mod tests {
         }
     }
 
-    fn settings(database_path: PathBuf) -> Settings {
-        Settings {
+    fn settings(database_path: PathBuf) -> DigikamSettings {
+        DigikamSettings {
             database_path,
             query: "SELECT Images.id AS image_id, AlbumRoots.specificPath AS root_path, Albums.relativePath AS album_path, Images.name AS file_name FROM Images JOIN Albums ON Albums.id = Images.album JOIN AlbumRoots ON AlbumRoots.id = Albums.albumRoot ORDER BY Images.id".into(),
             path_mappings: vec![PathMapping {

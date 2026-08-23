@@ -6,7 +6,7 @@ use tokio::sync::watch;
 use tracing::{error, info};
 
 use crate::{
-    config::Settings,
+    config::DigikamSettings,
     selection::{self, SelectionResult},
     state::AppState,
 };
@@ -31,7 +31,7 @@ async fn run_with_selector<F, Fut>(
     retry_delay: Duration,
     selector: F,
 ) where
-    F: Fn(Settings, PathBuf, DateTime<Utc>) -> Fut,
+    F: Fn(DigikamSettings, PathBuf, DateTime<Utc>) -> Fut,
     Fut: Future<Output = Result<SelectionResult>>,
 {
     let mut triggers = state.subscribe_to_selection_triggers();
@@ -41,12 +41,23 @@ async fn run_with_selector<F, Fut>(
         }
 
         let snapshot = state.settings.snapshot().await;
+        let Some(digikam_settings) = snapshot.settings.digikam().cloned() else {
+            tokio::select! {
+                changed = triggers.changed() => {
+                    if changed.is_err() { return; }
+                }
+                changed = shutdown.changed() => {
+                    if changed.is_err() || *shutdown.borrow() { return; }
+                }
+            }
+            continue;
+        };
         let attempted_at = Utc::now();
         state
             .selection_started(snapshot.generation, attempted_at)
             .await;
         let selection = selector(
-            snapshot.settings.clone(),
+            digikam_settings.clone(),
             state.cache.root().to_path_buf(),
             attempted_at,
         );
@@ -72,7 +83,7 @@ async fn run_with_selector<F, Fut>(
         }
 
         let next_attempt = if result.is_ok() {
-            next_rollover(&snapshot.settings, completed_at).unwrap_or_else(|error| {
+            next_rollover(&digikam_settings, completed_at).unwrap_or_else(|error| {
                 error!(%error, "failed to calculate next rollover; using retry delay");
                 completed_at
                     + chrono::Duration::from_std(retry_delay)
@@ -104,7 +115,7 @@ async fn run_with_selector<F, Fut>(
     }
 }
 
-pub fn next_rollover(settings: &Settings, now: DateTime<Utc>) -> Result<DateTime<Utc>> {
+pub fn next_rollover(settings: &DigikamSettings, now: DateTime<Utc>) -> Result<DateTime<Utc>> {
     let timezone = settings.selection.timezone()?;
     let rollover = settings.selection.rollover_time()?;
     let local_now = now.with_timezone(&timezone);
@@ -162,16 +173,14 @@ mod tests {
 
     use crate::{
         cache::CacheStore,
-        config::{
-            Config, PathMapping, SelectionMode, SelectionSettings, Settings, SettingsManager,
-        },
+        config::{Config, PathMapping, SelectionMode, SelectionSettings, SettingsManager},
         state::AppState,
     };
 
     use super::*;
 
-    fn settings(root: &std::path::Path) -> Settings {
-        Settings {
+    fn digikam_settings(root: &std::path::Path) -> DigikamSettings {
+        DigikamSettings {
             database_path: root.join("digikam.db"),
             query: "unused".into(),
             path_mappings: vec![PathMapping {
@@ -196,7 +205,13 @@ mod tests {
             settings_path: root.join("settings.toml"),
             cache_dir: root.join("cache"),
         };
-        AppState::new(config, SettingsManager::in_memory(settings(root)), cache)
+        AppState::new(
+            config,
+            SettingsManager::in_memory(crate::config::Settings {
+                mode: crate::config::ModeSettings::DigikamSqlite(digikam_settings(root)),
+            }),
+            cache,
+        )
     }
 
     fn success() -> SelectionResult {
@@ -309,7 +324,7 @@ mod tests {
     #[test]
     fn calculates_rollovers_across_dst_boundaries() {
         let directory = tempdir().unwrap();
-        let mut input = settings(directory.path());
+        let mut input = digikam_settings(directory.path());
         input.selection.timezone = "Europe/Amsterdam".into();
         input.selection.rollover_time = "02:30".into();
 

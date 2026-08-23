@@ -5,7 +5,7 @@
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>Paper frame settings</title>
   <style>
-    body { font-family: sans-serif; line-height: 1.4; margin: 2rem auto; max-width: 70rem; padding: 0 1rem; }
+    body { font-family: sans-serif; line-height: 1.4; margin: 2rem auto; max-width: 75rem; padding: 0 1rem; }
     label { display: block; font-weight: bold; margin-top: 1rem; }
     input, select, textarea { box-sizing: border-box; font: inherit; width: 100%; }
     textarea { min-height: 8rem; }
@@ -13,10 +13,17 @@
     .error { background: #fee; border: 1px solid #b00; padding: .75rem; }
     .ok { color: #174; }
     .not-ready { color: #a20; }
-    button { margin-top: 1.25rem; padding: .6rem 1rem; }
+    button { margin-top: 1rem; padding: .6rem 1rem; }
     dt { font-weight: bold; margin-top: .5rem; }
     dd { margin-left: 1rem; white-space: pre-wrap; }
     small { display: block; font-weight: normal; }
+    fieldset { border: 1px solid #bbb; margin-top: 1rem; padding: 1rem; }
+    .queue { display: grid; gap: 1rem; grid-template-columns: repeat(auto-fill, minmax(10rem, 1fr)); list-style: none; padding: 0; }
+    .queue li { border: 1px solid #bbb; overflow-wrap: anywhere; padding: .5rem; }
+    .queue li.next { border: 3px solid #174; }
+    .queue img { display: block; height: 8rem; object-fit: contain; width: 100%; }
+    .inline { display: inline-block; margin-right: .75rem; }
+    .inline input { width: auto; }
   </style>
 </head>
 <body>
@@ -29,51 +36,111 @@
 
   <h2>Runtime status</h2>
   <dl>
-    <dt>Cache</dt><dd class="{% if cache_ready %}ok{% else %}not-ready{% endif %}">{% if cache_ready %}ready{% else %}not ready{% endif %}</dd>
+    <dt>Readiness</dt><dd class="{% if cache_ready %}ok{% else %}not-ready{% endif %}">{% if cache_ready %}ready{% else %}not ready{% endif %}</dd>
     <dt>Last frame GET</dt><dd>{{ last_request }}</dd>
-    <dt>Selector</dt><dd>{{ selector_status }}</dd>
+    <dt>Active mode</dt><dd>{% if active_digikam %}DigiKam SQLite{% else %}Sequential server folder{% endif %}</dd>
+    <dt>Mode status</dt><dd>{{ mode_status }}</dd>
   </dl>
 
-  <h2>Selection settings</h2>
+  {% if active_folder %}
+  <section>
+    <h2>Folder queue</h2>
+    {% if folder_entries.is_empty() %}
+      <p>The queue is empty.</p>
+    {% else %}
+      <p>Displayed in serving order. The item marked “Next” will be returned by the next frame GET.</p>
+      <ol class="queue">
+      {% for image in folder_entries %}
+        <li class="{% if image.is_next %}next{% endif %}">
+          <img src="/folder/thumbnail/{{ image.id }}" alt="Thumbnail for {{ image.filename }}">
+          {% if image.is_next %}<strong>Next</strong>{% endif %}
+          <div>{{ image.filename }}</div>
+        </li>
+      {% endfor %}
+      </ol>
+    {% endif %}
+
+    <form method="post" action="/folder/refresh">
+      <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+      <input type="hidden" name="inventory_generation" value="{{ folder_generation }}">
+      <button type="submit">Refresh queue from disk</button>
+    </form>
+
+    <form method="post" action="/folder/upload" enctype="multipart/form-data">
+      <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+      <input type="hidden" name="inventory_generation" value="{{ folder_generation }}">
+      <label for="images">Upload JPEG images</label>
+      <input id="images" name="images" type="file" accept="image/jpeg,.jpg,.jpeg" multiple required>
+      <button type="submit">Upload and append</button>
+    </form>
+
+    <form method="post" action="/folder/reorder">
+      <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+      <input type="hidden" name="inventory_generation" value="{{ folder_generation }}">
+      <label for="order">Serving order
+        <small>Put every current filename on one line in the desired order. Saving renames files on disk.</small>
+      </label>
+      <textarea id="order" name="order" spellcheck="false">{{ reorder_lines }}</textarea>
+      <button type="submit">Save order and rename files</button>
+    </form>
+  </section>
+  {% endif %}
+
+  <h2>Mode settings</h2>
   <form method="post" action="/settings">
     <input type="hidden" name="generation" value="{{ generation }}">
     <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
 
-    <label for="database_path">DigiKam SQLite database</label>
-    <input id="database_path" name="database_path" required value="{{ database_path }}">
-
-    <label for="query">Candidate query
-      <small>Must be one read-only SELECT/CTE returning image_id, root_path, album_path and file_name.</small>
-    </label>
-    <textarea class="query" id="query" name="query" required>{{ query }}</textarea>
-
-    <label for="path_mappings">Path mappings
-      <small>One mapping per line: DigiKam database root =&gt; mounted read-only root</small>
-    </label>
-    <textarea id="path_mappings" name="path_mappings" required>{{ path_mappings }}</textarea>
-
-    <label for="selection_mode">Selection mode</label>
-    <select id="selection_mode" name="selection_mode">
-      <option value="first"{% if mode_first %} selected{% endif %}>First result in query order</option>
-      <option value="daily_random"{% if mode_daily_random %} selected{% endif %}>Deterministic daily random</option>
+    <label for="active_mode">Active image mode</label>
+    <select id="active_mode" name="active_mode">
+      <option value="digikam_sqlite"{% if active_digikam %} selected{% endif %}>DigiKam SQLite daily selection</option>
+      <option value="folder_sequence"{% if active_folder %} selected{% endif %}>Sequential server folder</option>
     </select>
 
-    <label for="random_seed">Random seed</label>
-    <input id="random_seed" name="random_seed" value="{{ random_seed }}">
+    <fieldset>
+      <legend>DigiKam SQLite mode</legend>
+      <small>These fields are validated and used only when DigiKam mode is selected.</small>
+      <label for="database_path">DigiKam SQLite database</label>
+      <input id="database_path" name="database_path" value="{{ database_path }}">
 
-    <label for="timezone">IANA timezone</label>
-    <input id="timezone" name="timezone" required value="{{ timezone }}">
+      <label for="query">Candidate query
+        <small>One read-only SELECT/CTE returning image_id, root_path, album_path and file_name.</small>
+      </label>
+      <textarea class="query" id="query" name="query">{{ query }}</textarea>
 
-    <label for="rollover_time">Daily rollover time (HH:MM)</label>
-    <input id="rollover_time" name="rollover_time" required pattern="[0-9]{2}:[0-9]{2}" value="{{ rollover_time }}">
+      <label for="path_mappings">Path mappings
+        <small>One mapping per line: DigiKam database root =&gt; mounted read-only root</small>
+      </label>
+      <textarea id="path_mappings" name="path_mappings">{{ path_mappings }}</textarea>
 
-    <label for="max_candidates">Maximum candidates</label>
-    <input id="max_candidates" name="max_candidates" required type="number" min="1" max="1000000" value="{{ max_candidates }}">
+      <label for="selection_mode">DigiKam selection behavior</label>
+      <select id="selection_mode" name="selection_mode">
+        <option value="first"{% if mode_first %} selected{% endif %}>First result in query order</option>
+        <option value="daily_random"{% if mode_daily_random %} selected{% endif %}>Deterministic daily random</option>
+      </select>
+      <label for="random_seed">Random seed</label>
+      <input id="random_seed" name="random_seed" value="{{ random_seed }}">
+      <label for="timezone">IANA timezone</label>
+      <input id="timezone" name="timezone" value="{{ timezone }}">
+      <label for="rollover_time">Daily rollover time (HH:MM)</label>
+      <input id="rollover_time" name="rollover_time" pattern="[0-9]{2}:[0-9]{2}" value="{{ rollover_time }}">
+      <label for="max_candidates">Maximum candidates</label>
+      <input id="max_candidates" name="max_candidates" type="number" min="1" max="1000000" value="{{ max_candidates }}">
+    </fieldset>
 
-    <button type="submit">Save settings and select now</button>
+    <fieldset>
+      <legend>Sequential server-folder mode</legend>
+      <small>These fields are validated and used only when folder mode is selected. The directory must be writable.</small>
+      <label for="folder_directory">Managed image directory</label>
+      <input id="folder_directory" name="folder_directory" value="{{ folder_directory }}">
+      <label for="max_upload_bytes">Maximum bytes per upload request</label>
+      <input id="max_upload_bytes" name="max_upload_bytes" type="number" min="1" max="104857600" value="{{ max_upload_bytes }}">
+    </fieldset>
+
+    <button type="submit">Save settings and activate mode</button>
   </form>
 
-  <p><small>This trusted-LAN interface has no authentication or TLS.</small></p>
+  <p><small>This trusted-LAN interface has no authentication or TLS. Folder ordering and uploads intentionally modify the managed folder.</small></p>
 </main>
 </body>
 </html>

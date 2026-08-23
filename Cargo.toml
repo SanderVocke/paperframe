@@ -7,7 +7,7 @@ publish = false
 [dependencies]
 anyhow = "1.0"
 askama = "0.14"
-axum = "0.8"
+axum = { version = "0.8", features = ["multipart"] }
 chrono = { version = "0.4", default-features = false, features = ["clock"] }
 chrono-tz = "0.10"
 httpdate = "1.0"

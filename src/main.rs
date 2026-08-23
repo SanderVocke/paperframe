@@ -1,6 +1,7 @@
 pub mod cache;
 pub mod catalog;
 pub mod config;
+pub mod folder;
 mod routes;
 pub mod scheduler;
 pub mod selection;
@@ -16,7 +17,7 @@ use tokio::{net::TcpListener, sync::watch};
 use tracing::{error, info};
 use tracing_subscriber::EnvFilter;
 
-use crate::{source::SourceStore, state::AppState};
+use crate::state::AppState;
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -30,8 +31,7 @@ async fn main() -> Result<()> {
     let settings = SettingsManager::load(config.settings_path.clone())?;
     let cache = CacheStore::new(&config.cache_dir)?;
     let initial_settings = settings.snapshot().await;
-    SourceStore::new(&initial_settings.settings, cache.root())
-        .context("source/cache safety validation failed")?;
+    initial_settings.settings.validate_basic()?;
     let listener = TcpListener::bind(config.bind)
         .await
         .with_context(|| format!("failed to bind server to {}", config.bind))?;
@@ -46,7 +46,7 @@ async fn main() -> Result<()> {
         "paper frame server listening"
     );
 
-    let state = AppState::new(config, settings, cache);
+    let state = AppState::initialize(config, settings, cache).await?;
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
     let scheduler_task = tokio::spawn(scheduler::run(state.clone(), shutdown_rx.clone()));
     let signal_task = tokio::spawn(signal_shutdown(shutdown_tx.clone()));

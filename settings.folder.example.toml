@@ -1,0 +1,6 @@
+# Sequential folder mode manages and renames top-level JPEG files in this directory.
+mode = "folder_sequence"
+
+[mode_settings]
+directory = "/data/frame-images"
+max_upload_bytes = 26214400

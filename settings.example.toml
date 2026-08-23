@@ -1,3 +1,7 @@
+# Active image mode and its mode-specific mutable settings.
+mode = "digikam_sqlite"
+
+[mode_settings]
 database_path = "/catalog/digikam4.db"
 max_candidates = 50000
 
@@ -17,11 +21,11 @@ WHERE lower(Images.name) LIKE '%.jpg'
 ORDER BY Images.id
 """
 
-[[path_mappings]]
+[[mode_settings.path_mappings]]
 database_root = "/home/user/Pictures"
 mounted_root = "/photos"
 
-[selection]
+[mode_settings.selection]
 mode = "daily_random"
 random_seed = "living-room"
 timezone = "Europe/Amsterdam"
