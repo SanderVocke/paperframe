@@ -64,6 +64,12 @@ Replace `SERVER_IP` with the computer's LAN address. Configure the frame to fetc
 
 The quick-start policy is `manual`, so test downloads cannot unexpectedly move the queue. After confirming that the frame works, choose another policy on the control page if wanted.
 
+## Docker and Kubernetes
+
+A production multi-stage [`Dockerfile`](Dockerfile) and example Kubernetes deployment are included. The image runs as a non-root user, keeps writable queue/settings data under `/data`, and supports read-only photo or DigiKam mounts.
+
+See **[Containers and Kubernetes](docs/containers.md)** for local Docker usage, multi-architecture registry publishing, persistent storage, DigiKam mounts, and a secured single-replica Kubernetes setup.
+
 ## Everyday use
 
 ### Manage the queue

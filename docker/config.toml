@@ -1,0 +1,5 @@
+# Container bootstrap configuration. Mount a replacement at
+# /config/config.toml if different paths or a different port are required.
+bind = "0.0.0.0:8080"
+settings_path = "/data/settings.toml"
+queue_dir = "/data/queue"

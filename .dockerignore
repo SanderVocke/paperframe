@@ -1,0 +1,12 @@
+.git
+.gitignore
+target
+data
+cache
+config.toml
+*.tmp
+*.log
+Dockerfile*
+implementation-summary.md
+plan.md
+refactor.md

@@ -1,0 +1,200 @@
+# Before applying:
+# 1. Replace ghcr.io/YOUR_USER/paperframe-server:latest with your image.
+# 2. Make a read-only PVC named digikam-library available, or replace that
+#    volume with storage appropriate for your cluster.
+# 3. Adjust database_root below to exactly match DigiKam's AlbumRoots path.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: paperframe-config
+  labels:
+    app.kubernetes.io/name: paperframe
+    app.kubernetes.io/component: server
+data:
+  config.toml: |
+    bind = "0.0.0.0:8080"
+    settings_path = "/data/settings.toml"
+    queue_dir = "/data/queue"
+  settings.toml: |
+    [queue]
+    target_length = 10
+    max_upload_bytes = 26214400
+
+    [advancement]
+    type = "manual"
+
+    [[suppliers]]
+    id = "primary"
+    type = "digikam_sqlite"
+
+    [suppliers.settings]
+    database_path = "/library/digikam_db/digikam4.db"
+    max_candidates = 100000
+    query = """
+    SELECT
+        Images.id AS image_id,
+        AlbumRoots.specificPath AS root_path,
+        Albums.relativePath AS album_path,
+        Images.name AS file_name
+    FROM Images
+    JOIN Albums ON Albums.id = Images.album
+    JOIN AlbumRoots ON AlbumRoots.id = Albums.albumRoot
+    WHERE Images.status = 1
+      AND (
+          lower(Images.name) LIKE '%.jpg'
+          OR lower(Images.name) LIKE '%.jpeg'
+      )
+    ORDER BY Images.id
+    LIMIT 100000
+    """
+
+    [[suppliers.settings.path_mappings]]
+    database_root = "/digikam/collection"
+    mounted_root = "/library/collection"
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: paperframe-data
+  labels:
+    app.kubernetes.io/name: paperframe
+    app.kubernetes.io/component: server
+spec:
+  accessModes:
+    - ReadWriteOnce
+  resources:
+    requests:
+      storage: 5Gi
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: paperframe
+  labels:
+    app.kubernetes.io/name: paperframe
+    app.kubernetes.io/component: server
+spec:
+  # Queue storage is single-writer; never increase this above one.
+  replicas: 1
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: paperframe
+      app.kubernetes.io/component: server
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: paperframe
+        app.kubernetes.io/component: server
+    spec:
+      terminationGracePeriodSeconds: 30
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 10001
+        runAsGroup: 10001
+        fsGroup: 10001
+        fsGroupChangePolicy: OnRootMismatch
+      initContainers:
+        - name: seed-settings
+          image: ghcr.io/YOUR_USER/paperframe-server:latest
+          imagePullPolicy: IfNotPresent
+          command: ["/bin/sh", "-ec"]
+          args:
+            - |
+              if [ ! -e /data/settings.toml ]; then
+                cp /seed/settings.toml /data/settings.toml
+              fi
+              mkdir -p /data/queue
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+          volumeMounts:
+            - name: data
+              mountPath: /data
+            - name: config
+              mountPath: /seed
+              readOnly: true
+      containers:
+        - name: paperframe
+          image: ghcr.io/YOUR_USER/paperframe-server:latest
+          imagePullPolicy: IfNotPresent
+          ports:
+            - name: http
+              containerPort: 8080
+              protocol: TCP
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+          resources:
+            requests:
+              cpu: 25m
+              memory: 64Mi
+            limits:
+              cpu: 500m
+              memory: 512Mi
+          startupProbe:
+            httpGet:
+              path: /health/live
+              port: http
+            periodSeconds: 2
+            failureThreshold: 30
+          livenessProbe:
+            httpGet:
+              path: /health/live
+              port: http
+            periodSeconds: 30
+            timeoutSeconds: 3
+          readinessProbe:
+            httpGet:
+              path: /health/ready
+              port: http
+            periodSeconds: 10
+            timeoutSeconds: 3
+            failureThreshold: 6
+          volumeMounts:
+            - name: config
+              mountPath: /config
+              readOnly: true
+            - name: data
+              mountPath: /data
+            - name: library
+              mountPath: /library
+              readOnly: true
+            - name: tmp
+              mountPath: /tmp
+      volumes:
+        - name: config
+          configMap:
+            name: paperframe-config
+        - name: data
+          persistentVolumeClaim:
+            claimName: paperframe-data
+        - name: library
+          persistentVolumeClaim:
+            claimName: digikam-library
+        - name: tmp
+          emptyDir:
+            sizeLimit: 256Mi
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: paperframe
+  labels:
+    app.kubernetes.io/name: paperframe
+    app.kubernetes.io/component: server
+spec:
+  type: ClusterIP
+  selector:
+    app.kubernetes.io/name: paperframe
+    app.kubernetes.io/component: server
+  ports:
+    - name: http
+      port: 8080
+      targetPort: http
+      protocol: TCP

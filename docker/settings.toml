@@ -1,0 +1,18 @@
+# Initial settings for a new /data volume. The web app saves later changes to
+# /data/settings.toml. Mount a photo folder read-only at /photos to use these
+# defaults immediately.
+
+[queue]
+target_length = 10
+max_upload_bytes = 26214400
+
+[advancement]
+type = "manual"
+
+[[suppliers]]
+id = "primary"
+type = "manual_folder"
+
+[suppliers.settings]
+directory = "/photos"
+poll_interval_seconds = 60
