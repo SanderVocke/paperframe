@@ -13,7 +13,7 @@ use std::{
 use anyhow::{Context, Result, bail};
 use chrono::NaiveTime;
 use chrono_tz::Tz;
-use serde::{Deserialize, Deserializer, Serialize};
+use serde::{Deserialize, Deserializer, Serialize, de::Error as _};
 use tokio::sync::{Mutex, RwLock};
 
 static TEMP_FILE_COUNTER: AtomicU64 = AtomicU64::new(0);
@@ -113,13 +113,6 @@ pub enum SelectionMode {
 }
 
 #[derive(Deserialize)]
-#[serde(untagged)]
-enum SettingsCompatibility {
-    Current(CurrentSettings),
-    Legacy(DigikamSettings),
-}
-
-#[derive(Deserialize)]
 struct CurrentSettings {
     #[serde(flatten)]
     mode: ModeSettings,
@@ -130,13 +123,27 @@ impl<'de> Deserialize<'de> for Settings {
     where
         D: Deserializer<'de>,
     {
-        let compatible = SettingsCompatibility::deserialize(deserializer)?;
-        Ok(match compatible {
-            SettingsCompatibility::Current(current) => Self { mode: current.mode },
-            SettingsCompatibility::Legacy(digikam) => Self {
-                mode: ModeSettings::DigikamSqlite(digikam),
-            },
-        })
+        let value = toml::Value::deserialize(deserializer)?;
+        let table = value
+            .as_table()
+            .ok_or_else(|| D::Error::custom("settings must be a TOML table"))?;
+        if table.contains_key("mode") {
+            if let Some(unknown) = table
+                .keys()
+                .find(|key| key.as_str() != "mode" && key.as_str() != "mode_settings")
+            {
+                return Err(D::Error::custom(format!(
+                    "unknown top-level field in tagged settings: {unknown}"
+                )));
+            }
+            let current: CurrentSettings = value.try_into().map_err(D::Error::custom)?;
+            Ok(Self { mode: current.mode })
+        } else {
+            let legacy: DigikamSettings = value.try_into().map_err(D::Error::custom)?;
+            Ok(Self {
+                mode: ModeSettings::DigikamSqlite(legacy),
+            })
+        }
     }
 }
 
@@ -432,6 +439,9 @@ mod tests {
         let encoded = toml::to_string_pretty(&folder).unwrap();
         assert!(encoded.contains("mode = \"folder_sequence\""));
         assert_eq!(toml::from_str::<Settings>(&encoded).unwrap(), folder);
+
+        let mixed = format!("{encoded}\ndatabase_path = '/unexpected.db'\n");
+        assert!(toml::from_str::<Settings>(&mixed).is_err());
     }
 
     #[tokio::test]

@@ -664,6 +664,41 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn duplicate_upload_names_do_not_collide_and_oversized_upload_is_rejected() {
+        let (_directory, mode) = mode().await;
+        let generation = mode.snapshot().await.generation;
+        let uploaded = mode
+            .upload(
+                generation,
+                vec![
+                    ("same.jpg".into(), A.to_vec()),
+                    ("same.jpg".into(), B.to_vec()),
+                ],
+            )
+            .await
+            .unwrap();
+        assert_eq!(uploaded.entries.len(), 4);
+        let mut filenames = uploaded
+            .entries
+            .iter()
+            .map(|entry| entry.filename.as_str())
+            .collect::<Vec<_>>();
+        filenames.sort_unstable();
+        filenames.dedup();
+        assert_eq!(filenames.len(), 4);
+
+        let mut too_large = vec![0_u8; 1025];
+        too_large[..3].copy_from_slice(&[0xff, 0xd8, 0xff]);
+        too_large[1023..].copy_from_slice(&[0xff, 0xd9]);
+        assert!(
+            mode.upload(uploaded.generation, vec![("large.jpg".into(), too_large)])
+                .await
+                .is_err()
+        );
+        assert_eq!(mode.snapshot().await.generation, uploaded.generation);
+    }
+
+    #[tokio::test]
     async fn rejects_invalid_upload_and_incomplete_reorder_without_state_change() {
         let (_directory, mode) = mode().await;
         let before = mode.snapshot().await;

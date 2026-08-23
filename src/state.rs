@@ -2,7 +2,7 @@ use std::{net::IpAddr, sync::Arc};
 
 use anyhow::Result;
 use axum::http::StatusCode;
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, SecondsFormat, Utc};
 use tokio::sync::{RwLock, watch};
 
 use crate::{
@@ -132,6 +132,20 @@ impl AppState {
         }
     }
 
+    pub async fn mode_status(&self) -> String {
+        match self.active_mode().await {
+            ActiveMode::Folder(folder) => {
+                let count = folder.snapshot().await.entries.len();
+                if count == 0 {
+                    "Folder queue is empty. Add JPEGs and refresh or upload.".to_owned()
+                } else {
+                    format!("Folder queue has {count} image(s); the cursor is runtime-only.")
+                }
+            }
+            ActiveMode::Digikam => format_selector_status(&self.selector_status().await),
+        }
+    }
+
     pub fn csrf_token(&self) -> &str {
         &self.csrf_token
     }
@@ -187,6 +201,43 @@ impl AppState {
         self.selection_trigger.send_modify(|generation| {
             *generation = generation.saturating_add(1);
         });
+    }
+}
+
+fn format_selector_status(status: &SelectorStatus) -> String {
+    let mut parts = Vec::new();
+    if status.running {
+        parts.push("DigiKam selection is running.".to_owned());
+    }
+    if let Some(success) = &status.last_success {
+        parts.push(format!(
+            "Last success: {} — image ID {}, selection date {}, {} bytes, cache {}.",
+            success
+                .completed_at
+                .to_rfc3339_opts(SecondsFormat::Secs, true),
+            success.result.image_id,
+            success.result.selection_date,
+            success.result.content_length,
+            if success.result.cache_changed {
+                "updated"
+            } else {
+                "unchanged"
+            }
+        ));
+    }
+    if let Some(error) = &status.last_error {
+        parts.push(format!("Last error: {error}"));
+    }
+    if let Some(next) = status.next_attempt {
+        parts.push(format!(
+            "Next attempt: {}.",
+            next.to_rfc3339_opts(SecondsFormat::Secs, true)
+        ));
+    }
+    if parts.is_empty() {
+        "No DigiKam selection has completed since the server started.".to_owned()
+    } else {
+        parts.join("\n")
     }
 }
 

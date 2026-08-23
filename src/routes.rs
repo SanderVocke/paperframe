@@ -395,42 +395,28 @@ async fn render_settings(
         ),
         None => "No image GET has occurred since the server started.".to_owned(),
     };
-    let (folder_generation, folder_entries, reorder_lines, mode_status) =
-        match state.active_mode().await {
-            ActiveMode::Digikam => (
-                0,
-                Vec::new(),
-                String::new(),
-                format_selector_status(&state.selector_status().await),
-            ),
-            ActiveMode::Folder(folder) => {
-                let snapshot = folder.snapshot().await;
-                let serving_order = snapshot.serving_order();
-                let lines = serving_order
-                    .iter()
-                    .map(|entry| entry.filename.as_str())
-                    .collect::<Vec<_>>()
-                    .join("\n");
-                let entries = serving_order
-                    .into_iter()
-                    .enumerate()
-                    .map(|(index, entry)| FolderTemplateEntry {
-                        id: entry.id,
-                        filename: entry.filename,
-                        is_next: index == 0,
-                    })
-                    .collect();
-                let status = if snapshot.entries.is_empty() {
-                    "Folder queue is empty. Add JPEGs and refresh or upload.".to_owned()
-                } else {
-                    format!(
-                        "Folder queue has {} image(s); the cursor is runtime-only.",
-                        snapshot.entries.len()
-                    )
-                };
-                (snapshot.generation, entries, lines, status)
-            }
-        };
+    let (folder_generation, folder_entries, reorder_lines) = match state.active_mode().await {
+        ActiveMode::Digikam => (0, Vec::new(), String::new()),
+        ActiveMode::Folder(folder) => {
+            let snapshot = folder.snapshot().await;
+            let serving_order = snapshot.serving_order();
+            let lines = serving_order
+                .iter()
+                .map(|entry| entry.filename.as_str())
+                .collect::<Vec<_>>()
+                .join("\n");
+            let entries = serving_order
+                .into_iter()
+                .enumerate()
+                .map(|(index, entry)| FolderTemplateEntry {
+                    id: entry.id,
+                    filename: entry.filename,
+                    is_next: index == 0,
+                })
+                .collect();
+            (snapshot.generation, entries, lines)
+        }
+    };
     let template = SettingsTemplate {
         generation,
         csrf_token: state.csrf_token().to_owned(),
@@ -452,7 +438,7 @@ async fn render_settings(
         reorder_lines,
         cache_ready: state.is_ready().await,
         last_request,
-        mode_status,
+        mode_status: state.mode_status().await,
         error,
     };
     match template.render() {
@@ -464,43 +450,6 @@ async fn render_settings(
                 "failed to render settings page",
             )
         }
-    }
-}
-
-fn format_selector_status(status: &crate::state::SelectorStatus) -> String {
-    let mut parts = Vec::new();
-    if status.running {
-        parts.push("DigiKam selection is running.".to_owned());
-    }
-    if let Some(success) = &status.last_success {
-        parts.push(format!(
-            "Last success: {} — image ID {}, selection date {}, {} bytes, cache {}.",
-            success
-                .completed_at
-                .to_rfc3339_opts(SecondsFormat::Secs, true),
-            success.result.image_id,
-            success.result.selection_date,
-            success.result.content_length,
-            if success.result.cache_changed {
-                "updated"
-            } else {
-                "unchanged"
-            }
-        ));
-    }
-    if let Some(error) = &status.last_error {
-        parts.push(format!("Last error: {error}"));
-    }
-    if let Some(next) = status.next_attempt {
-        parts.push(format!(
-            "Next attempt: {}.",
-            next.to_rfc3339_opts(SecondsFormat::Secs, true)
-        ));
-    }
-    if parts.is_empty() {
-        "No DigiKam selection has completed since the server started.".to_owned()
-    } else {
-        parts.join("\n")
     }
 }
 
@@ -875,11 +824,12 @@ mod tests {
     #[tokio::test]
     async fn folder_get_advances_head_does_not_and_wraps() {
         let (_directory, state) = folder_state().await;
-        let app = router(state);
+        let app = router(state.clone());
         let head = app.clone().oneshot(frame_request("HEAD")).await.unwrap();
         assert_eq!(head.status(), StatusCode::OK);
         assert_eq!(head.headers()[header::CACHE_CONTROL], "no-store");
         assert!(bytes(head).await.is_empty());
+        assert!(state.last_image_request().await.is_none());
         assert_eq!(
             bytes(app.clone().oneshot(frame_request("GET")).await.unwrap()).await,
             JPEG_A
@@ -897,6 +847,10 @@ mod tests {
         assert_eq!(
             bytes(app.oneshot(frame_request("GET")).await.unwrap()).await,
             JPEG_A
+        );
+        assert_eq!(
+            state.last_image_request().await.unwrap().client_ip,
+            "127.0.0.1".parse::<std::net::IpAddr>().unwrap()
         );
     }
 
@@ -949,6 +903,63 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn settings_rejects_csrf_stale_generation_and_oversized_bodies() {
+        let (_directory, state) = folder_state().await;
+        let snapshot = state.settings.snapshot().await;
+        let mut form = SettingsForm::from_settings(
+            snapshot.generation,
+            state.csrf_token(),
+            &snapshot.settings,
+        );
+        form.csrf_token = "wrong".into();
+        let app = router(state.clone());
+        let response = app
+            .clone()
+            .oneshot(
+                Request::post("/settings")
+                    .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
+                    .body(Body::from(serde_urlencoded::to_string(&form).unwrap()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+        assert_eq!(
+            state.settings.snapshot().await.generation,
+            snapshot.generation
+        );
+
+        form.csrf_token = state.csrf_token().into();
+        form.generation = "99".into();
+        let response = app
+            .clone()
+            .oneshot(
+                Request::post("/settings")
+                    .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
+                    .body(Body::from(serde_urlencoded::to_string(&form).unwrap()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+        assert_eq!(
+            state.settings.snapshot().await.generation,
+            snapshot.generation
+        );
+
+        let response = app
+            .oneshot(
+                Request::post("/settings")
+                    .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
+                    .body(Body::from("x".repeat(70 * 1024)))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
+    }
+
+    #[tokio::test]
     async fn readiness_tracks_empty_folder() {
         let (_directory, state) = folder_state().await;
         let app = router(state.clone());
@@ -968,11 +979,16 @@ mod tests {
             folder.refresh(generation).await.unwrap();
         }
         assert_eq!(
-            app.oneshot(Request::get("/health/ready").body(Body::empty()).unwrap())
+            app.clone()
+                .oneshot(Request::get("/health/ready").body(Body::empty()).unwrap())
                 .await
                 .unwrap()
                 .status(),
             StatusCode::SERVICE_UNAVAILABLE
+        );
+        assert_eq!(
+            app.oneshot(frame_request("GET")).await.unwrap().status(),
+            StatusCode::NOT_FOUND
         );
     }
 

@@ -70,69 +70,69 @@ Not included:
 
 ### Stage 1 — Generic configuration and mode boundary
 
-- [ ] Add strongly typed active-mode settings with explicit DigiKam and folder variants, compatibility deserialization for the existing DigiKam settings shape, per-mode validation, and updated example TOML.
-- [ ] Define mode-neutral frame metadata/status/readiness interfaces and refactor shared app state so routes and health checks do not depend directly on `SelectionResult` or DigiKam scheduler fields.
-- [ ] Move current DigiKam selection/scheduling behavior behind the DigiKam mode implementation without changing its source/cache capability boundary.
-- [ ] Add tests for old/new settings loading and persistence, invalid/mixed mode fields, mode-specific validation, and unchanged DigiKam selection behavior.
-- [ ] Verify with `cargo fmt --check`, strict Clippy, and the full tests; commit the generic configuration/mode milestone.
+- [x] Add strongly typed active-mode settings with explicit DigiKam and folder variants, compatibility deserialization for the existing DigiKam settings shape, per-mode validation, and updated example TOML.
+- [x] Define mode-neutral frame metadata/status/readiness interfaces and refactor shared app state so routes and health checks do not depend directly on `SelectionResult` or DigiKam scheduler fields.
+- [x] Move current DigiKam selection/scheduling behavior behind the DigiKam mode implementation without changing its source/cache capability boundary.
+- [x] Add tests for old/new settings loading and persistence, invalid/mixed mode fields, mode-specific validation, and unchanged DigiKam selection behavior.
+- [x] Verify with `cargo fmt --check`, strict Clippy, and the full tests; commit the generic configuration/mode milestone.
 
 ### Stage 2 — Folder inventory and safe filesystem operations
 
 Depends on Stage 1.
 
-- [ ] Add a folder-mode module that canonicalizes/validates its managed root, recovers recognized temporary operations, scans only eligible top-level regular JPEGs, assigns safe opaque runtime identifiers, and builds a filename-sorted inventory.
-- [ ] Implement synchronized inventory generation and cursor state with deterministic reset, sequential reservation/preparation, wraparound, no-advance-on-failure, and a snapshot API for status/UI.
-- [ ] Implement explicit refresh as a complete validated inventory replacement while preserving the previous snapshot on failure.
-- [ ] Implement bounded, content-validated multipart upload using confined `create_new` temporary files, collision-safe destination naming, sync/rename publication, and deterministic queue update.
-- [ ] Implement complete-order validation and collision-safe two-phase renaming so refreshed alphabetical order matches the submitted order, including rollback/recovery behavior.
-- [ ] Unit-test ordering, wrap/reset, empty/invalid folders, manual add/remove refresh, concurrent reservations, unreadable/deleted files, filename edge cases, traversal/symlink rejection, upload failures/collisions, reorder persistence, injected rename failure, and temporary recovery.
-- [ ] Verify formatting, strict linting, and all tests; commit the folder storage/queue milestone.
+- [x] Add a folder-mode module that canonicalizes/validates its managed root, recovers recognized temporary operations, scans only eligible top-level regular JPEGs, assigns safe opaque runtime identifiers, and builds a filename-sorted inventory.
+- [x] Implement synchronized inventory generation and cursor state with deterministic reset, sequential reservation/preparation, wraparound, no-advance-on-failure, and a snapshot API for status/UI.
+- [x] Implement explicit refresh as a complete validated inventory replacement while preserving the previous snapshot on failure.
+- [x] Implement bounded, content-validated multipart upload using confined `create_new` temporary files, collision-safe destination naming, sync/rename publication, and deterministic queue update.
+- [x] Implement complete-order validation and collision-safe two-phase renaming so refreshed alphabetical order matches the submitted order, including rollback/recovery behavior.
+- [x] Unit-test ordering, wrap/reset, empty/invalid folders, manual add/remove refresh, concurrent reservations, unreadable/deleted files, filename edge cases, traversal/symlink rejection, upload failures/collisions, reorder persistence, injected rename failure, and temporary recovery.
+- [x] Verify formatting, strict linting, and all tests; commit the folder storage/queue milestone.
 
 ### Stage 3 — Mode-aware runtime, scheduler, frame serving, and health
 
 Depends on Stages 1–2.
 
-- [ ] Add active-mode activation/switching that validates and initializes the replacement runtime before publishing it, triggers immediate DigiKam selection or folder scan as applicable, and prevents inactive DigiKam rollover work.
-- [ ] Refactor the scheduler/trigger loop to delegate only mode-relevant background work while preserving single-flight retries, graceful cancellation, and stale DigiKam cache retention.
-- [ ] Refactor frame `GET`/`HEAD` through the generic mode contract: preserve DigiKam conditional responses, make folder `GET` advance and return the next body with rotating-resource cache headers, and make folder `HEAD` peek without advancing.
-- [ ] Make readiness and status mode-aware while preserving common direct-peer last-GET tracking and error handling.
-- [ ] Add integration tests for dynamic mode switches, startup activation, folder GET sequence/wrap, simultaneous GETs, failed GET/no advance, HEAD/no advance, mode-specific conditional headers, readiness transitions, request tracking, and shutdown during mode work.
-- [ ] Verify formatting, strict linting, and all tests; commit the mode runtime/serving milestone.
+- [x] Add active-mode activation/switching that validates and initializes the replacement runtime before publishing it, triggers immediate DigiKam selection or folder scan as applicable, and prevents inactive DigiKam rollover work.
+- [x] Refactor the scheduler/trigger loop to delegate only mode-relevant background work while preserving single-flight retries, graceful cancellation, and stale DigiKam cache retention.
+- [x] Refactor frame `GET`/`HEAD` through the generic mode contract: preserve DigiKam conditional responses, make folder `GET` advance and return the next body with rotating-resource cache headers, and make folder `HEAD` peek without advancing.
+- [x] Make readiness and status mode-aware while preserving common direct-peer last-GET tracking and error handling.
+- [x] Add integration tests for dynamic mode switches, startup activation, folder GET sequence/wrap, simultaneous GETs, failed GET/no advance, HEAD/no advance, mode-specific conditional headers, readiness transitions, request tracking, and shutdown during mode work.
+- [x] Verify formatting, strict linting, and all tests; commit the mode runtime/serving milestone.
 
 ### Stage 4 — Folder settings, thumbnails, upload, refresh, and reorder UI
 
 Depends on Stages 2–3.
 
-- [ ] Update `/settings` to show active mode, shared runtime state, mode-appropriate configuration/status, and folder queue thumbnails in serving order with the next item clearly marked.
-- [ ] Add a safe non-advancing thumbnail route resolved through the current inventory rather than user-provided filesystem paths.
-- [ ] Add CSRF- and inventory-generation-protected forms/routes for explicit disk refresh, multipart upload, and complete queue reordering, with operation-specific body limits and POST/Redirect/GET success behavior.
-- [ ] Ensure UI mode changes validate/activate transactionally and render escaped submitted values plus actionable errors without changing settings or runtime on failure.
-- [ ] Test thumbnail ordering/content/non-advancement, successful and failed refresh/upload/reorder HTTP flows, stale inventory and settings generations, CSRF rejection, multipart/body limits, HTML escaping, PRG redirects, and filename changes visible after reload.
-- [ ] Perform a browser-oriented accessibility/usability pass so ordering controls work without relying solely on drag-and-drop or JavaScript.
-- [ ] Verify formatting, strict linting, and all tests; commit the complete web-interface milestone.
+- [x] Update `/settings` to show active mode, shared runtime state, mode-appropriate configuration/status, and folder queue thumbnails in serving order with the next item clearly marked.
+- [x] Add a safe non-advancing thumbnail route resolved through the current inventory rather than user-provided filesystem paths.
+- [x] Add CSRF- and inventory-generation-protected forms/routes for explicit disk refresh, multipart upload, and complete queue reordering, with operation-specific body limits and POST/Redirect/GET success behavior.
+- [x] Ensure UI mode changes validate/activate transactionally and render escaped submitted values plus actionable errors without changing settings or runtime on failure.
+- [x] Test thumbnail ordering/content/non-advancement, successful and failed refresh/upload/reorder HTTP flows, stale inventory and settings generations, CSRF rejection, multipart/body limits, HTML escaping, PRG redirects, and filename changes visible after reload.
+- [x] Perform a browser-oriented accessibility/usability pass so ordering controls work without relying solely on drag-and-drop or JavaScript.
+- [x] Verify formatting, strict linting, and all tests; commit the complete web-interface milestone.
 
 ### Stage 5 — Examples, operations documentation, and safety audit
 
 Depends on Stages 1–4.
 
-- [ ] Update README/configuration examples for selecting both modes, compatibility/migration, folder permissions and separation, startup/refresh behavior, filename-based order and rename side effects, cursor resets/wrap, uploads, thumbnail endpoints, readiness, and mode-specific HTTP caching.
-- [ ] Update container/Kubernetes-administrator guidance to distinguish read-only DigiKam mounts from the writable managed folder and retain the one-replica, trusted-LAN, non-root, persistent-storage, and graceful-shutdown requirements.
-- [ ] Audit all open/create/remove/rename call sites and demonstrate that DigiKam remains immutable, folder writes remain under its canonical root, cache/settings writes remain under their roots, and all browser-controlled identifiers are confined.
-- [ ] Verify the documented local setup from empty temporary directories, then run formatting, strict linting, tests, and a release build; commit the documentation/safety milestone.
+- [x] Update README/configuration examples for selecting both modes, compatibility/migration, folder permissions and separation, startup/refresh behavior, filename-based order and rename side effects, cursor resets/wrap, uploads, thumbnail endpoints, readiness, and mode-specific HTTP caching.
+- [x] Update container/Kubernetes-administrator guidance to distinguish read-only DigiKam mounts from the writable managed folder and retain the one-replica, trusted-LAN, non-root, persistent-storage, and graceful-shutdown requirements.
+- [x] Audit all open/create/remove/rename call sites and demonstrate that DigiKam remains immutable, folder writes remain under its canonical root, cache/settings writes remain under their roots, and all browser-controlled identifiers are confined.
+- [x] Verify the documented local setup from empty temporary directories, then run formatting, strict linting, tests, and a release build; commit the documentation/safety milestone.
 
 ### Stage 6 — Final end-to-end validation
 
 Depends on all previous stages.
 
-- [ ] From a clean checkout, build a release binary and create a representative read-only DigiKam catalog/photo tree plus separate writable settings, cache, and managed-folder storage.
-- [ ] Start with a legacy DigiKam settings file; verify compatibility, startup selection, daily-mode status/readiness, GET/HEAD/conditional behavior, and unchanged database/source hashes and metadata.
-- [ ] Switch through the HTTP settings interface to folder mode; verify immediate alphabetical thumbnails/readiness and exact sequential frame bodies through wrap, with HEAD/thumbnail/health/settings requests not advancing the cursor.
-- [ ] Upload JPEGs through HTTP, reorder the complete queue, confirm underlying alphabetical filenames encode the new order, add/remove files directly on disk, and verify only explicit refresh reconciles them.
-- [ ] Restart and verify uploaded/reordered files remain in the displayed/served order while the runtime cursor resets to the documented first image; switch back to DigiKam and verify immediate selection still works.
-- [ ] Exercise concurrent frame GETs and invalid/stale/CSRF-invalid/oversized/non-JPEG/traversal/collision operations; verify deterministic advancement, proper errors, no overwrite/escape, prior-state retention, and temporary-file cleanup.
-- [ ] Send SIGTERM during normal serving and folder/DigiKam work; verify graceful exit and intact settings, cache, catalog, source photos, managed images, and ordering.
-- [ ] Run `cargo fmt --check`, `cargo clippy --all-targets --all-features -- -D warnings`, `cargo test`, and `cargo build --release`; record exact results in the implementation summary.
-- [ ] Commit any final validated fixes as a meaningful milestone and leave the working tree clean.
+- [x] From a clean checkout, build a release binary and create a representative read-only DigiKam catalog/photo tree plus separate writable settings, cache, and managed-folder storage.
+- [x] Start with a legacy DigiKam settings file; verify compatibility, startup selection, daily-mode status/readiness, GET/HEAD/conditional behavior, and unchanged database/source hashes and metadata.
+- [x] Switch through the HTTP settings interface to folder mode; verify immediate alphabetical thumbnails/readiness and exact sequential frame bodies through wrap, with HEAD/thumbnail/health/settings requests not advancing the cursor.
+- [x] Upload JPEGs through HTTP, reorder the complete queue, confirm underlying alphabetical filenames encode the new order, add/remove files directly on disk, and verify only explicit refresh reconciles them.
+- [x] Restart and verify uploaded/reordered files remain in the displayed/served order while the runtime cursor resets to the documented first image; switch back to DigiKam and verify immediate selection still works.
+- [x] Exercise concurrent frame GETs and invalid/stale/CSRF-invalid/oversized/non-JPEG/traversal/collision operations; verify deterministic advancement, proper errors, no overwrite/escape, prior-state retention, and temporary-file cleanup.
+- [x] Send SIGTERM during normal serving and folder/DigiKam work; verify graceful exit and intact settings, cache, catalog, source photos, managed images, and ordering.
+- [x] Run `cargo fmt --check`, `cargo clippy --all-targets --all-features -- -D warnings`, `cargo test`, and `cargo build --release`; record exact results in the implementation summary.
+- [x] Commit any final validated fixes as a meaningful milestone and leave the working tree clean.
 
 ## Execution contract
 
