@@ -52,7 +52,7 @@ impl AppState {
         );
         let queue = QueueStore::new(&config.queue_dir, migrate_current).await?;
         let registry =
-            SupplierRegistry::prepare(&snapshot.settings.suppliers, queue.root()).await?;
+            SupplierRegistry::prepare(&snapshot.settings.suppliers, queue.root(), false).await?;
         let (runtime_trigger, _) = watch::channel(0);
         Ok(Arc::new(Self {
             config,
@@ -70,7 +70,7 @@ impl AppState {
     pub async fn prepare_registry(&self, settings: &Settings) -> Result<Arc<SupplierRegistry>> {
         settings.validate()?;
         validate_settings_separation(&self.config, settings)?;
-        SupplierRegistry::prepare(&settings.suppliers, self.queue.root()).await
+        SupplierRegistry::prepare(&settings.suppliers, self.queue.root(), true).await
     }
 
     pub async fn activate_registry(&self, registry: Arc<SupplierRegistry>) {
@@ -136,26 +136,20 @@ fn validate_settings_separation(config: &Config, settings: &Settings) -> Result<
         bail!("settings file must not be inside queue root");
     }
     match &settings.supplier().kind {
-        SupplierKind::ManualFolder(manual) => {
-            let source = std::fs::canonicalize(&manual.directory)
-                .context("failed to canonicalize manual source")?;
-            if source.starts_with(&queue) || queue.starts_with(&source) {
-                bail!("manual source and queue root must be separate");
-            }
-        }
+        SupplierKind::ManualFolder(manual) => check_source_separation(&queue, &manual.directory)?,
         SupplierKind::DigikamSqlite(digikam) => {
             for mapping in &digikam.path_mappings {
-                let source = std::fs::canonicalize(&mapping.mounted_root).with_context(|| {
-                    format!(
-                        "failed to canonicalize DigiKam source {}",
-                        mapping.mounted_root.display()
-                    )
-                })?;
-                if source.starts_with(&queue) || queue.starts_with(&source) {
-                    bail!("DigiKam source and queue root must be separate");
-                }
+                check_source_separation(&queue, &mapping.mounted_root)?;
             }
         }
+    }
+    Ok(())
+}
+
+fn check_source_separation(queue: &std::path::Path, configured: &std::path::Path) -> Result<()> {
+    let source = std::fs::canonicalize(configured).unwrap_or_else(|_| configured.to_path_buf());
+    if source.starts_with(queue) || queue.starts_with(&source) {
+        bail!("supplier source and queue root must be separate");
     }
     Ok(())
 }

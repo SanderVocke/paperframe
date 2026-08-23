@@ -47,6 +47,14 @@ pub struct QueueSnapshot {
 }
 
 #[derive(Clone, Debug)]
+pub struct EnqueueRequest {
+    pub display_name: String,
+    pub bytes: Vec<u8>,
+    pub supplier_id: Option<String>,
+    pub source_key: Option<String>,
+}
+
+#[derive(Clone, Debug)]
 pub struct PreparedImage {
     pub entry: QueueEntry,
     pub bytes: Vec<u8>,
@@ -169,42 +177,88 @@ impl QueueStore {
         supplier_id: Option<String>,
         source_key: Option<String>,
     ) -> Result<QueueEntry> {
-        validate_jpeg(&bytes)?;
-        let digest = digest(&bytes);
-        let id = random_id();
-        let object_name = format!("{id}.jpg");
-        let entry = QueueEntry {
-            id,
-            object_name: object_name.clone(),
-            display_name,
-            digest,
-            content_length: bytes.len() as u64,
-            supplier_id,
-            source_key,
-        };
+        let mut added = self
+            .enqueue_batch(
+                None,
+                None,
+                vec![EnqueueRequest {
+                    display_name,
+                    bytes,
+                    supplier_id,
+                    source_key,
+                }],
+            )
+            .await?;
+        added.pop().context("enqueue was unexpectedly skipped")
+    }
+
+    pub async fn enqueue_batch(
+        &self,
+        expected_generation: Option<u64>,
+        maximum_length: Option<usize>,
+        mut requests: Vec<EnqueueRequest>,
+    ) -> Result<Vec<QueueEntry>> {
+        for request in &requests {
+            validate_jpeg(&request.bytes)?;
+        }
         let _guard = self.mutation.lock().await;
+        let current = self.descriptor.read().await.clone();
+        if let Some(expected) = expected_generation {
+            require_generation(&current, expected)?;
+        }
+        if let Some(maximum) = maximum_length {
+            requests.truncate(maximum.saturating_sub(current.entries.len()));
+        }
+        if requests.is_empty() {
+            return Ok(Vec::new());
+        }
+        let entries = requests
+            .iter()
+            .map(|request| {
+                let id = random_id();
+                QueueEntry {
+                    object_name: format!("{id}.jpg"),
+                    id,
+                    display_name: request.display_name.clone(),
+                    digest: digest(&request.bytes),
+                    content_length: request.bytes.len() as u64,
+                    supplier_id: request.supplier_id.clone(),
+                    source_key: request.source_key.clone(),
+                }
+            })
+            .collect::<Vec<_>>();
+        let mut next = current;
+        next.generation = next.generation.saturating_add(1);
+        for entry in &entries {
+            next.entries.push(entry.clone());
+            if let (Some(supplier), Some(source)) = (&entry.supplier_id, &entry.source_key) {
+                next.seen
+                    .entry(supplier.clone())
+                    .or_default()
+                    .insert(source.clone());
+            }
+        }
         let root = self.root.clone();
         let objects = self.objects.clone();
         let state_path = self.state_path.clone();
-        let mut next = self.descriptor.read().await.clone();
-        next.generation = next.generation.saturating_add(1);
-        next.entries.push(entry.clone());
-        if let (Some(supplier), Some(source)) = (&entry.supplier_id, &entry.source_key) {
-            next.seen
-                .entry(supplier.clone())
-                .or_default()
-                .insert(source.clone());
-        }
-        let object_path = objects.join(&object_name);
+        let disk_entries = entries.clone();
+        let payloads = requests.into_iter().map(|request| request.bytes).collect();
         let next_for_disk = next.clone();
         tokio::task::spawn_blocking(move || {
-            publish_enqueue(&root, &object_path, &state_path, &bytes, &next_for_disk)
+            publish_enqueue_batch(
+                &root,
+                &objects,
+                &state_path,
+                &disk_entries,
+                payloads,
+                &next_for_disk,
+            )
         })
         .await
         .context("queue enqueue worker stopped")??;
         *self.descriptor.write().await = next.clone();
         self.notify(QueueEventReason::Enqueue, next.generation);
-        Ok(entry)
+        Ok(entries)
     }
 
     pub async fn reorder(&self, expected: u64, ids: Vec<String>) -> Result<QueueSnapshot> {
@@ -260,26 +314,26 @@ impl QueueStore {
     }
 
     pub async fn advance(&self) -> Result<bool> {
-        let current_id = self
-            .descriptor
-            .read()
-            .await
-            .entries
-            .first()
-            .map(|entry| entry.id.clone());
-        match current_id {
-            Some(id) => self.advance_if_current(&id).await,
-            None => {
-                self.demand(QueueEventReason::BlockedAdvance);
-                Ok(false)
-            }
-        }
+        self.advance_internal(None, None).await
+    }
+
+    pub async fn advance_at_generation(&self, expected: u64) -> Result<bool> {
+        self.advance_internal(Some(expected), None).await
     }
 
     pub async fn advance_if_current(&self, id: &str) -> Result<bool> {
+        self.advance_internal(None, Some(id)).await
+    }
+
+    async fn advance_internal(&self, expected: Option<u64>, id: Option<&str>) -> Result<bool> {
         let _guard = self.mutation.lock().await;
         let current = self.descriptor.read().await.clone();
-        if current.entries.first().map(|entry| entry.id.as_str()) != Some(id) {
+        if let Some(expected) = expected {
+            require_generation(&current, expected)?;
+        }
+        if let Some(id) = id
+            && current.entries.first().map(|entry| entry.id.as_str()) != Some(id)
+        {
             return Ok(false);
         }
         if current.entries.len() <= 1 {
@@ -434,38 +488,49 @@ fn initialize(configured: &Path) -> Result<(PathBuf, PathBuf, Descriptor)> {
     Ok((root, objects, descriptor))
 }
 
-fn publish_enqueue(
+fn publish_enqueue_batch(
     root: &Path,
-    object_path: &Path,
+    objects: &Path,
     state_path: &Path,
-    bytes: &[u8],
+    entries: &[QueueEntry],
+    payloads: Vec<Vec<u8>>,
     descriptor: &Descriptor,
 ) -> Result<()> {
-    let temporary = object_path.parent().unwrap().join(format!(
-        ".object.{}.{}.tmp",
-        std::process::id(),
-        TEMP_COUNTER.fetch_add(1, Ordering::Relaxed)
-    ));
+    let mut temporaries = Vec::new();
+    let mut published = Vec::new();
     let result = (|| -> Result<()> {
-        let mut file = OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&temporary)
-            .context("failed to create queue object temporary")?;
-        file.write_all(bytes)
-            .context("failed to write queue object")?;
-        file.sync_all().context("failed to sync queue object")?;
-        fs::rename(&temporary, object_path).context("failed to publish queue object")?;
-        sync_directory(object_path.parent().unwrap())?;
-        if let Err(error) = persist_descriptor(state_path, descriptor) {
-            let _ = fs::remove_file(object_path);
-            return Err(error);
+        for (entry, bytes) in entries.iter().zip(payloads) {
+            let temporary = objects.join(format!(
+                ".object.{}.{}.tmp",
+                std::process::id(),
+                TEMP_COUNTER.fetch_add(1, Ordering::Relaxed)
+            ));
+            let mut file = OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&temporary)
+                .context("failed to create queue object temporary")?;
+            file.write_all(&bytes)
+                .context("failed to write queue object")?;
+            file.sync_all().context("failed to sync queue object")?;
+            temporaries.push((temporary, objects.join(&entry.object_name)));
         }
-        sync_directory(root)?;
-        Ok(())
+        for (temporary, destination) in &temporaries {
+            fs::rename(temporary, destination).context("failed to publish queue object")?;
+            published.push(destination.clone());
+        }
+        sync_directory(objects)?;
+        persist_descriptor(state_path, descriptor)?;
+        sync_directory(root)
     })();
     if result.is_err() {
-        let _ = fs::remove_file(&temporary);
+        for (temporary, _) in &temporaries {
+            let _ = fs::remove_file(temporary);
+        }
+        for destination in &published {
+            let _ = fs::remove_file(destination);
+        }
+        let _ = sync_directory(objects);
     }
     result
 }
@@ -590,6 +655,96 @@ mod tests {
         assert_eq!(snapshot.entries[0].id, b.id);
         queue.remove(snapshot.generation, &b.id).await.unwrap();
         assert!(queue.current().await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn migrates_legacy_current_and_detects_missing_or_corrupt_state() {
+        let dir = tempdir().unwrap();
+        fs::write(dir.path().join("current.jpg"), A).unwrap();
+        let queue = QueueStore::new(dir.path(), true).await.unwrap();
+        assert_eq!(queue.current().await.unwrap().unwrap().bytes, A);
+        assert!(!dir.path().join("current.jpg").exists());
+        let object = queue.snapshot().await.entries[0].object_name.clone();
+        drop(queue);
+        fs::remove_file(dir.path().join(OBJECTS_DIR).join(object)).unwrap();
+        assert!(QueueStore::new(dir.path(), false).await.is_err());
+
+        let corrupt = tempdir().unwrap();
+        fs::write(corrupt.path().join(STATE_FILE), "not valid toml = [").unwrap();
+        assert!(QueueStore::new(corrupt.path(), false).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn events_report_committed_changes_and_blocked_demand() {
+        let dir = tempdir().unwrap();
+        let queue = QueueStore::new(dir.path(), false).await.unwrap();
+        let mut events = queue.subscribe();
+        queue
+            .enqueue("a".into(), A.to_vec(), None, None)
+            .await
+            .unwrap();
+        events.changed().await.unwrap();
+        assert_eq!(events.borrow().reason, QueueEventReason::Enqueue);
+        queue.advance().await.unwrap();
+        events.changed().await.unwrap();
+        assert_eq!(events.borrow().reason, QueueEventReason::BlockedAdvance);
+    }
+
+    #[tokio::test]
+    async fn batch_enqueue_is_atomic_bounded_and_generation_checked() {
+        let dir = tempdir().unwrap();
+        let queue = QueueStore::new(dir.path(), false).await.unwrap();
+        let generation = queue.snapshot().await.generation;
+        let invalid = queue
+            .enqueue_batch(
+                Some(generation),
+                None,
+                vec![
+                    EnqueueRequest {
+                        display_name: "a".into(),
+                        bytes: A.to_vec(),
+                        supplier_id: None,
+                        source_key: None,
+                    },
+                    EnqueueRequest {
+                        display_name: "bad".into(),
+                        bytes: b"bad".to_vec(),
+                        supplier_id: None,
+                        source_key: None,
+                    },
+                ],
+            )
+            .await;
+        assert!(invalid.is_err());
+        assert!(queue.snapshot().await.entries.is_empty());
+        let added = queue
+            .enqueue_batch(
+                Some(generation),
+                Some(1),
+                vec![
+                    EnqueueRequest {
+                        display_name: "a".into(),
+                        bytes: A.to_vec(),
+                        supplier_id: None,
+                        source_key: None,
+                    },
+                    EnqueueRequest {
+                        display_name: "b".into(),
+                        bytes: B.to_vec(),
+                        supplier_id: None,
+                        source_key: None,
+                    },
+                ],
+            )
+            .await
+            .unwrap();
+        assert_eq!(added.len(), 1);
+        assert!(
+            queue
+                .enqueue_batch(Some(generation), None, Vec::new())
+                .await
+                .is_err()
+        );
     }
 
     #[tokio::test]

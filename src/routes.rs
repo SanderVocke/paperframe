@@ -358,12 +358,11 @@ async fn advance_queue(
     State(state): State<Arc<AppState>>,
     Form(form): Form<QueueActionForm>,
 ) -> Response {
-    if let Err((status, message)) =
-        validate_action(&state, &form.csrf_token, &form.queue_generation)
-    {
-        return plain(status, &message);
-    }
-    match state.queue.advance().await {
+    let generation = match validate_action(&state, &form.csrf_token, &form.queue_generation) {
+        Ok(value) => value,
+        Err((status, message)) => return plain(status, &message),
+    };
+    match state.queue.advance_at_generation(generation).await {
         Ok(_) => Redirect::to("/settings").into_response(),
         Err(error) => plain(StatusCode::CONFLICT, &error.to_string()),
     }
@@ -372,10 +371,12 @@ async fn refresh_supplier(
     State(state): State<Arc<AppState>>,
     Form(form): Form<QueueActionForm>,
 ) -> Response {
-    if let Err((status, message)) =
-        validate_action(&state, &form.csrf_token, &form.queue_generation)
-    {
-        return plain(status, &message);
+    let generation = match validate_action(&state, &form.csrf_token, &form.queue_generation) {
+        Ok(value) => value,
+        Err((status, message)) => return plain(status, &message),
+    };
+    if state.queue.snapshot().await.generation != generation {
+        return plain(StatusCode::CONFLICT, "Queue changed concurrently");
     }
     state.queue.demand(QueueEventReason::SupplierRefresh);
     Redirect::to("/settings").into_response()
@@ -463,18 +464,30 @@ async fn upload_queue(State(state): State<Arc<AppState>>, mut multipart: Multipa
     }
     let csrf = csrf.unwrap_or_default();
     let generation = generation.unwrap_or_default();
-    if let Err((status, message)) = validate_action(&state, &csrf, &generation) {
-        return plain(status, &message);
-    }
+    let generation = match validate_action(&state, &csrf, &generation) {
+        Ok(value) => value,
+        Err((status, message)) => return plain(status, &message),
+    };
     if uploads.is_empty() {
         return plain(StatusCode::UNPROCESSABLE_ENTITY, "Select at least one JPEG");
     }
-    for (name, bytes) in uploads {
-        if let Err(error) = state.queue.enqueue(name, bytes, None, None).await {
-            return plain(StatusCode::UNPROCESSABLE_ENTITY, &error.to_string());
-        }
+    let requests = uploads
+        .into_iter()
+        .map(|(display_name, bytes)| crate::queue::EnqueueRequest {
+            display_name,
+            bytes,
+            supplier_id: None,
+            source_key: None,
+        })
+        .collect();
+    match state
+        .queue
+        .enqueue_batch(Some(generation), None, requests)
+        .await
+    {
+        Ok(_) => Redirect::to("/settings").into_response(),
+        Err(error) => plain(StatusCode::UNPROCESSABLE_ENTITY, &error.to_string()),
     }
-    Redirect::to("/settings").into_response()
 }
 fn safe_display_name(name: &str) -> String {
     std::path::Path::new(name)
@@ -1034,6 +1047,218 @@ mod tests {
             StatusCode::NOT_MODIFIED
         );
         assert_eq!(manual.queue.current().await.unwrap().unwrap().bytes, A);
+    }
+
+    #[tokio::test]
+    async fn universal_http_controls_are_protected_and_do_not_touch_source() {
+        let (directory, state) = manual_state(AdvancementSettings::Manual).await;
+        let app = router(state.clone());
+        let before = state.queue.snapshot().await;
+        let thumbnail = app
+            .clone()
+            .oneshot(
+                Request::get(format!("/queue/thumbnail/{}", before.entries[0].id))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(bytes(thumbnail).await, A);
+        assert_eq!(state.queue.snapshot().await.generation, before.generation);
+
+        let bad = serde_urlencoded::to_string([
+            ("csrf_token", "wrong"),
+            ("queue_generation", &before.generation.to_string()),
+            ("id", before.entries[0].id.as_str()),
+        ])
+        .unwrap();
+        let response = app
+            .clone()
+            .oneshot(
+                Request::post("/queue/remove")
+                    .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
+                    .body(Body::from(bad))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+
+        let good = serde_urlencoded::to_string([
+            ("csrf_token", state.csrf_token()),
+            ("queue_generation", &before.generation.to_string()),
+            ("id", before.entries[0].id.as_str()),
+        ])
+        .unwrap();
+        let response = app
+            .clone()
+            .oneshot(
+                Request::post("/queue/remove")
+                    .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
+                    .body(Body::from(good))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::SEE_OTHER);
+        assert_eq!(state.queue.current().await.unwrap().unwrap().bytes, B);
+
+        let generation = state.queue.snapshot().await.generation;
+        let boundary = "queue-upload-boundary";
+        let mut body = format!(
+            "--{boundary}\r\nContent-Disposition: form-data; name=\"csrf_token\"\r\n\r\n{}\r\n--{boundary}\r\nContent-Disposition: form-data; name=\"queue_generation\"\r\n\r\n{generation}\r\n--{boundary}\r\nContent-Disposition: form-data; name=\"images\"; filename=\"direct.jpg\"\r\nContent-Type: image/jpeg\r\n\r\n",
+            state.csrf_token()
+        ).into_bytes();
+        body.extend_from_slice(A);
+        body.extend_from_slice(format!("\r\n--{boundary}--\r\n").as_bytes());
+        let response = app
+            .oneshot(
+                Request::post("/queue/upload")
+                    .header(
+                        header::CONTENT_TYPE,
+                        format!("multipart/form-data; boundary={boundary}"),
+                    )
+                    .body(Body::from(body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::SEE_OTHER);
+        assert!(
+            state
+                .queue
+                .snapshot()
+                .await
+                .entries
+                .iter()
+                .any(|entry| entry.display_name == "direct.jpg" && entry.supplier_id.is_none())
+        );
+        assert!(!directory.path().join("source/direct.jpg").exists());
+    }
+
+    #[tokio::test]
+    async fn existing_queue_starts_and_remains_ready_when_supplier_is_unavailable() {
+        let (directory, state) = manual_state(AdvancementSettings::Manual).await;
+        drop(state);
+        fs::remove_dir_all(directory.path().join("source")).unwrap();
+        let settings_path = directory.path().join("settings.toml");
+        let restarted = AppState::initialize(
+            crate::config::Config {
+                bind: "127.0.0.1:0".parse().unwrap(),
+                settings_path: settings_path.clone(),
+                queue_dir: directory.path().join("queue"),
+            },
+            SettingsManager::load(settings_path).unwrap(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(restarted.queue.current().await.unwrap().unwrap().bytes, A);
+        let mut settings = restarted.settings.snapshot().await.settings;
+        settings.queue.target_length = 4;
+        restarted.settings.replace(1, settings).await.unwrap();
+        assert!(refill::refill_once(&restarted).await.is_err());
+        assert_eq!(restarted.queue.current().await.unwrap().unwrap().bytes, A);
+        let ready = router(restarted)
+            .oneshot(Request::get("/health/ready").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(ready.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn background_refill_reacts_to_queue_events_and_shuts_down() {
+        let (directory, state) = manual_state(AdvancementSettings::Manual).await;
+        fs::write(
+            directory.path().join("source/d.jpg"),
+            b"\xff\xd8\xffD\xff\xd9",
+        )
+        .unwrap();
+        let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+        let task = tokio::spawn(refill::run(state.clone(), shutdown_rx));
+        tokio::time::sleep(TokioDuration::from_millis(5)).await;
+        let snapshot = state.queue.snapshot().await;
+        state
+            .queue
+            .remove(snapshot.generation, &snapshot.entries[0].id)
+            .await
+            .unwrap();
+        timeout(TokioDuration::from_secs(1), async {
+            while state.queue.snapshot().await.entries.len() != 3 {
+                tokio::time::sleep(TokioDuration::from_millis(2)).await;
+            }
+        })
+        .await
+        .unwrap();
+        let names = state
+            .queue
+            .snapshot()
+            .await
+            .entries
+            .into_iter()
+            .map(|entry| entry.display_name)
+            .collect::<Vec<_>>();
+        assert_eq!(names, vec!["b.jpg", "c.jpg", "d.jpg"]);
+        shutdown_tx.send(true).unwrap();
+        task.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn queue_change_refills_with_next_unseen_and_source_changes_do_not_touch_copy() {
+        let (directory, state) = manual_state(AdvancementSettings::Manual).await;
+        let original_b = state
+            .queue
+            .prepare(&state.queue.snapshot().await.entries[1].id)
+            .await
+            .unwrap()
+            .bytes;
+        fs::write(
+            directory.path().join("source/b.jpg"),
+            b"\xff\xd8\xffCHANGED\xff\xd9",
+        )
+        .unwrap();
+        fs::remove_file(directory.path().join("source/a.jpg")).unwrap();
+        assert_eq!(
+            state
+                .queue
+                .prepare(&state.queue.snapshot().await.entries[1].id)
+                .await
+                .unwrap()
+                .bytes,
+            original_b
+        );
+
+        let snapshot = state.queue.snapshot().await;
+        state
+            .queue
+            .remove(snapshot.generation, &snapshot.entries[0].id)
+            .await
+            .unwrap();
+        // c was already queued, and removed a remains seen; add d as the next alphabetical unseen candidate.
+        fs::write(
+            directory.path().join("source/d.jpg"),
+            b"\xff\xd8\xffD\xff\xd9",
+        )
+        .unwrap();
+        refill::refill_once(&state).await.unwrap();
+        let names = state
+            .queue
+            .snapshot()
+            .await
+            .entries
+            .into_iter()
+            .map(|entry| entry.display_name)
+            .collect::<Vec<_>>();
+        assert_eq!(names, vec!["b.jpg", "c.jpg", "b.jpg"]); // changed b content is a new identity and sorts before d.
+        assert_eq!(
+            state
+                .queue
+                .seen("manual")
+                .await
+                .iter()
+                .filter(|key| key.contains("a.jpg"))
+                .count(),
+            1
+        );
     }
 
     #[tokio::test]

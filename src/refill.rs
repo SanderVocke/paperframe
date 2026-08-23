@@ -4,7 +4,10 @@ use anyhow::Result;
 use tokio::sync::watch;
 use tracing::{error, info};
 
-use crate::{queue::QueueEventReason, state::AppState};
+use crate::{
+    queue::{EnqueueRequest, QueueEventReason},
+    state::AppState,
+};
 
 const RETRY_DELAY: Duration = Duration::from_secs(5 * 60);
 const IDLE_POLL: Duration = Duration::from_secs(24 * 60 * 60);
@@ -50,25 +53,21 @@ pub async fn refill_once(state: &AppState) -> Result<usize> {
         let deficit = target - count;
         let seen = state.queue.seen(supplier.id()).await;
         let candidates = supplier.supply(seen, deficit).await?;
-        for candidate in candidates.into_iter().take(deficit) {
-            let current_seen = state.queue.seen(supplier.id()).await;
-            if current_seen.contains(&candidate.source_key) {
-                continue;
-            }
-            state
-                .queue
-                .enqueue(
-                    candidate.display_name,
-                    candidate.bytes,
-                    Some(supplier.id().to_owned()),
-                    Some(candidate.source_key),
-                )
-                .await?;
-            added += 1;
-            if state.queue.snapshot().await.entries.len() >= target {
-                break;
-            }
-        }
+        let requests = candidates
+            .into_iter()
+            .take(deficit)
+            .map(|candidate| EnqueueRequest {
+                display_name: candidate.display_name,
+                bytes: candidate.bytes,
+                supplier_id: Some(supplier.id().to_owned()),
+                source_key: Some(candidate.source_key),
+            })
+            .collect();
+        added += state
+            .queue
+            .enqueue_batch(None, Some(target), requests)
+            .await?
+            .len();
     }
     Ok(added)
 }

@@ -518,6 +518,14 @@ mod tests {
             digi.supplier().kind,
             SupplierKind::DigikamSqlite(_)
         ));
+
+        let tagged = "mode='digikam_sqlite'\n[mode_settings]\ndatabase_path='/db'\nquery='SELECT 1'\nmax_candidates=10\n[[mode_settings.path_mappings]]\ndatabase_root='/a'\nmounted_root='/b'\n[mode_settings.selection]\nmode='daily_random'\nrandom_seed='old'\ntimezone='UTC'\nrollover_time='03:00'\n";
+        let tagged_digi: Settings = toml::from_str(tagged).unwrap();
+        assert_eq!(tagged_digi.queue.target_length, 10);
+        assert!(matches!(
+            tagged_digi.supplier().kind,
+            SupplierKind::DigikamSqlite(_)
+        ));
     }
 
     #[test]

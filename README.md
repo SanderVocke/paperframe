@@ -1,188 +1,162 @@
 # Paper frame server
 
-A single-process Rust service that serves JPEG images to a PaperlessPaper frame running the offline firmware. The image URL, health endpoints, request tracking, and settings/status page are shared; an active **image mode** supplies the images and decides when they advance.
+A single-process Rust service that maintains an application-owned JPEG queue and serves its current entry to a PaperlessPaper frame. Image **suppliers** only copy suitable images into the queue; a separate **advancement policy** decides when the current entry is consumed.
 
-The supported modes are:
+Supported suppliers:
 
-- **DigiKam SQLite:** selects a cached image at startup and a configured daily boundary from a read-only DigiKam catalog.
-- **Sequential server folder:** manages top-level JPEGs in a writable directory and returns the next filename-sorted image for every frame `GET`.
+- **DigiKam SQLite** — read-only SQL query order.
+- **Manual source folder** — read-only, top-level alphabetical discovery with polling and explicit refresh.
 
-It is intended for a trusted home LAN and one running process/replica.
+Supported advancement policies:
+
+- `every_fetch` — advance after a qualifying frame response body is fully consumed by the HTTP server.
+- `scheduled` — advance at one or more configured local daily times.
+- `manual` — advance only through the settings page.
+
+Only one supplier may currently be configured, but suppliers are registered through a collection-shaped supplier-neutral coordinator so mixed supply can be added without changing queue or serving APIs.
 
 ## HTTP endpoints
 
 | Method | Path | Purpose |
 |---|---|---|
-| `GET` | `/settings` | Active-mode status, settings, and folder queue controls |
-| `POST` | `/settings` | Validate, persist, and activate complete mode settings |
-| `POST` | `/folder/refresh` | Reconcile folder mode with files currently on disk |
-| `POST` | `/folder/upload` | Upload and append one or more JPEGs |
-| `POST` | `/folder/reorder` | Rename files to persist a submitted queue order |
-| `GET` | `/folder/thumbnail/{id}` | Non-advancing image preview for the current folder inventory |
-| `GET` | `/frame/current.jpg` | Current DigiKam cache or next sequential-folder JPEG |
-| `HEAD` | `/frame/current.jpg` | Image metadata without advancing folder mode or request status |
-| `GET` | `/health/live` | `200` while the HTTP process runs |
-| `GET` | `/health/ready` | `200` when the active mode has an image; otherwise `503` |
+| `GET` / `POST` | `/settings` | Queue/status view and complete settings update |
+| `GET` / `HEAD` | `/frame/current.jpg` | Current queue image |
+| `GET` | `/queue/thumbnail/{id}` | Non-advancing queue thumbnail |
+| `GET` | `/queue/preview/{id}` | Non-advancing full preview |
+| `POST` | `/queue/reorder` | Replace the complete current-first order |
+| `POST` | `/queue/remove` | Remove any entry, including current |
+| `POST` | `/queue/upload` | Append JPEG copies directly to the queue |
+| `POST` | `/queue/advance` | Explicitly consume current when a successor exists |
+| `POST` | `/supplier/refresh` | Request supplier discovery/refill now |
+| `POST` | `/supplier/reset-seen` | Clear imported-candidate history |
+| `GET` | `/health/live` | Process liveness |
+| `GET` | `/health/ready` | `200` while a valid current queue entry is servable |
 
-Configure the offline firmware URL as:
+All mutations are bounded, CSRF-protected, generation checked, and use POST/Redirect/GET.
 
-```text
-http://SERVER_LAN_IP:8080/frame/current.jpg
-```
-
-## Local setup
-
-A current stable Rust toolchain is required. DigiKam mode additionally needs a readable SQLite catalog/photo library; folder mode needs a dedicated writable directory.
+## Setup
 
 ```sh
 cp config.example.toml config.toml
-mkdir -p data/cache data/frame-images
-# Choose one:
+mkdir -p data/queue data/source-images
+# Choose one example supplier:
 cp settings.example.toml data/settings.toml
 # cp settings.folder.example.toml data/settings.toml
 cargo run --release -- config.toml
 ```
 
-The configuration path defaults to `config.toml`. Relative bootstrap paths are resolved from the process working directory. `RUST_LOG` controls structured logging.
-
-### Bootstrap configuration
+The bootstrap path defaults to `config.toml`:
 
 ```toml
 bind = "0.0.0.0:8080"
 settings_path = "data/settings.toml"
-cache_dir = "data/cache"
+queue_dir = "data/queue"
 ```
 
-This file is immutable while the process runs. The settings file and cache directory must be writable. The settings file must already exist and its parent must be writable so updates can use a same-directory temporary file, sync, and atomic rename.
+Legacy `cache_dir` is accepted as an alias for `queue_dir`. The bootstrap file is immutable while running. The settings file, its parent, and queue root must be writable.
 
-### Mode settings
+## Queue model
 
-Canonical settings are tagged and contain only the active mode's strongly typed fields:
+The queue root is fully application managed:
 
-```toml
-mode = "folder_sequence"
-
-[mode_settings]
-directory = "/data/frame-images"
-max_upload_bytes = 26214400
+```text
+queue/
+  queue-state.toml
+  objects/
+    <opaque-id>.jpg
 ```
 
-See [`settings.example.toml`](settings.example.toml) and [`settings.folder.example.toml`](settings.folder.example.toml). Existing untagged DigiKam settings files remain accepted as legacy DigiKam mode. The next successful settings save writes the canonical tagged format.
+`queue-state.toml` is a small versioned descriptor containing generation, current-first order, immutable object metadata, supplier provenance/source identities, and imported-candidate history. It and settings are written through same-directory `create_new` temporaries, file sync, atomic rename, and directory sync. Queue object filenames never encode order.
 
-A generation value prevents concurrent settings forms from silently overwriting one another. Switching modes validates and initializes the replacement before persistence/live activation. Switching to DigiKam triggers immediate selection; switching to folder mode scans it immediately and leaves DigiKam rollover work idle.
+Entry zero is the current image and is otherwise ordinary:
 
-## Sequential server-folder mode
+- Reordering all entries may change current immediately.
+- Removing current promotes the next entry.
+- Advancing consumes current only if another entry exists.
+- If only one entry remains, advance/fetch attempts retain and continue serving it while notifying refill.
+- Explicitly removing the sole entry empties the queue; frame GET returns `404` and readiness returns `503`.
 
-Folder mode intentionally manages and renames files. Its directory must be writable, separate from the cache, and must not contain the settings file. Do not point it at a DigiKam-managed or otherwise immutable photo library.
+Queue copies are immutable snapshots. Once imported, later source modification, rename, deletion, or supplier failure cannot alter them. Direct uploads may exceed `target_length`; the target (default 10) is a refill minimum, not a cap.
 
-### Inventory and advancement
+At startup, recognized temporaries/orphans are reconciled. A descriptor referencing a missing, unsafe, or corrupt object fails safely rather than silently serving a different file.
 
-- Only top-level regular, non-symlink `.jpg`/`.jpeg` files with JPEG boundary markers are eligible. Subdirectories and unrelated files are ignored; unsafe JPEG entries make refresh fail.
-- The initial inventory is sorted by exact filename. There is no recursive traversal or filesystem watcher.
-- Startup, mode activation, upload, reorder, and successful refresh reset the runtime cursor to the first image.
-- Every successful `GET /frame/current.jpg` returns the next image and advances once, wrapping after the last image. Concurrent GETs are serialized around reservation/preparation so they take distinct queue positions.
-- Failed image preparation does not advance. `HEAD`, thumbnails, settings, and health requests never advance.
-- The cursor is not persisted. A restart begins at the alphabetically first file.
-- Manual server-side additions/removals are intentionally invisible until **Refresh queue from disk** succeeds. A failed refresh retains the previous in-memory queue.
-- An empty queue returns `404` from the frame endpoint and makes readiness return `503`.
+## Refill and seen state
 
-The status page rotates its thumbnail list into serving order and marks the next image. Preview URLs use opaque inventory identifiers and resolve only files in the active canonical folder.
+Every committed enqueue, reorder, removal, advance, history reset, and settings change emits a revisioned event. Startup, source polling, explicit refresh, and blocked advancement also request reconciliation. The single-flight coordinator coalesces events, re-reads queue length, and asks suppliers only for the current deficit. Supplier-generated enqueue events therefore settle as a no-op once target is reached rather than looping.
 
-### Reordering and filenames
+A candidate is marked seen only in the same descriptor publication that enqueues its copy. Removing it does not immediately make the supplier add the same source back; the supplier continues with the next unseen candidate. History survives restart and can be reset explicitly from the web UI.
 
-The accessible reorder form contains every current filename, one per line. Submitting a complete new order:
+Failures retain the existing queue and appear in status. Refill retries are bounded and never blocks frame body transfer.
 
-1. Rejects stale inventory generations, duplicates, omissions, and unknown names.
-2. Stages every file to a collision-safe temporary name.
-3. Renames files to fixed-width ordering names such as `000001--holiday.jpg`.
-4. Syncs the directory and publishes a freshly scanned inventory.
+## DigiKam supplier
 
-Therefore ordinary alphabetical sorting reproduces the chosen order after refresh or restart. Recognized ordering prefixes are replaced rather than accumulated. Files are never overwritten. Failures attempt rollback, and recognized interrupted-operation names are recovered on startup/activation.
+DigiKam settings retain:
 
-### Uploads
+- SQLite database path
+- One read-only query
+- Explicit database-to-mounted path mappings
+- Candidate limit
 
-The multipart upload form accepts one or more `.jpg`/`.jpeg` files. The total bytes must not exceed `max_upload_bytes` (maximum configurable value: 100 MiB), as well as the HTTP route's fixed defence-in-depth bound. Browser filenames must be one safe path component and are sanitized; JPEG markers are checked from content.
+The query must be one `SELECT`/CTE returning `image_id`, `root_path`, `album_path`, and `file_name`. Candidates are supplied strictly in query order. SQLite uses read-only/no-create flags, query-only mode, statement-read-only validation, no extension loading, and blocking-worker isolation.
 
-Uploads use `create_new` same-directory temporary files, file sync, collision-safe ordered renaming, and directory sync. They append in submitted order, reset the cursor, and never overwrite existing files. Invalid CSRF, stale generation, malformed/oversized/non-JPEG input, or a filesystem error leaves the published inventory unchanged.
+Mapped photos are canonicalized beneath read-only mounted roots. Traversal, multi-component filenames, symlink escapes, missing files, and invalid JPEGs are rejected. DigiKam no longer owns daily selection, current image, or cache publication.
 
-### Rotating HTTP semantics
+## Manual-folder supplier
 
-A folder-mode frame `GET` always returns the selected body with `Content-Type: image/jpeg`, `Content-Length`, and `Cache-Control: no-store`. `If-Modified-Since` is ignored because the representation intentionally changes on every GET; returning `304` would consume a queue position without delivering the next image. `HEAD` reports the next image length without advancing.
+The configured source folder is separate from the queue and treated as externally mutable but read-only:
 
-## DigiKam SQLite mode
+- Portable periodic polling plus **Refresh supplier now**
+- Top-level regular non-symlink `.jpg`/`.jpeg` files only
+- Exact alphabetical filename discovery order
+- No recursive traversal
+- No source writes, renames, removals, links, or direct serving
 
-DigiKam mode preserves the original daily cached-image behavior. Its settings include:
+Files are read and copied only when queue capacity permits. A changed file has a new content-version identity and may be imported later. Deleted unseen candidates disappear; already queued copies remain untouched. Polling errors retain the queue.
 
-- `database_path`: SQLite catalog visible to the process.
-- `query`: candidate selection query.
-- `path_mappings`: DigiKam database roots translated to mounted roots.
-- `selection.mode`: `first` or `daily_random`.
-- `selection.random_seed`: stable randomization seed.
-- `selection.timezone` and `selection.rollover_time`: IANA timezone and local `HH:MM` boundary.
-- `max_candidates`: upper bound on materialized query rows.
+## Advancement behavior
 
-### Query contract and read-only safety
+### Every completed frame fetch
 
-The SQL must be exactly one read-only SQLite `SELECT` or CTE returning:
+`every_fetch` returns `Cache-Control: no-store` and a body rather than `304`. A qualifying request holds a serialization permit, prepares the current immutable queue object, and wraps the response body with completion tracking. Only successful body EOF schedules `advance_if_current(entry_id)`; a dropped/disconnected body, HEAD, preview, thumbnail, health request, or bodyless response does not advance. Entry-ID comparison prevents an in-flight completion from removing a different current entry after a web mutation.
 
-| Alias | Type | Meaning |
-|---|---|---|
-| `image_id` | integer | Stable DigiKam image identity |
-| `root_path` | text | Album-root path stored by DigiKam |
-| `album_path` | text | Path relative to the album root |
-| `file_name` | text | One filename component |
+The optional `frame_client_ips` list matches the direct TCP peer. Forwarding and `User-Agent` headers are ignored. Empty preserves compatibility by treating every direct peer as a frame client. Configure the frame's IP and use `/queue/preview/{id}` for browser testing when distinction matters.
 
-Safety is enforced with SQL parsing, SQLite's statement-read-only check, `SQLITE_OPEN_READ_ONLY`, no database creation/extension loading, and `PRAGMA query_only = ON`. SQLite work runs outside Tokio executor threads. The service never migrates or modifies DigiKam.
+“Body complete” means the HTTP stack fully polled the response stream. It cannot prove that bytes reached the panel, decoded successfully, or were displayed.
 
-A path mapping translates the database path to a mounted read-only location:
+### Scheduled
 
-```toml
-[[mode_settings.path_mappings]]
-database_root = "/home/user/Pictures"
-mounted_root = "/photos"
-```
+Scheduled policy takes an IANA timezone and one or more unique `HH:MM` values. It calculates only the next future event (no missed-event replay), handles DST gaps/ambiguity deterministically, recalculates after settings changes, and uses the same queue advance operation. Between advances, the stable current image supports `Last-Modified` and conditional `304` responses.
 
-Traversal, multi-component filenames, unmapped roots, missing files, symlink escapes, and canonical paths outside a mounted root are rejected. The cache must be separate from every source root.
+### Manual
 
-### Selection, scheduling, and cache
+Manual policy never advances on GET. The stable current image has the same conditional behavior; **Advance now** invokes the common operation. That button remains available under every policy.
 
-`first` follows query order. `daily_random` deterministically ranks by seed, local selection date, and DigiKam image ID. Selection runs at startup/activation, at the next rollover (including DST handling), after settings updates, and after a bounded retry delay on failure. Only one selection runs at a time.
+## Compatibility migration
 
-Candidates are opened read-only and streamed into an application-owned cache temporary while computing SHA-256 and validating JPEG markers. Publication syncs and atomically renames to `current.jpg`; source files are never linked or exposed as output paths. A matching digest leaves cache mtime unchanged. Database/source/copy failures retain the old cache and appear on `/settings`.
+The loader accepts:
 
-DigiKam frame responses retain `Last-Modified` and `If-Modified-Since`/`304` behavior. Both `200` and `304` GETs update direct-peer request status; HEAD does not.
+- Legacy untagged DigiKam settings.
+- The previous tagged `digikam_sqlite` settings.
+- The previous tagged `folder_sequence` settings.
+- Legacy bootstrap `cache_dir`.
 
-## Storage and permissions
+DigiKam migrates to SQL-order supply and maps its previous timezone/rollover to one scheduled time. Previous `first`/`daily_random` source selection is removed from canonical settings. A valid legacy DigiKam `current.jpg` is imported as the first managed queue object before refill.
 
-Use separate capabilities:
+Previous folder mode migrates to a manual read-only supplier with `every_fetch`; existing source filenames are no longer renamed. Its old folder remains a source, while queue copies live under `queue_dir`. The next successful settings update persists canonical format. Back up writable settings/cache storage before upgrading if rollback to an older binary is required.
 
-1. Immutable bootstrap file.
-2. Writable persistent settings file and cache directory.
-3. DigiKam database and mapped photos mounted read-only.
-4. Folder-mode image directory mounted writable and persistent.
+## Storage, deployment, and security
 
-Run as a non-root UID/GID with access only to these paths. A read-only live SQLite database in WAL mode requires its matching WAL/SHM state and suitable storage semantics; prefer a consistent SQLite snapshot/backup when DigiKam writes concurrently.
+Use distinct storage capabilities:
 
-The source safeguards are defence in depth. Use read-only/no-atime-capable DigiKam photo mounts, a read-only container root filesystem, no privilege escalation, and no capabilities that bypass filesystem permissions.
+1. Immutable bootstrap configuration.
+2. Writable persistent settings file and queue root.
+3. Read-only DigiKam database/photo mounts or read-only manual source mount.
 
-## Web-interface security
+The settings file and every source root must be separate from the queue. Run one process and one replica as a non-root UID with a read-only container root filesystem, dropped capabilities, and writes only on intended volumes. Use `/health/live` and `/health/ready`; allow SIGTERM grace for in-flight body/refill/state operations. A live SQLite WAL catalog requires consistent WAL/SHM exposure; prefer a safe snapshot.
 
-All rendered values are automatically HTML-escaped. Mutation bodies are bounded, forms use a per-process CSRF token, and settings/inventory generations reject stale updates. These controls are not authentication.
+There is no authentication, authorization, or TLS. CSRF and generation checks are not authentication. Keep the service on a trusted LAN or behind an authenticating TLS proxy. Direct-peer classification intentionally ignores forwarding headers, so configure networking accordingly.
 
-There is no authentication, authorization, or TLS. Anyone who can reach the service can view settings and attempt mutations. Keep it on a trusted LAN or use an authenticating TLS reverse proxy. Do not expose it directly to the Internet.
-
-## Container/Kubernetes administrator notes
-
-No Kubernetes manifests, Helm chart, operator, or deployment automation are included.
-
-- Run exactly one process and one replica; there is no leader election or multi-writer/cursor coordination.
-- Pass the immutable bootstrap path as the sole argument.
-- Persist writable settings/cache storage and, when used, the managed folder. They may be sibling directories but cannot overlap in prohibited ways.
-- Mount DigiKam catalog/photos read-only and the folder-mode directory writable. Never make a DigiKam source root the managed folder.
-- Run non-root with a read-only root filesystem, disabled privilege escalation, dropped capabilities, and writes only on intended volumes.
-- Use `/health/live` and `/health/ready` as probes.
-- Allow graceful SIGTERM completion for in-flight selection/upload/rename work.
-- Restrict network access to the trusted LAN or provide authentication/TLS externally.
+No Kubernetes manifests or deployment automation are included.
 
 ## Development checks
 
