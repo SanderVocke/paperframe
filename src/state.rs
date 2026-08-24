@@ -36,6 +36,7 @@ pub struct AppState {
     runtime_trigger: watch::Sender<u64>,
     pub frame_serialization: Arc<Mutex<()>>,
     pub render_serialization: Arc<Semaphore>,
+    pub rendering_transition: RwLock<()>,
     csrf_token: String,
 }
 
@@ -86,6 +87,7 @@ impl AppState {
             runtime_trigger,
             frame_serialization: Arc::new(Mutex::new(())),
             render_serialization: Arc::new(Semaphore::new(1)),
+            rendering_transition: RwLock::new(()),
             csrf_token: random_token(),
         }))
     }

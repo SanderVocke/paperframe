@@ -71,22 +71,13 @@ pub async fn refill_once(state: &AppState) -> Result<usize> {
                             return None;
                         }
                     };
-                    let rendered = match if rendering.output_mode == crate::renderer::OutputMode::DirectJpeg
-                        && decoded.format == image::ImageFormat::Jpeg
-                    {
-                        Ok(crate::renderer::RenderedImage {
-                            bytes: candidate.bytes.clone(),
-                            media_type: "image/jpeg",
-                            extension: "jpg",
-                        })
-                    } else {
-                        crate::renderer::render(
-                            &decoded,
-                            rendering.target,
-                            rendering.output_mode,
-                            decoded.orientation,
-                        )
-                    } {
+                    let rendered = match crate::renderer::render_with_original(
+                        &decoded,
+                        &candidate.bytes,
+                        rendering.target,
+                        rendering.output_mode,
+                        decoded.orientation,
+                    ) {
                         Ok(rendered) => rendered,
                         Err(error) => {
                             tracing::warn!(image = %candidate.display_name, %error, "supplier image could not be rendered");

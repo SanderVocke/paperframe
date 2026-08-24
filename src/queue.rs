@@ -134,6 +134,12 @@ pub struct QueueEvent {
     pub reason: QueueEventReason,
 }
 
+#[cfg(test)]
+struct RerenderTestHook {
+    started: tokio::sync::oneshot::Sender<()>,
+    resume: tokio::sync::oneshot::Receiver<()>,
+}
+
 pub struct QueueStore {
     root: PathBuf,
     objects: PathBuf,
@@ -142,6 +148,8 @@ pub struct QueueStore {
     mutation: Mutex<()>,
     events: watch::Sender<QueueEvent>,
     event_serial: AtomicU64,
+    #[cfg(test)]
+    rerender_test_hook: std::sync::Mutex<Option<RerenderTestHook>>,
 }
 
 impl QueueStore {
@@ -164,6 +172,8 @@ impl QueueStore {
             mutation: Mutex::new(()),
             events,
             event_serial: AtomicU64::new(0),
+            #[cfg(test)]
+            rerender_test_hook: std::sync::Mutex::new(None),
         });
         if migrate_current && store.snapshot().await.entries.is_empty() {
             let legacy = store.root.join("current.jpg");
@@ -580,13 +590,26 @@ impl QueueStore {
         target: FrameTarget,
         output_mode: crate::renderer::OutputMode,
     ) -> Result<QueueSnapshot> {
-        let _guard = self.mutation.lock().await;
-        let current = self.descriptor.read().await.clone();
-        if current.entries.is_empty() {
-            return Ok(snapshot_of(&current));
+        // Render from an immutable descriptor snapshot without holding the queue mutation lock.
+        // Publication below uses the generation as an optimistic concurrency check.
+        let base = self.descriptor.read().await.clone();
+        if base.entries.is_empty() {
+            return Ok(snapshot_of(&base));
+        }
+        let base_generation = base.generation;
+        #[cfg(test)]
+        {
+            let hook = {
+                let mut guard = self.rerender_test_hook.lock().unwrap();
+                guard.take()
+            };
+            if let Some(hook) = hook {
+                hook.started.send(()).unwrap();
+                hook.resume.await.context("rerender test hook canceled")?;
+            }
         }
         let objects = self.objects.clone();
-        let entries = current.entries.clone();
+        let entries = base.entries;
         let rendered = tokio::task::spawn_blocking(move || -> Result<Vec<_>> {
             entries
                 .into_iter()
@@ -599,27 +622,49 @@ impl QueueStore {
                         .context("failed to read queue source for rerender")?;
                     let decoded =
                         crate::renderer::decode_source_named(&source, Some(&entry.display_name))?;
-                    let output =
-                        crate::renderer::render(&decoded, target, output_mode, entry.orientation)?;
-                    Ok((entry, output))
+                    let output = crate::renderer::render_with_original(
+                        &decoded,
+                        &source,
+                        target,
+                        output_mode,
+                        entry.orientation,
+                    )?;
+                    Ok((entry.id, output))
                 })
                 .collect()
         })
         .await
         .context("queue rerender worker stopped")??;
+
+        let _guard = self.mutation.lock().await;
+        let current = self.descriptor.read().await.clone();
+        require_generation(&current, base_generation)?;
+        if current.entries.len() != rendered.len()
+            || current
+                .entries
+                .iter()
+                .zip(&rendered)
+                .any(|(entry, (id, _))| entry.id != *id)
+        {
+            bail!("queue changed while images were being rendered");
+        }
         let mut next = current;
         next.version = STATE_VERSION;
         next.generation = next.generation.saturating_add(1);
         let mut replacements = Vec::new();
-        for (index, (old, output)) in rendered.into_iter().enumerate() {
-            let name = format!("{}.render-{}.{}", old.id, next.generation, output.extension);
+        for (index, (_, output)) in rendered.into_iter().enumerate() {
+            let old_name = next.entries[index].object_name.clone();
+            let name = format!(
+                "{}.render-{}.{}",
+                next.entries[index].id, next.generation, output.extension
+            );
             next.entries[index].object_name = name.clone();
             next.entries[index].digest = digest(&output.bytes);
             next.entries[index].content_length = output.bytes.len() as u64;
             next.entries[index].media_type = output.media_type.into();
             next.entries[index].frame_target = target;
             next.entries[index].renderer_profile = RENDER_PROFILE_VERSION;
-            replacements.push((old.object_name, name, output.bytes));
+            replacements.push((old_name, name, output.bytes));
         }
         let objects = self.objects.clone();
         let state_path = self.state_path.clone();
@@ -642,6 +687,36 @@ impl QueueStore {
         target: FrameTarget,
         output_mode: crate::renderer::OutputMode,
     ) -> Result<QueueSnapshot> {
+        // Decode and render outside the mutation lock, then reject publication if the queue moved.
+        let base = self.descriptor.read().await.clone();
+        require_generation(&base, expected)?;
+        let entry = base
+            .entries
+            .iter()
+            .find(|entry| entry.id == id)
+            .cloned()
+            .context("queue entry not found")?;
+        let source_name = entry
+            .source_object_name
+            .clone()
+            .unwrap_or_else(|| entry.object_name.clone());
+        let source_path = self.objects.join(source_name);
+        let id = entry.id.clone();
+        let display_name = entry.display_name;
+        let rendered = tokio::task::spawn_blocking(move || -> Result<_> {
+            let source = fs::read(source_path).context("failed to read queue source")?;
+            let decoded = crate::renderer::decode_source_named(&source, Some(&display_name))?;
+            crate::renderer::render_with_original(
+                &decoded,
+                &source,
+                target,
+                output_mode,
+                orientation,
+            )
+        })
+        .await
+        .context("orientation render worker stopped")??;
+
         let _guard = self.mutation.lock().await;
         let current = self.descriptor.read().await.clone();
         require_generation(&current, expected)?;
@@ -650,29 +725,12 @@ impl QueueStore {
             .iter()
             .position(|entry| entry.id == id)
             .context("queue entry not found")?;
-        let entry = current.entries[index].clone();
-        let source_name = entry
-            .source_object_name
-            .clone()
-            .unwrap_or_else(|| entry.object_name.clone());
-        let source_path = self.objects.join(source_name);
-        let objects = self.objects.clone();
-        let state_path = self.state_path.clone();
         let mut next = current;
         next.version = STATE_VERSION;
         next.generation = next.generation.saturating_add(1);
-        let id = entry.id.clone();
-        let display_name = entry.display_name.clone();
-        let rendered = tokio::task::spawn_blocking(move || -> Result<_> {
-            let source = fs::read(source_path).context("failed to read queue source")?;
-            let decoded = crate::renderer::decode_source_named(&source, Some(&display_name))?;
-            let rendered = crate::renderer::render(&decoded, target, output_mode, orientation)?;
-            Ok(rendered)
-        })
-        .await
-        .context("orientation render worker stopped")??;
         let extension = rendered.extension;
         let new_name = format!("{id}.{extension}");
+        let old_name = next.entries[index].object_name.clone();
         next.entries[index].object_name = new_name.clone();
         next.entries[index].digest = digest(&rendered.bytes);
         next.entries[index].content_length = rendered.bytes.len() as u64;
@@ -681,7 +739,8 @@ impl QueueStore {
         next.entries[index].orientation_source = OrientationSource::Override;
         next.entries[index].frame_target = target;
         next.entries[index].renderer_profile = RENDER_PROFILE_VERSION;
-        let old_name = entry.object_name;
+        let objects = self.objects.clone();
+        let state_path = self.state_path.clone();
         let disk = next.clone();
         tokio::task::spawn_blocking(move || {
             replace_derivative(
@@ -854,6 +913,12 @@ fn initialize(configured: &Path) -> Result<(PathBuf, PathBuf, Descriptor)> {
         persist_descriptor(&state_path, &value)?;
         value
     };
+    for entry in &descriptor.entries {
+        validate_object_name(&entry.object_name)?;
+        if let Some(source) = &entry.source_object_name {
+            validate_object_name(source)?;
+        }
+    }
     if descriptor.version < STATE_VERSION {
         migrate_v1_descriptor(&objects, &mut descriptor)?;
         persist_descriptor(&state_path, &descriptor)?;
@@ -889,6 +954,18 @@ fn initialize(configured: &Path) -> Result<(PathBuf, PathBuf, Descriptor)> {
         }
     }
     Ok((root, objects, descriptor))
+}
+
+fn validate_object_name(name: &str) -> Result<()> {
+    let mut components = Path::new(name).components();
+    match (components.next(), components.next()) {
+        (Some(std::path::Component::Normal(component)), None)
+            if !component.is_empty() && component == std::ffi::OsStr::new(name) =>
+        {
+            Ok(())
+        }
+        _ => bail!("queue object name is unsafe: {name}"),
+    }
 }
 
 fn migrate_v1_descriptor(objects: &Path, descriptor: &mut Descriptor) -> Result<()> {
@@ -1426,6 +1503,26 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn descriptor_object_names_cannot_escape_queue_storage() {
+        let parent = tempdir().unwrap();
+        let queue_root = parent.path().join("queue");
+        fs::create_dir(&queue_root).unwrap();
+        let outside = parent.path().join("outside.jpg");
+        fs::write(&outside, A).unwrap();
+        fs::write(
+            queue_root.join(STATE_FILE),
+            format!(
+                "version = 2\ngeneration = 1\n\n[[entries]]\nid = 'escape'\nobject_name = '../outside.jpg'\ndisplay_name = 'outside.jpg'\ndigest = '{}'\ncontent_length = {}\n",
+                digest(A),
+                A.len()
+            ),
+        )
+        .unwrap();
+        assert!(QueueStore::new(&queue_root, false).await.is_err());
+        assert_eq!(fs::read(outside).unwrap(), A);
+    }
+
+    #[tokio::test]
     async fn events_report_committed_changes_and_blocked_demand() {
         let dir = tempdir().unwrap();
         let queue = QueueStore::new(dir.path(), false).await.unwrap();
@@ -1511,6 +1608,46 @@ mod tests {
             fs::read_dir(dir.path().join(OBJECTS_DIR)).unwrap().count(),
             0
         );
+    }
+
+    #[tokio::test]
+    async fn cpu_render_phase_does_not_hold_mutation_lock_and_rejects_stale_publication() {
+        let dir = tempdir().unwrap();
+        let queue = QueueStore::new(dir.path(), false).await.unwrap();
+        queue
+            .enqueue("a.jpg".into(), A.to_vec(), None, None)
+            .await
+            .unwrap();
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let (resume_tx, resume_rx) = tokio::sync::oneshot::channel();
+        *queue.rerender_test_hook.lock().unwrap() = Some(RerenderTestHook {
+            started: started_tx,
+            resume: resume_rx,
+        });
+        let rerender_queue = queue.clone();
+        let rerender = tokio::spawn(async move {
+            rerender_queue
+                .rerender_all(
+                    FrameTarget::PaperL,
+                    crate::renderer::OutputMode::ServerDitherBmp,
+                )
+                .await
+        });
+        tokio::time::timeout(std::time::Duration::from_secs(1), started_rx)
+            .await
+            .unwrap()
+            .unwrap();
+        let snapshot = queue.snapshot().await;
+        tokio::time::timeout(
+            std::time::Duration::from_millis(200),
+            queue.remove(snapshot.generation, &snapshot.entries[0].id),
+        )
+        .await
+        .expect("queue mutation was blocked by CPU rendering")
+        .unwrap();
+        resume_tx.send(()).unwrap();
+        assert!(rerender.await.unwrap().is_err());
+        assert!(queue.snapshot().await.entries.is_empty());
     }
 
     #[tokio::test]

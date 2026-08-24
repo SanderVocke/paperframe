@@ -255,6 +255,9 @@ async fn update_settings(
             .await;
         }
     };
+    // Frame GET/HEAD take the read side so clients cannot observe the queue between
+    // derivative publication and settings activation (or rollback).
+    let _transition = state.rendering_transition.write().await;
     let live_before = state.settings.snapshot().await;
     if live_before.generation != expected {
         return render_error(
@@ -658,22 +661,13 @@ async fn upload_queue(State(state): State<Arc<AppState>>, mut multipart: Multipa
             .into_iter()
             .map(|(display_name, bytes)| {
                 let decoded = crate::renderer::decode_source_named(&bytes, Some(&display_name))?;
-                let rendered = if rendering.output_mode == OutputMode::DirectJpeg
-                    && decoded.format == image::ImageFormat::Jpeg
-                {
-                    crate::renderer::RenderedImage {
-                        bytes: bytes.clone(),
-                        media_type: "image/jpeg",
-                        extension: "jpg",
-                    }
-                } else {
-                    crate::renderer::render(
-                        &decoded,
-                        rendering.target,
-                        rendering.output_mode,
-                        decoded.orientation,
-                    )?
-                };
+                let rendered = crate::renderer::render_with_original(
+                    &decoded,
+                    &bytes,
+                    rendering.target,
+                    rendering.output_mode,
+                    decoded.orientation,
+                )?;
                 Ok(crate::queue::RenderedEnqueueRequest {
                     display_name,
                     source_bytes: bytes,
@@ -830,6 +824,7 @@ async fn set_queue_orientation(
 }
 
 async fn health_ready(State(state): State<Arc<AppState>>) -> StatusCode {
+    let _transition = state.rendering_transition.read().await;
     if state.queue.current().await.ok().flatten().is_some() {
         StatusCode::OK
     } else {
@@ -842,6 +837,7 @@ async fn get_image(
     ConnectInfo(peer): ConnectInfo<SocketAddr>,
     headers: HeaderMap,
 ) -> Response {
+    let _transition = state.rendering_transition.read().await;
     let settings = state.settings.snapshot().await.settings;
     let every_fetch = matches!(settings.advancement, AdvancementSettings::EveryFetch { .. });
     let qualifies = match &settings.advancement {
@@ -873,6 +869,7 @@ async fn get_image(
 }
 
 async fn head_image(State(state): State<Arc<AppState>>, headers: HeaderMap) -> Response {
+    let _transition = state.rendering_transition.read().await;
     let every_fetch = matches!(
         state.settings.snapshot().await.settings.advancement,
         AdvancementSettings::EveryFetch { .. }
@@ -1359,6 +1356,34 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn frame_requests_cannot_observe_a_partially_activated_rendering_transition() {
+        let (_directory, state) = manual_state(AdvancementSettings::Manual).await;
+        let transition = state.rendering_transition.write().await;
+        let app = router(state.clone());
+        let request = tokio::spawn(async move {
+            app.oneshot(frame_request("GET", [127, 0, 0, 1]))
+                .await
+                .unwrap()
+        });
+        tokio::time::sleep(TokioDuration::from_millis(10)).await;
+        assert!(!request.is_finished());
+
+        let mut settings = state.settings.snapshot().await.settings;
+        settings.rendering.output_mode = OutputMode::ServerDitherBmp;
+        state
+            .queue
+            .rerender_all(settings.rendering.target, settings.rendering.output_mode)
+            .await
+            .unwrap();
+        state.settings.replace(1, settings).await.unwrap();
+        drop(transition);
+
+        let response = request.await.unwrap();
+        assert_eq!(response.headers()[header::CONTENT_TYPE], "image/bmp");
+        crate::renderer::validate_bmp4(&bytes(response).await, FrameTarget::Paper7).unwrap();
+    }
+
+    #[tokio::test]
     async fn global_rendering_settings_rerender_the_whole_queue_before_activation() {
         let (_directory, state) = manual_state(AdvancementSettings::Manual).await;
         let snapshot = state.settings.snapshot().await;
@@ -1432,10 +1457,15 @@ mod tests {
         );
         for entry in state.queue.snapshot().await.entries {
             let prepared = state.queue.prepare(&entry.id).await.unwrap();
+            let source = state.queue.prepare_source(&entry.id).await.unwrap();
             assert_eq!(prepared.entry.media_type, "image/jpeg");
             assert_eq!(
                 image::guess_format(&prepared.bytes).unwrap(),
                 image::ImageFormat::Jpeg
+            );
+            assert_eq!(
+                prepared.bytes, source.bytes,
+                "JPEG source should pass through"
             );
         }
     }

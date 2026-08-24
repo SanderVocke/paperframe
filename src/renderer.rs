@@ -12,6 +12,7 @@ use serde::{Deserialize, Serialize};
 use crate::dither::{IndexedImage, Rgb};
 
 pub const RENDER_PROFILE_VERSION: u32 = 1;
+pub const MAX_ENCODED_BYTES: u64 = 100 * 1024 * 1024;
 pub const MAX_SOURCE_DIMENSION: u32 = 20_000;
 pub const MAX_DECODED_BYTES: u64 = 256 * 1024 * 1024;
 pub const JPEG_QUALITY: u8 = 90;
@@ -107,9 +108,7 @@ pub fn decode_source(bytes: &[u8]) -> Result<DecodedImage> {
 }
 
 pub fn decode_source_named(bytes: &[u8], name: Option<&str>) -> Result<DecodedImage> {
-    if bytes.is_empty() {
-        bail!("image is empty");
-    }
+    validate_encoded_length(bytes.len())?;
     let mut reader = ImageReader::new(Cursor::new(bytes));
     if let Some(format) = name.and_then(|name| ImageFormat::from_path(name).ok()) {
         reader.set_format(format);
@@ -141,6 +140,33 @@ pub fn decode_source_named(bytes: &[u8], name: Option<&str>) -> Result<DecodedIm
         format,
         orientation,
     })
+}
+
+fn validate_encoded_length(length: usize) -> Result<()> {
+    if length == 0 {
+        bail!("image is empty");
+    }
+    if length as u64 > MAX_ENCODED_BYTES {
+        bail!("encoded image exceeds the 100 MiB source limit");
+    }
+    Ok(())
+}
+
+pub fn render_with_original(
+    source: &DecodedImage,
+    original: &[u8],
+    target: FrameTarget,
+    mode: OutputMode,
+    orientation: ImageOrientation,
+) -> Result<RenderedImage> {
+    if mode == OutputMode::DirectJpeg && source.format == ImageFormat::Jpeg {
+        return Ok(RenderedImage {
+            bytes: original.to_vec(),
+            media_type: "image/jpeg",
+            extension: "jpg",
+        });
+    }
+    render(source, target, mode, orientation)
 }
 
 pub fn render(
@@ -610,6 +636,32 @@ mod tests {
     }
 
     #[test]
+    fn dithered_preview_pixels_match_the_served_bmp_exactly() {
+        let decoded = DecodedImage {
+            pixels: source(17, 29),
+            format: ImageFormat::Png,
+            orientation: ImageOrientation::Portrait,
+        };
+        let rendered = render(
+            &decoded,
+            FrameTarget::Paper7,
+            OutputMode::ServerDitherBmp,
+            ImageOrientation::Portrait,
+        )
+        .unwrap();
+        let preview =
+            dithered_preview_png(&decoded, FrameTarget::Paper7, ImageOrientation::Portrait)
+                .unwrap();
+        let bmp_pixels = image::load_from_memory_with_format(&rendered.bytes, ImageFormat::Bmp)
+            .unwrap()
+            .into_rgb8();
+        let preview_pixels = image::load_from_memory_with_format(&preview, ImageFormat::Png)
+            .unwrap()
+            .into_rgb8();
+        assert_eq!(bmp_pixels, preview_pixels);
+    }
+
+    #[test]
     fn jpeg_and_png_outputs_decode() {
         let input = source(4, 3);
         let jpeg = encode_jpeg(&input).unwrap();
@@ -633,12 +685,17 @@ mod tests {
             (ImageFormat::Tga, "test.tga"),
             (ImageFormat::Pnm, "test.ppm"),
             (ImageFormat::Hdr, "test.hdr"),
+            (ImageFormat::OpenExr, "test.exr"),
             (ImageFormat::Farbfeld, "test.ff"),
             (ImageFormat::Qoi, "test.qoi"),
         ] {
             let mut cursor = Cursor::new(Vec::new());
             if format == ImageFormat::Farbfeld {
                 DynamicImage::ImageRgba16(input.to_rgba16())
+                    .write_to(&mut cursor, format)
+                    .unwrap();
+            } else if format == ImageFormat::OpenExr {
+                DynamicImage::ImageRgba32F(input.to_rgba32f())
                     .write_to(&mut cursor, format)
                     .unwrap();
             } else if format == ImageFormat::Hdr {
@@ -699,6 +756,8 @@ mod tests {
 
     #[test]
     fn corrupt_and_overdimensioned_sources_are_rejected() {
+        assert!(validate_encoded_length(0).is_err());
+        assert!(validate_encoded_length(MAX_ENCODED_BYTES as usize + 1).is_err());
         assert!(decode_source_named(b"not an image", Some("bad.png")).is_err());
         let input = DynamicImage::ImageRgba8(source(2, 3));
         let mut cursor = Cursor::new(Vec::new());

@@ -73,7 +73,7 @@ The server has two global output modes:
 
 Select Paper 7 (`800×480`) or Paper L (`1200×1600`) in Frame settings. Existing settings without a `[rendering]` section retain the compatibility default of direct JPEG; the supplied new-install examples select server dithering.
 
-The compiled decoder supports JPEG, PNG, GIF, WebP, BMP, TIFF, TGA, PNM, DDS, HDR, ICO, QOI, and Farbfeld. Animated formats use their first frame, metadata orientation is applied where the decoder exposes it, and transparency is composited onto white. Encoded uploads are bounded by `max_upload_bytes`; decoded images are also dimension/allocation limited.
+The compiled decoder supports JPEG, PNG, GIF, WebP, BMP, TIFF, TGA, PNM, DDS, HDR, OpenEXR, ICO, QOI, and Farbfeld. AVIF is not enabled because `image` 0.25's AVIF decoder requires the optional native backend, while this server deliberately retains a pure-Rust production image pipeline. Animated formats use their first frame, metadata orientation is applied where the decoder exposes it, and transparency is composited onto white. Encoded uploads are bounded by `max_upload_bytes`; every supplier/upload source also has a hard 100 MiB encoded limit, and decoded images are dimension/allocation limited.
 
 Orientation is inferred after metadata orientation: taller images are portrait and square images are landscape. Each queue card can override it. The renderer stretches to the complete orientation-appropriate panel area and uses a fixed clockwise 90° transform when logical and physical orientations differ. Reposition the physical frame clockwise to match the displayed image. Auto Rotation in the offline firmware still handles only the final 180° correction.
 

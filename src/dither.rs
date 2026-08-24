@@ -13,6 +13,66 @@ impl Rgb {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PaletteEntry {
+    pub name: &'static str,
+    /// Measured/calibrated color used while selecting and diffusing colors.
+    pub calibrated: Rgb,
+    /// Fully saturated native color written for the display controller.
+    pub device: Rgb,
+    pub device_index: u8,
+}
+
+/// epdoptimize v1.2.0 `spectra6` palette, retaining its calibrated/native split.
+pub const SPECTRA6_CALIBRATED: [PaletteEntry; 6] = [
+    PaletteEntry {
+        name: "black",
+        calibrated: Rgb::new(0x1f, 0x22, 0x26),
+        device: Rgb::new(0, 0, 0),
+        device_index: 0,
+    },
+    PaletteEntry {
+        name: "white",
+        calibrated: Rgb::new(0xb9, 0xc7, 0xc9),
+        device: Rgb::new(255, 255, 255),
+        device_index: 6,
+    },
+    PaletteEntry {
+        name: "blue",
+        calibrated: Rgb::new(0x23, 0x3f, 0x8e),
+        device: Rgb::new(0, 0, 255),
+        device_index: 1,
+    },
+    PaletteEntry {
+        name: "green",
+        calibrated: Rgb::new(0x35, 0x56, 0x3a),
+        device: Rgb::new(0, 255, 0),
+        device_index: 2,
+    },
+    PaletteEntry {
+        name: "red",
+        calibrated: Rgb::new(0x62, 0x20, 0x1e),
+        device: Rgb::new(255, 0, 0),
+        device_index: 3,
+    },
+    PaletteEntry {
+        name: "yellow",
+        calibrated: Rgb::new(0xc1, 0xbb, 0x1e),
+        device: Rgb::new(255, 255, 0),
+        device_index: 5,
+    },
+];
+
+pub fn calibrated_colors(palette: &[PaletteEntry]) -> Vec<Rgb> {
+    palette.iter().map(|entry| entry.calibrated).collect()
+}
+
+pub fn device_entry(palette: &[PaletteEntry], palette_index: u8) -> Option<(u8, Rgb)> {
+    palette
+        .get(palette_index as usize)
+        .map(|entry| (entry.device_index, entry.device))
+}
+
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct DiffusionStep {
     pub dx: i8,
@@ -364,6 +424,37 @@ mod tests {
         assert_eq!(
             DiffusionKernel::JarvisJudiceNinke.steps()[9].factor,
             5.0 / 48.0
+        );
+    }
+
+    #[test]
+    fn spectra6_palette_keeps_calibrated_and_native_colors_aligned() {
+        let calibrated = calibrated_colors(&SPECTRA6_CALIBRATED);
+        let rgba = calibrated
+            .iter()
+            .flat_map(|color| [color.r, color.g, color.b, 255])
+            .collect::<Vec<_>>();
+        assert_eq!(
+            quantize_rgb(&rgba, calibrated.len() as u32, 1, &calibrated)
+                .unwrap()
+                .indices,
+            [0, 1, 2, 3, 4, 5]
+        );
+        assert_eq!(
+            device_entry(&SPECTRA6_CALIBRATED, 0),
+            Some((0, Rgb::new(0, 0, 0)))
+        );
+        assert_eq!(
+            device_entry(&SPECTRA6_CALIBRATED, 1),
+            Some((6, Rgb::new(255, 255, 255)))
+        );
+        assert_eq!(
+            device_entry(&SPECTRA6_CALIBRATED, 5),
+            Some((5, Rgb::new(255, 255, 0)))
+        );
+        assert_eq!(
+            SPECTRA6_CALIBRATED[2].calibrated,
+            Rgb::new(0x23, 0x3f, 0x8e)
         );
     }
 
