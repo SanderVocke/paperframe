@@ -34,10 +34,20 @@ use crate::{
 
 const SETTINGS_LIMIT: usize = 64 * 1024;
 const UPLOAD_LIMIT: usize = 101 * 1024 * 1024;
+const WEB_APP_MANIFEST: &[u8] = include_bytes!("../assets/pwa/manifest.webmanifest");
+const SERVICE_WORKER: &[u8] = include_bytes!("../assets/pwa/sw.js");
+const ICON_192: &[u8] = include_bytes!("../assets/pwa/icon-192.png");
+const ICON_512: &[u8] = include_bytes!("../assets/pwa/icon-512.png");
+const ICON_MASKABLE_512: &[u8] = include_bytes!("../assets/pwa/icon-maskable-512.png");
 
 pub fn router(state: Arc<AppState>) -> Router {
     Router::new()
         .route("/", get(|| async { Redirect::to("/settings") }))
+        .route("/manifest.webmanifest", get(web_app_manifest))
+        .route("/sw.js", get(service_worker))
+        .route("/pwa/icon-192.png", get(icon_192))
+        .route("/pwa/icon-512.png", get(icon_512))
+        .route("/pwa/icon-maskable-512.png", get(icon_maskable_512))
         .route("/settings", get(settings_page).post(update_settings))
         .route("/queue/reorder", post(reorder_queue))
         .route("/queue/remove", post(remove_queue_entry))
@@ -61,6 +71,58 @@ pub fn router(state: Arc<AppState>) -> Router {
                 .on_failure(DefaultOnFailure::new().level(Level::ERROR)),
         )
         .with_state(state)
+}
+
+async fn web_app_manifest() -> Response {
+    (
+        [
+            (
+                header::CONTENT_TYPE,
+                "application/manifest+json; charset=utf-8",
+            ),
+            (header::CACHE_CONTROL, "public, max-age=3600"),
+        ],
+        Bytes::from_static(WEB_APP_MANIFEST),
+    )
+        .into_response()
+}
+
+async fn service_worker() -> Response {
+    (
+        [
+            (header::CONTENT_TYPE, "text/javascript; charset=utf-8"),
+            (header::CACHE_CONTROL, "no-cache"),
+            (
+                header::HeaderName::from_static("service-worker-allowed"),
+                "/",
+            ),
+        ],
+        Bytes::from_static(SERVICE_WORKER),
+    )
+        .into_response()
+}
+
+async fn icon_192() -> Response {
+    pwa_icon(ICON_192)
+}
+
+async fn icon_512() -> Response {
+    pwa_icon(ICON_512)
+}
+
+async fn icon_maskable_512() -> Response {
+    pwa_icon(ICON_MASKABLE_512)
+}
+
+fn pwa_icon(bytes: &'static [u8]) -> Response {
+    (
+        [
+            (header::CONTENT_TYPE, "image/png"),
+            (header::CACHE_CONTROL, "public, max-age=31536000, immutable"),
+        ],
+        Bytes::from_static(bytes),
+    )
+        .into_response()
 }
 
 #[derive(Clone)]
@@ -979,6 +1041,51 @@ mod tests {
             fs::read(directory.path().join("source/a.jpg")).unwrap(),
             source_hash
         );
+    }
+
+    #[tokio::test]
+    async fn serves_installable_web_app_assets() {
+        let template = include_str!("../templates/settings.html");
+        assert!(template.contains("rel=\"manifest\" href=\"/manifest.webmanifest\""));
+        assert!(template.contains("id=\"install-app\""));
+        assert!(template.contains("serviceWorker.register('/sw.js')"));
+
+        let manifest = web_app_manifest().await;
+        assert_eq!(manifest.status(), StatusCode::OK);
+        assert_eq!(
+            manifest.headers()[header::CONTENT_TYPE],
+            "application/manifest+json; charset=utf-8"
+        );
+        let manifest_body = String::from_utf8(bytes(manifest).await).unwrap();
+        assert!(manifest_body.contains("\"start_url\": \"/settings\""));
+        assert!(manifest_body.contains("\"display\": \"standalone\""));
+        assert!(manifest_body.contains("icon-maskable-512.png"));
+
+        let worker = service_worker().await;
+        assert_eq!(worker.status(), StatusCode::OK);
+        assert_eq!(
+            worker.headers()[header::CONTENT_TYPE],
+            "text/javascript; charset=utf-8"
+        );
+        assert_eq!(worker.headers()["service-worker-allowed"], "/");
+        assert!(
+            String::from_utf8(bytes(worker).await)
+                .unwrap()
+                .contains("self.addEventListener(\"fetch\"")
+        );
+
+        for (icon, size) in [
+            (icon_192().await, 192_u32),
+            (icon_512().await, 512_u32),
+            (icon_maskable_512().await, 512_u32),
+        ] {
+            assert_eq!(icon.status(), StatusCode::OK);
+            assert_eq!(icon.headers()[header::CONTENT_TYPE], "image/png");
+            let png = bytes(icon).await;
+            assert_eq!(&png[..8], b"\x89PNG\r\n\x1a\n");
+            assert_eq!(u32::from_be_bytes(png[16..20].try_into().unwrap()), size);
+            assert_eq!(u32::from_be_bytes(png[20..24].try_into().unwrap()), size);
+        }
     }
 
     #[tokio::test]

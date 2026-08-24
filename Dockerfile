@@ -6,6 +6,7 @@ WORKDIR /build
 COPY Cargo.toml Cargo.lock ./
 COPY src ./src
 COPY templates ./templates
+COPY assets ./assets
 RUN cargo build --locked --release
 
 FROM debian:bookworm-slim AS runtime

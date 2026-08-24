@@ -3,7 +3,14 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
-<meta name="theme-color" content="#f7f4ee">
+<meta name="theme-color" content="#496b55">
+<meta name="mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="default">
+<meta name="apple-mobile-web-app-title" content="Paper Frame">
+<link rel="manifest" href="/manifest.webmanifest">
+<link rel="icon" type="image/png" sizes="192x192" href="/pwa/icon-192.png">
+<link rel="apple-touch-icon" href="/pwa/icon-192.png">
 <title>Paper Frame</title>
 <style>
 :root{
@@ -14,6 +21,7 @@
   --radius:22px;--radius-sm:13px;
 }
 *{box-sizing:border-box}
+[hidden]{display:none!important}
 html{scroll-behavior:smooth}
 body{margin:0;background:var(--bg);color:var(--ink);font:15px/1.5 Inter,ui-sans-serif,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;-webkit-font-smoothing:antialiased}
 button,input,select,textarea{font:inherit}
@@ -103,6 +111,7 @@ textarea.code{min-height:210px;font:12px/1.5 ui-monospace,SFMono-Regular,Consola
         <button class="btn btn-primary" type="submit"{% if entries.is_empty() %} disabled{% endif %}><svg viewBox="0 0 24 24" fill="none" stroke="currentColor"><path d="m6 4 10 8L6 20V4Z"/><path d="M19 5v14"/></svg>Show next photo</button>
       </form>
       {% if !entries.is_empty() %}<a class="btn btn-secondary" href="/frame/current.jpg" target="_blank"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor"><path d="M2.5 12s3.5-6 9.5-6 9.5 6 9.5 6-3.5 6-9.5 6-9.5-6-9.5-6Z"/><circle cx="12" cy="12" r="2.5"/></svg>View frame</a>{% endif %}
+      <button class="btn btn-secondary" id="install-app" type="button" hidden><svg viewBox="0 0 24 24" fill="none" stroke="currentColor"><path d="M12 3v12m0 0 4-4m-4 4-4-4"/><path d="M5 19h14"/></svg>Install app</button>
     </div>
   </div>
   <aside class="status-panel" aria-label="Frame status">
@@ -234,6 +243,27 @@ textarea.code{min-height:210px;font:12px/1.5 ui-monospace,SFMono-Regular,Consola
 </div>
 <script>
 (function(){
+  const installButton=document.getElementById('install-app');
+  let installPrompt=null;
+  const standalone=window.matchMedia('(display-mode: standalone)').matches||window.navigator.standalone===true;
+  if(standalone)installButton.hidden=true;
+  window.addEventListener('beforeinstallprompt',event=>{
+    event.preventDefault();
+    installPrompt=event;
+    if(!standalone)installButton.hidden=false;
+  });
+  installButton.addEventListener('click',async()=>{
+    if(!installPrompt)return;
+    installPrompt.prompt();
+    await installPrompt.userChoice;
+    installPrompt=null;
+    installButton.hidden=true;
+  });
+  window.addEventListener('appinstalled',()=>{installPrompt=null;installButton.hidden=true;});
+  if('serviceWorker' in navigator){
+    window.addEventListener('load',()=>navigator.serviceWorker.register('/sw.js').catch(error=>console.warn('Service worker registration failed',error)));
+  }
+
   const policy=document.getElementById('advancement_type');
   const source=document.getElementById('supplier_type');
   function showConditional(){

@@ -64,6 +64,12 @@ Replace `SERVER_IP` with the computer's LAN address. Configure the frame to fetc
 
 The quick-start policy is `manual`, so test downloads cannot unexpectedly move the queue. After confirming that the frame works, choose another policy on the control page if wanted.
 
+### Install the control page as an app
+
+Paper Frame is a progressive web app. On a supported Android browser, open the control page and use **Install app** when the button appears. The installed app opens `/settings` in a standalone window. A valid HTTPS public origin is required for installation; plain HTTP works only on loopback addresses such as `localhost` during development.
+
+An authenticating reverse proxy such as Authelia is compatible with installation. The installed app shares the browser's cookies and follows the normal login redirect when its session expires. Ensure authenticated requests for `/manifest.webmanifest`, `/sw.js`, and `/pwa/*` return the actual assets rather than a login page. These endpoints contain no private data and can optionally be exempted from authentication, while `/settings`, queue endpoints, previews, and frame images remain protected. The service worker caches only PWA metadata and icons, never authenticated application pages or photos.
+
 ## Docker and Kubernetes
 
 A production multi-stage [`Dockerfile`](Dockerfile) and example Kubernetes deployment are included. The image runs as a non-root user, keeps writable queue/settings data under `/data`, and supports read-only photo or DigiKam mounts.
@@ -292,6 +298,9 @@ Most users only need `/settings` and `/frame/current.jpg`.
 | Method | Path | Purpose |
 |---|---|---|
 | `GET` / `POST` | `/settings` | Control page and complete settings update |
+| `GET` | `/manifest.webmanifest` | Progressive web app metadata |
+| `GET` | `/sw.js` | Static-assets-only service worker |
+| `GET` | `/pwa/*` | Progressive web app icons |
 | `GET` / `HEAD` | `/frame/current.jpg` | Current frame image |
 | `GET` | `/queue/thumbnail/{id}` | Non-advancing thumbnail |
 | `GET` | `/queue/preview/{id}` | Non-advancing full preview |
