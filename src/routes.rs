@@ -25,8 +25,9 @@ use tracing::{Level, error, info};
 
 use crate::{
     config::{
-        AdvancementSettings, DigikamSettings, ManualFolderSettings, PathMapping, QueueSettings,
-        RenderingSettings, ReplaceSettingsError, Settings, SupplierKind, SupplierSettings,
+        AdvancementSettings, DigikamSettings, ManualFolderSettings, PathMapping,
+        QueueAdvanceBehavior, QueueSettings, RenderingSettings, ReplaceSettingsError, Settings,
+        SupplierKind, SupplierSettings,
     },
     queue::{PreparedImage, QueueEntry, QueueEventReason},
     renderer::{FrameTarget, OutputMode},
@@ -177,6 +178,8 @@ struct SettingsTemplate {
     policy_every_fetch: bool,
     policy_scheduled: bool,
     policy_manual: bool,
+    queue_drop_and_refill: bool,
+    queue_rotate: bool,
     frame_client_ips: String,
     schedule_timezone: String,
     schedule_times: String,
@@ -201,6 +204,7 @@ struct SettingsForm {
     frame_target: String,
     output_mode: String,
     advancement_type: String,
+    queue_advance_behavior: String,
     frame_client_ips: String,
     schedule_timezone: String,
     schedule_times: String,
@@ -468,6 +472,8 @@ async fn render_settings(
         policy_every_fetch: form.advancement_type == "every_fetch",
         policy_scheduled: form.advancement_type == "scheduled",
         policy_manual: form.advancement_type == "manual",
+        queue_drop_and_refill: form.queue_advance_behavior == "drop_and_refill",
+        queue_rotate: form.queue_advance_behavior == "rotate",
         frame_client_ips: form.frame_client_ips,
         schedule_timezone: form.schedule_timezone,
         schedule_times: form.schedule_times,
@@ -589,7 +595,18 @@ async fn advance_queue(
         Ok(value) => value,
         Err((status, message)) => return plain(status, &message),
     };
-    match state.queue.advance_at_generation(generation).await {
+    let behavior = state
+        .settings
+        .snapshot()
+        .await
+        .settings
+        .queue
+        .advance_behavior;
+    match state
+        .queue
+        .advance_at_generation(generation, behavior)
+        .await
+    {
         Ok(_) => Redirect::to("/settings").into_response(),
         Err(error) => plain(StatusCode::CONFLICT, &error.to_string()),
     }
@@ -959,7 +976,12 @@ async fn get_image(
     let response = if every_fetch && qualifies {
         let permit = state.frame_serialization.clone().lock_owned().await;
         match state.queue.current().await {
-            Ok(Some(image)) => completion_response(state.queue.clone(), image, permit),
+            Ok(Some(image)) => completion_response(
+                state.queue.clone(),
+                image,
+                permit,
+                settings.queue.advance_behavior,
+            ),
             Ok(None) => plain(StatusCode::NOT_FOUND, "Queue is empty"),
             Err(error) => plain(StatusCode::INTERNAL_SERVER_ERROR, &error.to_string()),
         }
@@ -1042,13 +1064,14 @@ fn completion_response(
     queue: Arc<crate::queue::QueueStore>,
     image: PreparedImage,
     permit: OwnedMutexGuard<()>,
+    behavior: QueueAdvanceBehavior,
 ) -> Response {
     let id = image.entry.id;
     let media_type = image.entry.media_type;
     let length = image.bytes.len();
     let stream = CompletionStream {
         bytes: Bytes::from(image.bytes),
-        completion: Some((queue, id, permit)),
+        completion: Some((queue, id, permit, behavior)),
         delay: None,
     };
     Response::builder()
@@ -1062,7 +1085,12 @@ fn completion_response(
 
 struct CompletionStream {
     bytes: Bytes,
-    completion: Option<(Arc<crate::queue::QueueStore>, String, OwnedMutexGuard<()>)>,
+    completion: Option<(
+        Arc<crate::queue::QueueStore>,
+        String,
+        OwnedMutexGuard<()>,
+        QueueAdvanceBehavior,
+    )>,
     delay: Option<Pin<Box<tokio::time::Sleep>>>,
 }
 impl Stream for CompletionStream {
@@ -1080,9 +1108,9 @@ impl Stream for CompletionStream {
             self.delay = Some(Box::pin(tokio::time::sleep(Duration::from_millis(1))));
             return Poll::Ready(Some(Ok(chunk)));
         }
-        if let Some((queue, id, permit)) = self.completion.take() {
+        if let Some((queue, id, permit, behavior)) = self.completion.take() {
             tokio::spawn(async move {
-                if let Err(error) = queue.advance_if_current(&id).await {
+                if let Err(error) = queue.advance_if_current(&id, behavior).await {
                     error!(%error, "completed-response advancement failed");
                 }
                 drop(permit);
@@ -1156,6 +1184,11 @@ impl SettingsForm {
             }
             .into(),
             advancement_type: "manual".into(),
+            queue_advance_behavior: match settings.queue.advance_behavior {
+                QueueAdvanceBehavior::DropAndRefill => "drop_and_refill",
+                QueueAdvanceBehavior::Rotate => "rotate",
+            }
+            .into(),
             frame_client_ips: String::new(),
             schedule_timezone: "UTC".into(),
             schedule_times: "03:00".into(),
@@ -1267,6 +1300,11 @@ impl SettingsForm {
                     .max_upload_bytes
                     .parse()
                     .map_err(|_| "Maximum upload bytes must be an integer")?,
+                advance_behavior: match self.queue_advance_behavior.as_str() {
+                    "drop_and_refill" => QueueAdvanceBehavior::DropAndRefill,
+                    "rotate" => QueueAdvanceBehavior::Rotate,
+                    _ => return Err("Unknown queue advance behavior".into()),
+                },
             },
             rendering: RenderingSettings {
                 target: match self.frame_target.as_str() {
@@ -1337,6 +1375,7 @@ mod tests {
             queue: QueueSettings {
                 target_length: 3,
                 max_upload_bytes: 1024,
+                advance_behavior: QueueAdvanceBehavior::DropAndRefill,
             },
             rendering: RenderingSettings::default(),
             advancement: policy,
@@ -1783,6 +1822,45 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn every_fetch_can_rotate_the_completed_image_to_the_back() {
+        let (_directory, state) = manual_state(AdvancementSettings::EveryFetch {
+            frame_client_ips: Vec::new(),
+        })
+        .await;
+        let snapshot = state.settings.snapshot().await;
+        let mut settings = snapshot.settings;
+        settings.queue.advance_behavior = QueueAdvanceBehavior::Rotate;
+        state
+            .settings
+            .replace(snapshot.generation, settings)
+            .await
+            .unwrap();
+        let before = state.queue.snapshot().await;
+
+        let response = router(state.clone())
+            .oneshot(frame_request("GET", [127, 0, 0, 1]))
+            .await
+            .unwrap();
+        assert_eq!(bytes(response).await, A);
+        wait_for_current(&state, B).await;
+        assert_eq!(
+            state
+                .queue
+                .snapshot()
+                .await
+                .entries
+                .iter()
+                .map(|entry| entry.id.as_str())
+                .collect::<Vec<_>>(),
+            vec![
+                before.entries[1].id.as_str(),
+                before.entries[2].id.as_str(),
+                before.entries[0].id.as_str(),
+            ]
+        );
+    }
+
+    #[tokio::test]
     async fn in_flight_completion_cannot_advance_a_new_current_after_reorder() {
         let (_directory, state) = manual_state(AdvancementSettings::EveryFetch {
             frame_client_ips: Vec::new(),
@@ -2111,6 +2189,114 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn settings_queue_behavior_rotates_or_drops_and_backfills_on_manual_advance() {
+        let (_directory, rotating) = manual_state(AdvancementSettings::Manual).await;
+        let settings_snapshot = rotating.settings.snapshot().await;
+        let mut form = SettingsForm::from_settings(
+            settings_snapshot.generation,
+            rotating.csrf_token(),
+            &settings_snapshot.settings,
+        );
+        form.queue_advance_behavior = "rotate".into();
+        let app = router(rotating.clone());
+        let updated = app
+            .clone()
+            .oneshot(
+                Request::post("/settings")
+                    .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
+                    .body(Body::from(serde_urlencoded::to_string(form).unwrap()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(updated.status(), StatusCode::SEE_OTHER);
+        assert_eq!(
+            rotating
+                .settings
+                .snapshot()
+                .await
+                .settings
+                .queue
+                .advance_behavior,
+            QueueAdvanceBehavior::Rotate
+        );
+        let page = app
+            .clone()
+            .oneshot(Request::get("/settings").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert!(
+            String::from_utf8(bytes(page).await)
+                .unwrap()
+                .contains("<option value=\"rotate\" selected>")
+        );
+
+        let before = rotating.queue.snapshot().await;
+        let action = serde_urlencoded::to_string([
+            ("csrf_token", rotating.csrf_token().to_owned()),
+            ("queue_generation", before.generation.to_string()),
+        ])
+        .unwrap();
+        let advanced = app
+            .oneshot(
+                Request::post("/queue/advance")
+                    .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
+                    .body(Body::from(action))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(advanced.status(), StatusCode::SEE_OTHER);
+        assert_eq!(
+            rotating
+                .queue
+                .snapshot()
+                .await
+                .entries
+                .iter()
+                .map(|entry| entry.id.as_str())
+                .collect::<Vec<_>>(),
+            vec![
+                before.entries[1].id.as_str(),
+                before.entries[2].id.as_str(),
+                before.entries[0].id.as_str(),
+            ]
+        );
+
+        let (directory, dropping) = manual_state(AdvancementSettings::Manual).await;
+        fs::write(directory.path().join("source/d.jpg"), A).unwrap();
+        let before = dropping.queue.snapshot().await;
+        let action = serde_urlencoded::to_string([
+            ("csrf_token", dropping.csrf_token().to_owned()),
+            ("queue_generation", before.generation.to_string()),
+        ])
+        .unwrap();
+        let advanced = router(dropping.clone())
+            .oneshot(
+                Request::post("/queue/advance")
+                    .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
+                    .body(Body::from(action))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(advanced.status(), StatusCode::SEE_OTHER);
+        assert_eq!(dropping.queue.snapshot().await.entries.len(), 2);
+        assert_eq!(refill::refill_once(&dropping).await.unwrap(), 1);
+        assert_eq!(
+            dropping
+                .queue
+                .snapshot()
+                .await
+                .entries
+                .into_iter()
+                .map(|entry| entry.display_name)
+                .collect::<Vec<_>>(),
+            vec!["b.jpg", "c.jpg", "d.jpg"]
+        );
+    }
+
+    #[tokio::test]
     async fn queue_reorder_remove_and_manual_advance_include_current() {
         let (_directory, state) = manual_state(AdvancementSettings::Manual).await;
         let snapshot = state.queue.snapshot().await;
@@ -2126,7 +2312,11 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(state.queue.current().await.unwrap().unwrap().bytes, C);
-        state.queue.advance().await.unwrap();
+        state
+            .queue
+            .advance(QueueAdvanceBehavior::DropAndRefill)
+            .await
+            .unwrap();
         assert_eq!(state.queue.current().await.unwrap().unwrap().bytes, B);
         let snapshot = state.queue.snapshot().await;
         let current = snapshot.entries[0].id.clone();

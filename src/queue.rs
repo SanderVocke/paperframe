@@ -15,7 +15,10 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use tokio::sync::{Mutex, RwLock, watch};
 
-use crate::renderer::{FrameTarget, ImageOrientation, OrientationSource, RENDER_PROFILE_VERSION};
+use crate::{
+    config::QueueAdvanceBehavior,
+    renderer::{FrameTarget, ImageOrientation, OrientationSource, RENDER_PROFILE_VERSION},
+};
 
 const STATE_VERSION: u32 = 2;
 const STATE_FILE: &str = "queue-state.toml";
@@ -538,19 +541,32 @@ impl QueueStore {
         Ok(snapshot_of(&next))
     }
 
-    pub async fn advance(&self) -> Result<bool> {
-        self.advance_internal(None, None).await
+    pub async fn advance(&self, behavior: QueueAdvanceBehavior) -> Result<bool> {
+        self.advance_internal(None, None, behavior).await
     }
 
-    pub async fn advance_at_generation(&self, expected: u64) -> Result<bool> {
-        self.advance_internal(Some(expected), None).await
+    pub async fn advance_at_generation(
+        &self,
+        expected: u64,
+        behavior: QueueAdvanceBehavior,
+    ) -> Result<bool> {
+        self.advance_internal(Some(expected), None, behavior).await
     }
 
-    pub async fn advance_if_current(&self, id: &str) -> Result<bool> {
-        self.advance_internal(None, Some(id)).await
+    pub async fn advance_if_current(
+        &self,
+        id: &str,
+        behavior: QueueAdvanceBehavior,
+    ) -> Result<bool> {
+        self.advance_internal(None, Some(id), behavior).await
     }
 
-    async fn advance_internal(&self, expected: Option<u64>, id: Option<&str>) -> Result<bool> {
+    async fn advance_internal(
+        &self,
+        expected: Option<u64>,
+        id: Option<&str>,
+        behavior: QueueAdvanceBehavior,
+    ) -> Result<bool> {
         let _guard = self.mutation.lock().await;
         let current = self.descriptor.read().await.clone();
         if let Some(expected) = expected {
@@ -567,20 +583,29 @@ impl QueueStore {
             return Ok(false);
         }
         let mut next = current;
-        let removed = next.entries.remove(0);
+        let previous = next.entries.remove(0);
+        let removed = match behavior {
+            QueueAdvanceBehavior::DropAndRefill => Some(previous),
+            QueueAdvanceBehavior::Rotate => {
+                next.entries.push(previous);
+                None
+            }
+        };
         next.generation = next.generation.saturating_add(1);
         self.commit_descriptor(next.clone()).await?;
-        let object = self.objects.join(&removed.object_name);
-        let source = removed
-            .source_object_name
-            .map(|name| self.objects.join(name));
-        let _ = tokio::task::spawn_blocking(move || {
-            let _ = fs::remove_file(object);
-            if let Some(source) = source {
-                let _ = fs::remove_file(source);
-            }
-        })
-        .await;
+        if let Some(removed) = removed {
+            let object = self.objects.join(&removed.object_name);
+            let source = removed
+                .source_object_name
+                .map(|name| self.objects.join(name));
+            let _ = tokio::task::spawn_blocking(move || {
+                let _ = fs::remove_file(object);
+                if let Some(source) = source {
+                    let _ = fs::remove_file(source);
+                }
+            })
+            .await;
+        }
         self.notify(QueueEventReason::Advance, next.generation);
         Ok(true)
     }
@@ -1360,6 +1385,55 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn advancing_can_rotate_or_drop_the_previous_entry() {
+        let dir = tempdir().unwrap();
+        let queue = QueueStore::new(dir.path(), false).await.unwrap();
+        let a = queue
+            .enqueue("a".into(), A.to_vec(), None, None)
+            .await
+            .unwrap();
+        let b = queue
+            .enqueue("b".into(), B.to_vec(), None, None)
+            .await
+            .unwrap();
+        let c = queue
+            .enqueue("c".into(), A.to_vec(), None, None)
+            .await
+            .unwrap();
+
+        assert!(queue.advance(QueueAdvanceBehavior::Rotate).await.unwrap());
+        assert_eq!(
+            queue
+                .snapshot()
+                .await
+                .entries
+                .iter()
+                .map(|entry| entry.id.as_str())
+                .collect::<Vec<_>>(),
+            vec![b.id.as_str(), c.id.as_str(), a.id.as_str()]
+        );
+        assert_eq!(queue.prepare(&a.id).await.unwrap().bytes, A);
+
+        assert!(
+            queue
+                .advance(QueueAdvanceBehavior::DropAndRefill)
+                .await
+                .unwrap()
+        );
+        assert_eq!(
+            queue
+                .snapshot()
+                .await
+                .entries
+                .iter()
+                .map(|entry| entry.id.as_str())
+                .collect::<Vec<_>>(),
+            vec![c.id.as_str(), a.id.as_str()]
+        );
+        assert!(queue.prepare(&b.id).await.is_err());
+    }
+
+    #[tokio::test]
     async fn persists_order_current_seen_and_one_entry_hold() {
         let dir = tempdir().unwrap();
         let queue = QueueStore::new(dir.path(), false).await.unwrap();
@@ -1377,8 +1451,18 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(queue.current().await.unwrap().unwrap().bytes, B);
-        assert!(queue.advance_if_current(&b.id).await.unwrap());
-        assert!(!queue.advance_if_current(&a.id).await.unwrap());
+        assert!(
+            queue
+                .advance_if_current(&b.id, QueueAdvanceBehavior::DropAndRefill)
+                .await
+                .unwrap()
+        );
+        assert!(
+            !queue
+                .advance_if_current(&a.id, QueueAdvanceBehavior::DropAndRefill)
+                .await
+                .unwrap()
+        );
         assert_eq!(queue.current().await.unwrap().unwrap().bytes, A);
         drop(queue);
         let reloaded = QueueStore::new(dir.path(), false).await.unwrap();
@@ -1533,7 +1617,10 @@ mod tests {
             .unwrap();
         events.changed().await.unwrap();
         assert_eq!(events.borrow().reason, QueueEventReason::Enqueue);
-        queue.advance().await.unwrap();
+        queue
+            .advance(QueueAdvanceBehavior::DropAndRefill)
+            .await
+            .unwrap();
         events.changed().await.unwrap();
         assert_eq!(events.borrow().reason, QueueEventReason::BlockedAdvance);
     }

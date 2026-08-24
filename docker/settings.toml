@@ -5,6 +5,7 @@
 [queue]
 target_length = 10
 max_upload_bytes = 26214400
+advance_behavior = "drop_and_refill"
 
 [rendering]
 target = "paper_7"

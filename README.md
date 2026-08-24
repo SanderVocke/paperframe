@@ -31,6 +31,7 @@ cat > data/settings.toml <<EOF
 [queue]
 target_length = 10
 max_upload_bytes = 26214400
+advance_behavior = "drop_and_refill"
 
 [advancement]
 type = "manual"
@@ -103,9 +104,14 @@ The first queue entry is always the current image.
 - **Save order** applies the complete current-first order shown in the text box. Move whole lines and do not alter their opaque IDs.
 - **Non-advancing preview** opens an in-page comparison: the undithered original is always shown, and a server-dithered entry also shows its exact six-color result. Each side links to the retained full source or stored frame derivative.
 
-Advancing never consumes the only remaining image, so the frame keeps displaying it. Removing that sole entry is allowed and empties the queue. An empty queue makes the frame URL return `404` and `/health/ready` return `503`.
+Choose what happens to the previous image under **Frame settings → After moving to the next photo**:
 
-`target_length` is a refill target, not a maximum. Supplier images are added until the queue reaches the target; direct uploads may make it longer.
+- **Remove the previous photo and find a new one** (`drop_and_refill`, the default) deletes that managed queue copy and refills from the next unseen supplier candidate.
+- **Move the previous photo to the end of the queue** (`rotate`) keeps the managed copy and cycles it behind the other queued photos without needing a replacement.
+
+Advancing never consumes or rotates the only remaining image, so the frame keeps displaying it. Removing that sole entry is allowed and empties the queue. An empty queue makes the frame URL return `404` and `/health/ready` return `503`.
+
+`target_length` is a refill target, not a maximum. In drop-and-refill mode supplier images are added until the queue reaches the target; direct uploads may make it longer.
 
 ### Refresh and supplier history
 

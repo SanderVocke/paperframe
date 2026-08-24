@@ -14,6 +14,7 @@ pub async fn run(state: Arc<AppState>, mut shutdown: watch::Receiver<bool>) {
             return;
         }
         let settings = state.settings.snapshot().await.settings;
+        let behavior = settings.queue.advance_behavior;
         let AdvancementSettings::Scheduled { timezone, times } = settings.advancement else {
             tokio::select! {
                 changed = runtime.changed() => { if changed.is_err() { return; } }
@@ -32,7 +33,7 @@ pub async fn run(state: Arc<AppState>, mut shutdown: watch::Receiver<bool>) {
         let wait = (next - Utc::now()).to_std().unwrap_or(Duration::ZERO);
         tokio::select! {
             _ = tokio::time::sleep(wait) => {
-                if let Err(error) = state.queue.advance().await { error!(%error, "scheduled queue advancement failed"); }
+                if let Err(error) = state.queue.advance(behavior).await { error!(%error, "scheduled queue advancement failed"); }
             }
             changed = runtime.changed() => { if changed.is_err() { return; } }
             changed = shutdown.changed() => { if changed.is_err() || *shutdown.borrow() { return; } }

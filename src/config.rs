@@ -78,6 +78,16 @@ pub struct QueueSettings {
     pub target_length: usize,
     #[serde(default = "default_upload_bytes")]
     pub max_upload_bytes: u64,
+    #[serde(default)]
+    pub advance_behavior: QueueAdvanceBehavior,
+}
+
+#[derive(Clone, Copy, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum QueueAdvanceBehavior {
+    #[default]
+    DropAndRefill,
+    Rotate,
 }
 
 fn default_target() -> usize {
@@ -235,6 +245,7 @@ fn migrate_old_mode(mode: OldModeSettings) -> Settings {
             queue: QueueSettings {
                 target_length: 10,
                 max_upload_bytes: settings.max_upload_bytes,
+                advance_behavior: QueueAdvanceBehavior::default(),
             },
             rendering: RenderingSettings::default(),
             advancement: AdvancementSettings::EveryFetch {
@@ -257,6 +268,7 @@ fn migrate_digikam(old: OldDigikamSettings) -> Settings {
         queue: QueueSettings {
             target_length: 10,
             max_upload_bytes: DEFAULT_UPLOAD_BYTES,
+            advance_behavior: QueueAdvanceBehavior::default(),
         },
         rendering: RenderingSettings::default(),
         advancement: AdvancementSettings::Scheduled {
@@ -565,6 +577,28 @@ mod tests {
         settings.queue.target_length = 10;
         settings.suppliers.push(settings.suppliers[0].clone());
         assert!(settings.validate().is_err());
+    }
+
+    #[test]
+    fn queue_advance_behavior_defaults_to_drop_and_round_trips_rotate() {
+        let base = "queue={target_length=10,max_upload_bytes=100}\nadvancement={type='manual'}\n[[suppliers]]\nid='one'\ntype='manual_folder'\n[suppliers.settings]\ndirectory='/images'\npoll_interval_seconds=60\n";
+        let defaults: Settings = toml::from_str(base).unwrap();
+        assert_eq!(
+            defaults.queue.advance_behavior,
+            QueueAdvanceBehavior::DropAndRefill
+        );
+
+        let rotating: Settings = toml::from_str(&base.replace(
+            "max_upload_bytes=100",
+            "max_upload_bytes=100,advance_behavior='rotate'",
+        ))
+        .unwrap();
+        assert_eq!(
+            rotating.queue.advance_behavior,
+            QueueAdvanceBehavior::Rotate
+        );
+        let encoded = toml::to_string_pretty(&rotating).unwrap();
+        assert_eq!(toml::from_str::<Settings>(&encoded).unwrap(), rotating);
     }
 
     #[test]
