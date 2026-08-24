@@ -1,0 +1,11 @@
+{
+  "name": "paperframe-generate-picture-oracle",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "install-browser": "playwright install chromium"
+  },
+  "devDependencies": {
+    "playwright": "1.55.0"
+  }
+}

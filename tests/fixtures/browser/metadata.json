@@ -1,0 +1,397 @@
+{
+  "schema": 1,
+  "oracle": "actual GeneratePicture.js UI: defaults, Auto-Optimieren, download",
+  "offline_firmware_commit": "0961aa69ffeddfe505f7a2bb4b7c45f49308b2d6",
+  "epdoptimize_version": "1.2.0",
+  "chromium": "147.0.7727.137",
+  "fixtures": [
+    {
+      "name": "paper7",
+      "width": 800,
+      "height": 480,
+      "source_width": 800,
+      "source_height": 480,
+      "source_sha256": "0ce5ec71493cd3eff2038b93a7e96401e9e6c4b377ce0218c9b41d6c7141d59c",
+      "bmp_sha256": "89306954cfb764f98c7c5af3cdd6c95b990ed43ff5d2e9a8eadc2b8e9be27c6f",
+      "classification_kind": "photo",
+      "classification": {
+        "style": "photo",
+        "kind": "photo",
+        "kindScores": {
+          "photo": 0.5906051223537562,
+          "lowContrastPhoto": 0.37048730778729577,
+          "highContrastPhoto": 0.29828027525195927,
+          "flatIllustration": 0.09288119901438024,
+          "lineArt": 0.059599609374999994,
+          "textOrUi": 0,
+          "pixelArt": 0.00023085585585585594,
+          "unknown": 0
+        },
+        "confidence": 0.42038226310456794,
+        "photoScore": 0.710191131552284,
+        "metrics": {
+          "sampleCount": 15360,
+          "uniqueColorRatio": 0.24583333333333332,
+          "topColorCoverage": 0.007356770833333333,
+          "paletteEntropy": 0.9754193497792376,
+          "flatRatio": 0.022518382352941176,
+          "softChangeRatio": 0.7243631827731093,
+          "strongEdgeRatio": 0.2531184348739496,
+          "edgeDensity": 0.00006733099919202801,
+          "horizontalEdgeRatio": 0,
+          "verticalEdgeRatio": 1,
+          "lumaStdDev": 33.94365453523578,
+          "lumaP05": 72.3614,
+          "lumaP95": 180.3558,
+          "lumaRange": 107.99439999999998,
+          "saturationMean": 0.4917495108146158,
+          "saturationStdDev": 0.17194407233014652,
+          "darkRatio": 0,
+          "lightRatio": 0,
+          "grayRatio": 0.009830729166666666,
+          "highSaturationRatio": 0.08053385416666667,
+          "warmPaperRatio": 0.22734375,
+          "redRatio": 0.2897135416666667,
+          "darkNeutralRatio": 0.00013020833333333333,
+          "photoTileRatio": 0,
+          "flatTileRatio": 0,
+          "textTileRatio": 0,
+          "gradientTileRatio": 0,
+          "transparentRatio": 0
+        }
+      },
+      "raw_auto_options": {
+        "0": {
+          "value": "balanced",
+          "title": "Balanced",
+          "description": "Compresses display luminance range for general photo conversion."
+        },
+        "1": {
+          "value": "dynamic",
+          "title": "Dynamic",
+          "description": "Uses S-curve tone mapping for brighter, punchier photographic output."
+        },
+        "2": {
+          "value": "vivid",
+          "title": "Vivid",
+          "description": "Boosts color and applies a gentler S-curve for illustrations."
+        },
+        "3": {
+          "value": "soft",
+          "title": "Soft",
+          "description": "Reduces contrast and uses Stucki diffusion for smoother tones."
+        },
+        "4": {
+          "value": "grayscale",
+          "title": "Grayscale",
+          "description": "Removes saturation and uses LAB matching for monochrome work."
+        },
+        "5": {
+          "value": "restore",
+          "title": "Restore",
+          "description": "Expands faded scans and paintings before mapping them to the display range."
+        },
+        "6": {
+          "value": "posterScan",
+          "title": "Poster Scan",
+          "description": "Neutralizes warm paper, anchors black ink, and preserves strong poster colors."
+        },
+        "colorMatching": "rgb",
+        "errorDiffusionMatrix": "floydSteinberg",
+        "ditheringType": "errorDiffusion",
+        "serpentine": true
+      }
+    },
+    {
+      "name": "paperl",
+      "width": 1200,
+      "height": 1600,
+      "source_width": 1200,
+      "source_height": 1600,
+      "source_sha256": "1e105dbbb799469be8af760c8a5691161c75be6b49102619a8045107bd2d2d5c",
+      "bmp_sha256": "342122b88f70c245d20f8a404b248986742196f74d70a72e54ff62d7640452ff",
+      "classification_kind": "photo",
+      "classification": {
+        "style": "photo",
+        "kind": "photo",
+        "kindScores": {
+          "photo": 0.5244762238319643,
+          "lowContrastPhoto": 0.3345100657718154,
+          "highContrastPhoto": 0.24778184365350003,
+          "flatIllustration": 0.1312138334068571,
+          "lineArt": 0.06964843750000001,
+          "textOrUi": 0,
+          "pixelArt": 0,
+          "unknown": 0
+        },
+        "confidence": 0.1799135412071431,
+        "photoScore": 0.5899567706035715,
+        "metrics": {
+          "sampleCount": 19200,
+          "uniqueColorRatio": 0.15244791666666666,
+          "topColorCoverage": 0.010572916666666666,
+          "paletteEntropy": 0.9640557021835653,
+          "flatRatio": 0.07780692549842602,
+          "softChangeRatio": 0.7715372507869884,
+          "strongEdgeRatio": 0.15065582371458552,
+          "edgeDensity": 0,
+          "horizontalEdgeRatio": 0,
+          "verticalEdgeRatio": 0,
+          "lumaStdDev": 33.053404813608,
+          "lumaP05": 73.6164,
+          "lumaP95": 178.39339999999999,
+          "lumaRange": 104.77699999999999,
+          "saturationMean": 0.484353448009131,
+          "saturationStdDev": 0.16959440209603516,
+          "darkRatio": 0,
+          "lightRatio": 0,
+          "grayRatio": 0.008854166666666666,
+          "highSaturationRatio": 0.06713541666666667,
+          "warmPaperRatio": 0.24223958333333334,
+          "redRatio": 0.2803645833333333,
+          "darkNeutralRatio": 0.00005208333333333334,
+          "photoTileRatio": 0,
+          "flatTileRatio": 0,
+          "textTileRatio": 0,
+          "gradientTileRatio": 0,
+          "transparentRatio": 0
+        }
+      },
+      "raw_auto_options": {
+        "0": {
+          "value": "balanced",
+          "title": "Balanced",
+          "description": "Compresses display luminance range for general photo conversion."
+        },
+        "1": {
+          "value": "dynamic",
+          "title": "Dynamic",
+          "description": "Uses S-curve tone mapping for brighter, punchier photographic output."
+        },
+        "2": {
+          "value": "vivid",
+          "title": "Vivid",
+          "description": "Boosts color and applies a gentler S-curve for illustrations."
+        },
+        "3": {
+          "value": "soft",
+          "title": "Soft",
+          "description": "Reduces contrast and uses Stucki diffusion for smoother tones."
+        },
+        "4": {
+          "value": "grayscale",
+          "title": "Grayscale",
+          "description": "Removes saturation and uses LAB matching for monochrome work."
+        },
+        "5": {
+          "value": "restore",
+          "title": "Restore",
+          "description": "Expands faded scans and paintings before mapping them to the display range."
+        },
+        "6": {
+          "value": "posterScan",
+          "title": "Poster Scan",
+          "description": "Neutralizes warm paper, anchors black ink, and preserves strong poster colors."
+        },
+        "colorMatching": "rgb",
+        "errorDiffusionMatrix": "floydSteinberg",
+        "ditheringType": "errorDiffusion",
+        "serpentine": true
+      }
+    },
+    {
+      "name": "paper7-resized",
+      "width": 800,
+      "height": 480,
+      "source_width": 613,
+      "source_height": 409,
+      "source_sha256": "5fd6051255bb7971dabbc1b41fa909787fa043ab587d6df4c1d1d3cfc39ea4df",
+      "bmp_sha256": "0ab041425ffec2845e19c809bb4665c160fa6c65d5e835b6920d69019453663d",
+      "classification_kind": "photo",
+      "classification": {
+        "style": "photo",
+        "kind": "photo",
+        "kindScores": {
+          "photo": 0.5851958386600778,
+          "lowContrastPhoto": 0.36613530671059924,
+          "highContrastPhoto": 0.2941495495222412,
+          "flatIllustration": 0.09588605750686384,
+          "lineArt": 0.06975585937499999,
+          "textOrUi": 0,
+          "pixelArt": 0,
+          "unknown": 0
+        },
+        "confidence": 0.40071214058210103,
+        "photoScore": 0.7003560702910505,
+        "metrics": {
+          "sampleCount": 15360,
+          "uniqueColorRatio": 0.19954427083333334,
+          "topColorCoverage": 0.10748697916666666,
+          "paletteEntropy": 0.913131882671787,
+          "flatRatio": 0.14502363445378152,
+          "softChangeRatio": 0.8230042016806722,
+          "strongEdgeRatio": 0.031972163865546216,
+          "edgeDensity": 0.02531645569620253,
+          "horizontalEdgeRatio": 0,
+          "verticalEdgeRatio": 1,
+          "lumaStdDev": 50.00463064085865,
+          "lumaP05": 74.3428,
+          "lumaP95": 254.99999999999997,
+          "lumaRange": 180.6572,
+          "saturationMean": 0.4384773395630389,
+          "saturationStdDev": 0.21692757955296998,
+          "darkRatio": 0,
+          "lightRatio": 0.1,
+          "grayRatio": 0.10690104166666667,
+          "highSaturationRatio": 0.0669921875,
+          "warmPaperRatio": 0.22376302083333333,
+          "redRatio": 0.24850260416666667,
+          "darkNeutralRatio": 0.00013020833333333333,
+          "photoTileRatio": 0.05555555555555555,
+          "flatTileRatio": 0.08585858585858586,
+          "textTileRatio": 0,
+          "gradientTileRatio": 0.05555555555555555,
+          "transparentRatio": 0
+        }
+      },
+      "raw_auto_options": {
+        "0": {
+          "value": "balanced",
+          "title": "Balanced",
+          "description": "Compresses display luminance range for general photo conversion."
+        },
+        "1": {
+          "value": "dynamic",
+          "title": "Dynamic",
+          "description": "Uses S-curve tone mapping for brighter, punchier photographic output."
+        },
+        "2": {
+          "value": "vivid",
+          "title": "Vivid",
+          "description": "Boosts color and applies a gentler S-curve for illustrations."
+        },
+        "3": {
+          "value": "soft",
+          "title": "Soft",
+          "description": "Reduces contrast and uses Stucki diffusion for smoother tones."
+        },
+        "4": {
+          "value": "grayscale",
+          "title": "Grayscale",
+          "description": "Removes saturation and uses LAB matching for monochrome work."
+        },
+        "5": {
+          "value": "restore",
+          "title": "Restore",
+          "description": "Expands faded scans and paintings before mapping them to the display range."
+        },
+        "6": {
+          "value": "posterScan",
+          "title": "Poster Scan",
+          "description": "Neutralizes warm paper, anchors black ink, and preserves strong poster colors."
+        },
+        "colorMatching": "rgb",
+        "errorDiffusionMatrix": "floydSteinberg",
+        "ditheringType": "errorDiffusion",
+        "serpentine": true
+      }
+    },
+    {
+      "name": "paperl-rotated-resized",
+      "width": 1200,
+      "height": 1600,
+      "source_width": 777,
+      "source_height": 511,
+      "source_sha256": "df94903d529e34e2557992d52e44fe5eeb9c31cccd3876f71ed319046fc3eff4",
+      "bmp_sha256": "dbeba8cf8c742158f4f13b82e76c486828d30eaff83a70d983227577389f8e8a",
+      "classification_kind": "photo",
+      "classification": {
+        "style": "photo",
+        "kind": "photo",
+        "kindScores": {
+          "photo": 0.6093575064340949,
+          "lowContrastPhoto": 0.35634089794560453,
+          "highContrastPhoto": 0.2883241503609313,
+          "flatIllustration": 0.10413398067738569,
+          "lineArt": 0.078203125,
+          "textOrUi": 0,
+          "pixelArt": 0,
+          "unknown": 0
+        },
+        "confidence": 0.3491626207663394,
+        "photoScore": 0.6745813103831697,
+        "metrics": {
+          "sampleCount": 19200,
+          "uniqueColorRatio": 0.16880208333333332,
+          "topColorCoverage": 0.13223958333333333,
+          "paletteEntropy": 0.8951518750264422,
+          "flatRatio": 0.16600209863588666,
+          "softChangeRatio": 0.7178646379853095,
+          "strongEdgeRatio": 0.11613326337880378,
+          "edgeDensity": 0.03389830508474576,
+          "horizontalEdgeRatio": 0,
+          "verticalEdgeRatio": 1,
+          "lumaStdDev": 52.65146487473285,
+          "lumaP05": 75.0172,
+          "lumaP95": 254.99999999999997,
+          "lumaRange": 179.98279999999997,
+          "saturationMean": 0.423181256614341,
+          "saturationStdDev": 0.224379340902254,
+          "darkRatio": 0,
+          "lightRatio": 0.125,
+          "grayRatio": 0.13244791666666667,
+          "highSaturationRatio": 0.05572916666666667,
+          "warmPaperRatio": 0.21598958333333335,
+          "redRatio": 0.24802083333333333,
+          "darkNeutralRatio": 0.00005208333333333334,
+          "photoTileRatio": 0.2,
+          "flatTileRatio": 0,
+          "textTileRatio": 0,
+          "gradientTileRatio": 0,
+          "transparentRatio": 0
+        }
+      },
+      "raw_auto_options": {
+        "0": {
+          "value": "balanced",
+          "title": "Balanced",
+          "description": "Compresses display luminance range for general photo conversion."
+        },
+        "1": {
+          "value": "dynamic",
+          "title": "Dynamic",
+          "description": "Uses S-curve tone mapping for brighter, punchier photographic output."
+        },
+        "2": {
+          "value": "vivid",
+          "title": "Vivid",
+          "description": "Boosts color and applies a gentler S-curve for illustrations."
+        },
+        "3": {
+          "value": "soft",
+          "title": "Soft",
+          "description": "Reduces contrast and uses Stucki diffusion for smoother tones."
+        },
+        "4": {
+          "value": "grayscale",
+          "title": "Grayscale",
+          "description": "Removes saturation and uses LAB matching for monochrome work."
+        },
+        "5": {
+          "value": "restore",
+          "title": "Restore",
+          "description": "Expands faded scans and paintings before mapping them to the display range."
+        },
+        "6": {
+          "value": "posterScan",
+          "title": "Poster Scan",
+          "description": "Neutralizes warm paper, anchors black ink, and preserves strong poster colors."
+        },
+        "colorMatching": "rgb",
+        "errorDiffusionMatrix": "floydSteinberg",
+        "ditheringType": "errorDiffusion",
+        "serpentine": true
+      }
+    }
+  ]
+}

@@ -1,0 +1,42 @@
+{
+  "schema": 1,
+  "comparison": "Rust generate_picture_auto_v2 against pinned Chromium GeneratePicture.js fixtures",
+  "chromium": "147.0.7727.137",
+  "offline_firmware_commit": "0961aa69ffeddfe505f7a2bb4b7c45f49308b2d6",
+  "epdoptimize_commit": "555c7a3c42d9233a17b26ec399f3d57340dde8f5",
+  "metrics": {
+    "box_filter_dimension_divisor": 8,
+    "minimum_ssim": 0.97,
+    "maximum_device_color_coverage_delta": 0.02
+  },
+  "fixtures": [
+    {
+      "name": "paper7",
+      "target": "paper_7",
+      "byte_identical": true,
+      "exact_pixel_mismatches": 0
+    },
+    {
+      "name": "paper_l",
+      "target": "paper_l",
+      "byte_identical": true,
+      "exact_pixel_mismatches": 0
+    },
+    {
+      "name": "paper7-resized",
+      "target": "paper_7",
+      "byte_identical": false,
+      "exact_pixel_mismatches": 197275,
+      "box8_ssim": 0.996190762,
+      "maximum_device_color_coverage_delta": 0.002679687
+    },
+    {
+      "name": "paperl-rotated-resized",
+      "target": "paper_l",
+      "byte_identical": false,
+      "exact_pixel_mismatches": 958405,
+      "box8_ssim": 0.997071284,
+      "maximum_device_color_coverage_delta": 0.000109375
+    }
+  ]
+}

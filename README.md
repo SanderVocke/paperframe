@@ -69,16 +69,16 @@ The quick-start policy is `manual`, so test downloads cannot unexpectedly move t
 
 The server has two global output modes:
 
-- **Server dither BMP** decodes the source, applies a fixed firmware-compatible six-color Floyd–Steinberg profile, and stores a ready-to-display 4-bit BMP. Configure either `/frame/current.bmp` or the backward-compatible `/frame/current.jpg`; the latter may return `image/bmp` because the firmware detects the body by its `BM` signature.
+- **Server dither BMP** decodes the source and applies a pure-Rust port of the PaperlessPaper web editor's default **Auto-Optimieren** flow: image-specific analysis and adjustments, the editor's calibrated six-color palette, and serpentine Floyd–Steinberg diffusion. It stores a ready-to-display 4-bit BMP. Configure either `/frame/current.bmp` or the backward-compatible `/frame/current.jpg`; the latter may return `image/bmp` because the firmware detects the body by its `BM` signature.
 - **Direct JPEG** preserves a suitable JPEG without recompression and converts other sources to JPEG. The frame performs its normal on-device processing.
 
 Select Paper 7 (`800×480`) or Paper L (`1200×1600`) in Frame settings. Existing settings without a `[rendering]` section retain the compatibility default of direct JPEG; the supplied new-install examples select server dithering.
 
 The compiled decoder supports JPEG, PNG, GIF, WebP, BMP, TIFF, TGA, PNM, DDS, HDR, OpenEXR, ICO, QOI, and Farbfeld. AVIF is not enabled because `image` 0.25's AVIF decoder requires the optional native backend, while this server deliberately retains a pure-Rust production image pipeline. Animated formats use their first frame, metadata orientation is applied where the decoder exposes it, and transparency is composited onto white. Encoded uploads are bounded by `max_upload_bytes`; every supplier/upload source also has a hard 100 MiB encoded limit, and decoded images are dimension/allocation limited.
 
-Orientation is inferred after metadata orientation: taller images are portrait and square images are landscape. Each queue card can override it. The renderer stretches to the complete orientation-appropriate panel area and uses a fixed clockwise 90° transform when logical and physical orientations differ. Reposition the physical frame clockwise to match the displayed image. Auto Rotation in the offline firmware still handles only the final 180° correction.
+Orientation is inferred after metadata orientation: taller images are portrait and square images are landscape. Each queue card can override it. Like the offline web editor, the renderer preserves aspect ratio, centers the image on white, and uses the editor's 270° transform when source and display orientations differ. Auto Rotation in the offline firmware still handles only the final 180° correction.
 
-Dither parameters are intentionally not user-editable. The versioned profile uses the firmware's ideal black/blue/green/red/yellow/white palette, RGB nearest-color matching, clean-color thresholds, non-serpentine Floyd–Steinberg diffusion, RGB565-like input precision, and nearest-neighbor resizing. Each queue card links to the original and to a non-advancing lossless dithered preview.
+Dither parameters are intentionally not user-editable yet. Profile version 2 uses the web editor's `spectra6Custom` calibrated palette, per-image natural auto optimization, RGB or LAB matching selected by that analysis, the editor's reachable tone/range/paper adjustments, its default Floyd–Steinberg selection, and serpentine scanning. The internal typed profile leaves room for future palette and exposure/contrast/saturation controls. Each queue card links to the original and to a non-advancing lossless dithered preview.
 
 ### Install the control page as an app
 

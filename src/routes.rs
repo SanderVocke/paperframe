@@ -1693,6 +1693,47 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn startup_rerenders_profile_v1_derivatives_to_generate_picture_v2() {
+        let (directory, state) = manual_state(AdvancementSettings::Manual).await;
+        let mut settings = state.settings.snapshot().await.settings;
+        settings.rendering.output_mode = OutputMode::ServerDitherBmp;
+        state
+            .queue
+            .rerender_all(settings.rendering.target, settings.rendering.output_mode)
+            .await
+            .unwrap();
+        state.settings.replace(1, settings).await.unwrap();
+        drop(state);
+
+        let descriptor_path = directory.path().join("queue/queue-state.toml");
+        let descriptor = fs::read_to_string(&descriptor_path)
+            .unwrap()
+            .replace("renderer_profile = 2", "renderer_profile = 1");
+        assert!(descriptor.contains("renderer_profile = 1"));
+        fs::write(&descriptor_path, descriptor).unwrap();
+        let settings_path = directory.path().join("settings.toml");
+        let restarted = AppState::initialize(
+            crate::config::Config {
+                bind: "127.0.0.1:0".parse().unwrap(),
+                settings_path: settings_path.clone(),
+                queue_dir: directory.path().join("queue"),
+            },
+            SettingsManager::load(settings_path).unwrap(),
+        )
+        .await
+        .unwrap();
+        assert!(
+            restarted
+                .queue
+                .snapshot()
+                .await
+                .entries
+                .iter()
+                .all(|entry| entry.renderer_profile == crate::renderer::RENDER_PROFILE_VERSION)
+        );
+    }
+
+    #[tokio::test]
     async fn dithered_frame_preview_and_orientation_override_are_non_advancing() {
         let (_directory, state) = manual_state(AdvancementSettings::Manual).await;
         let mut settings = state.settings.snapshot().await.settings;

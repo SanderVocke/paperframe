@@ -1,6 +1,10 @@
 pub mod catalog;
 pub mod config;
 pub mod dither;
+pub mod epd_auto;
+pub mod epd_pipeline;
+pub mod epd_processing;
+pub mod epd_profile;
 pub mod queue;
 mod refill;
 pub mod renderer;

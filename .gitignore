@@ -4,3 +4,4 @@
 /data/
 /cache/
 *.tmp
+/tools/oracle/node_modules/

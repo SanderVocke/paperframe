@@ -9,9 +9,14 @@ use image::{
 use image::{ImageEncoder, metadata::Orientation as ExifOrientation};
 use serde::{Deserialize, Serialize};
 
-use crate::dither::{IndexedImage, Rgb};
+use crate::{
+    dither::{IndexedImage, Rgb},
+    epd_auto::resolve_auto_options,
+    epd_pipeline::process_canvas,
+    epd_profile::{DitherProfile, PlacementMode, ResizePolicy},
+};
 
-pub const RENDER_PROFILE_VERSION: u32 = 1;
+pub const RENDER_PROFILE_VERSION: u32 = 2;
 pub const MAX_ENCODED_BYTES: u64 = 100 * 1024 * 1024;
 pub const MAX_SOURCE_DIMENSION: u32 = 20_000;
 pub const MAX_DECODED_BYTES: u64 = 256 * 1024 * 1024;
@@ -177,8 +182,7 @@ pub fn render(
 ) -> Result<RenderedImage> {
     match mode {
         OutputMode::ServerDitherBmp => {
-            let framebuffer = prepare_framebuffer(&source.pixels, target, orientation);
-            let indexed = firmware_dither(&framebuffer)?;
+            let indexed = generate_picture_dither(&source.pixels, target, orientation)?;
             Ok(RenderedImage {
                 bytes: encode_bmp4(&indexed)?,
                 media_type: "image/bmp",
@@ -198,8 +202,7 @@ pub fn dithered_preview_png(
     target: FrameTarget,
     orientation: ImageOrientation,
 ) -> Result<Vec<u8>> {
-    let framebuffer = prepare_framebuffer(&source.pixels, target, orientation);
-    let indexed = firmware_dither(&framebuffer)?;
+    let indexed = generate_picture_dither(&source.pixels, target, orientation)?;
     encode_indexed_png(&indexed)
 }
 
@@ -208,143 +211,94 @@ pub fn prepare_framebuffer(
     target: FrameTarget,
     orientation: ImageOrientation,
 ) -> RgbaImage {
-    let (logical_width, logical_height) = target.logical_dimensions(orientation);
-    let divisor = if source.width() > 3200 {
-        8
-    } else if source.width() > 1600 {
-        4
-    } else if source.width() > 800 {
-        2
-    } else {
-        1
-    };
-    let prescaled = if divisor > 1 {
-        resize_nearest_firmware(
-            source,
-            (source.width() / divisor).max(1),
-            (source.height() / divisor).max(1),
-        )
-    } else {
-        source.clone()
-    };
-    let mut logical = resize_nearest_firmware(&prescaled, logical_width, logical_height);
-    for pixel in logical.pixels_mut() {
-        // JPEGDEC supplies RGB565 to the firmware callback.
-        pixel[0] &= 0xF8;
-        pixel[1] &= 0xFC;
-        pixel[2] &= 0xF8;
-        pixel[3] = 255;
+    prepare_profile_canvas(
+        source,
+        target,
+        orientation,
+        false,
+        &DitherProfile::generate_picture_auto_v2(),
+    )
+}
+
+pub fn prepare_analysis_canvas(
+    source: &RgbaImage,
+    target: FrameTarget,
+    orientation: ImageOrientation,
+) -> RgbaImage {
+    prepare_profile_canvas(
+        source,
+        target,
+        orientation,
+        target == FrameTarget::PaperL,
+        &DitherProfile::generate_picture_auto_v2(),
+    )
+}
+
+fn prepare_profile_canvas(
+    source: &RgbaImage,
+    target: FrameTarget,
+    orientation: ImageOrientation,
+    half_size: bool,
+    profile: &DitherProfile,
+) -> RgbaImage {
+    debug_assert_eq!(profile.placement, PlacementMode::AspectFitWhite);
+    let (mut logical_width, mut logical_height) = target.logical_dimensions(orientation);
+    if half_size {
+        logical_width /= 2;
+        logical_height /= 2;
     }
-    if (logical_width, logical_height) == target.physical_dimensions() {
+    let scale = (logical_width as f64 / source.width() as f64)
+        .min(logical_height as f64 / source.height() as f64);
+    let render_width = ((source.width() as f64 * scale).round() as u32).clamp(1, logical_width);
+    let render_height = ((source.height() as f64 * scale).round() as u32).clamp(1, logical_height);
+    // Canvas drawImage uses browser smoothing. Triangle filtering is the closest
+    // deterministic image-crate equivalent and is isolated behind the profile.
+    let filter = match profile.resize {
+        ResizePolicy::BrowserLikeTriangle => imageops::FilterType::Triangle,
+    };
+    let resized = imageops::resize(source, render_width, render_height, filter);
+    let mut logical = RgbaImage::from_pixel(
+        logical_width,
+        logical_height,
+        image::Rgba([255, 255, 255, 255]),
+    );
+    imageops::overlay(
+        &mut logical,
+        &resized,
+        i64::from((logical_width - render_width) / 2),
+        i64::from((logical_height - render_height) / 2),
+    );
+    if (logical_width, logical_height)
+        == if half_size {
+            let (width, height) = target.physical_dimensions();
+            (width / 2, height / 2)
+        } else {
+            target.physical_dimensions()
+        }
+    {
         logical
     } else {
-        // Fixed clockwise convention: rotate the physical frame clockwise for this image.
-        imageops::rotate90(&logical)
+        // GeneratePicture rotates orientation-mismatched sources by 270°.
+        imageops::rotate270(&logical)
     }
 }
 
-fn resize_nearest_firmware(source: &RgbaImage, width: u32, height: u32) -> RgbaImage {
-    RgbaImage::from_fn(width, height, |x, y| {
-        let source_x = (u64::from(x) * u64::from(source.width()) / u64::from(width)) as u32;
-        let source_y = (u64::from(y) * u64::from(source.height()) / u64::from(height)) as u32;
-        *source.get_pixel(
-            source_x.min(source.width() - 1),
-            source_y.min(source.height() - 1),
-        )
-    })
-}
-
-pub fn firmware_dither(image: &RgbaImage) -> Result<IndexedImage> {
-    let width = image.width() as usize;
-    let height = image.height() as usize;
-    let channels = width
-        .checked_mul(3)
-        .context("dither error buffer size overflow")?;
-    let mut current = vec![0_i32; channels];
-    let mut next = vec![0_i32; channels];
-    let mut indices = vec![6_u8; width.checked_mul(height).context("image size overflow")?];
-
-    for y in 0..height {
-        for x in 0..width {
-            let pixel = image.get_pixel(x as u32, y as u32);
-            let mut original = [pixel[0] as i32, pixel[1] as i32, pixel[2] as i32];
-            snap_color(&mut original);
-            let adjusted = [
-                (original[0] + current[x * 3]).clamp(0, 255),
-                (original[1] + current[x * 3 + 1]).clamp(0, 255),
-                (original[2] + current[x * 3 + 2]).clamp(0, 255),
-            ];
-            let (device_index, selected) = closest_device(adjusted);
-            indices[y * width + x] = device_index;
-            let error = [
-                adjusted[0] - selected.r as i32,
-                adjusted[1] - selected.g as i32,
-                adjusted[2] - selected.b as i32,
-            ];
-            if x + 1 < width {
-                add_error(&mut current, x + 1, error, 7);
-            }
-            if x > 0 {
-                add_error(&mut next, x - 1, error, 3);
-            }
-            add_error(&mut next, x, error, 5);
-            if x + 1 < width {
-                add_error(&mut next, x + 1, error, 1);
-            }
-        }
-        std::mem::swap(&mut current, &mut next);
-        next.fill(0);
-    }
-
-    Ok(IndexedImage {
-        width: image.width(),
-        height: image.height(),
-        indices,
-    })
-}
-
-fn add_error(buffer: &mut [i32], x: usize, error: [i32; 3], weight: i32) {
-    for channel in 0..3 {
-        buffer[x * 3 + channel] += (error[channel] * weight) >> 4;
-    }
-}
-
-fn snap_color(rgb: &mut [i32; 3]) {
-    let [r, g, b] = *rgb;
-    let replacement = if r < 25 && g < 25 && b < 25 {
-        Some([0, 0, 0])
-    } else if r > 230 && g > 230 && b > 230 {
-        Some([255, 255, 255])
-    } else if r > 230 && g < 25 && b < 25 {
-        Some([255, 0, 0])
-    } else if r < 35 && g > 220 && b < 35 {
-        Some([0, 255, 0])
-    } else if r < 25 && g < 25 && b > 230 {
-        Some([0, 0, 255])
-    } else if r > 205 && g > 205 && b < 50 {
-        Some([255, 255, 0])
-    } else {
-        None
-    };
-    if let Some(replacement) = replacement {
-        *rgb = replacement;
-    }
-}
-
-fn closest_device(rgb: [i32; 3]) -> (u8, Rgb) {
-    let mut best = DEVICE_PALETTE[0];
-    let mut distance = i64::MAX;
-    for candidate in DEVICE_PALETTE {
-        let dr = rgb[0] - candidate.1.r as i32;
-        let dg = rgb[1] - candidate.1.g as i32;
-        let db = rgb[2] - candidate.1.b as i32;
-        let candidate_distance = (dr * dr + dg * dg + db * db) as i64;
-        if candidate_distance < distance {
-            best = candidate;
-            distance = candidate_distance;
-        }
-    }
-    best
+fn generate_picture_dither(
+    source: &RgbaImage,
+    target: FrameTarget,
+    orientation: ImageOrientation,
+) -> Result<IndexedImage> {
+    let profile = DitherProfile::generate_picture_auto_v2();
+    let analysis = prepare_profile_canvas(
+        source,
+        target,
+        orientation,
+        target == FrameTarget::PaperL,
+        &profile,
+    );
+    let (_, options) = resolve_auto_options(&analysis, &profile);
+    let framebuffer = prepare_profile_canvas(source, target, orientation, false, &profile);
+    process_canvas(&framebuffer, &profile, &options)
 }
 
 pub fn encode_bmp4(image: &IndexedImage) -> Result<Vec<u8>> {
@@ -502,7 +456,6 @@ fn get_i32(bytes: &[u8], offset: usize) -> Result<i32> {
 mod tests {
     use super::*;
     use image::{ImageBuffer, Rgba};
-    use serde::Deserialize;
 
     fn source(width: u32, height: u32) -> RgbaImage {
         ImageBuffer::from_fn(width, height, |x, y| {
@@ -517,14 +470,6 @@ mod tests {
     }
 
     #[test]
-    fn firmware_nearest_resize_uses_floor_mapped_source_coordinates() {
-        let input = RgbaImage::from_fn(3, 2, |x, y| Rgba([(x + y * 3) as u8, 0, 0, 255]));
-        let output = resize_nearest_firmware(&input, 5, 3);
-        let values = output.pixels().map(|pixel| pixel[0]).collect::<Vec<_>>();
-        assert_eq!(values, [0, 0, 1, 1, 2, 0, 0, 1, 1, 2, 3, 3, 4, 4, 5]);
-    }
-
-    #[test]
     fn framebuffer_uses_exact_target_dimensions_for_both_orientations() {
         for target in [FrameTarget::Paper7, FrameTarget::PaperL] {
             for orientation in [ImageOrientation::Portrait, ImageOrientation::Landscape] {
@@ -534,84 +479,16 @@ mod tests {
         }
     }
 
-    #[derive(Deserialize)]
-    struct FirmwareFixture {
-        firmware_commit: String,
-        profile_version: u32,
-        comparison: String,
-        dither_case: FirmwareDitherCase,
-        negative_shift_cases: Vec<NegativeShiftCase>,
-        nearest_resize_case: ResizeCase,
-        bmp_targets: Vec<BmpTargetCase>,
-    }
-    #[derive(Deserialize)]
-    struct FirmwareDitherCase {
-        width: u32,
-        height: u32,
-        rgba: Vec<u8>,
-        indices: Vec<u8>,
-    }
-    #[derive(Deserialize)]
-    struct NegativeShiftCase {
-        error: i32,
-        weight: i32,
-        expected: i32,
-    }
-    #[derive(Deserialize)]
-    struct ResizeCase {
-        source_width: u32,
-        source_height: u32,
-        target_width: u32,
-        target_height: u32,
-        expected_source_indices: Vec<u8>,
-    }
-    #[derive(Deserialize)]
-    struct BmpTargetCase {
-        name: String,
-        width: u32,
-        height: u32,
-        file_size: usize,
-    }
-
     #[test]
-    fn firmware_profile_fixture_matches_exactly() {
-        let fixture: FirmwareFixture =
-            serde_json::from_str(include_str!("../tests/fixtures/firmware-profile-v1.json"))
-                .unwrap();
-        assert_eq!(fixture.firmware_commit, "0961aa6");
-        assert_eq!(fixture.profile_version, RENDER_PROFILE_VERSION);
-        assert!(fixture.comparison.starts_with("exact independently"));
-        let case = fixture.dither_case;
-        let pixels = RgbaImage::from_raw(case.width, case.height, case.rgba).unwrap();
-        assert_eq!(firmware_dither(&pixels).unwrap().indices, case.indices);
-        for case in fixture.negative_shift_cases {
-            assert_eq!((case.error * case.weight) >> 4, case.expected);
-        }
-        let case = fixture.nearest_resize_case;
-        let source = RgbaImage::from_fn(case.source_width, case.source_height, |x, y| {
-            Rgba([(x + y * case.source_width) as u8, 0, 0, 255])
-        });
-        let resized = resize_nearest_firmware(&source, case.target_width, case.target_height);
-        assert_eq!(
-            resized.pixels().map(|pixel| pixel[0]).collect::<Vec<_>>(),
-            case.expected_source_indices
-        );
-        for case in fixture.bmp_targets {
-            let target = match case.name.as_str() {
-                "paper_7" => FrameTarget::Paper7,
-                "paper_l" => FrameTarget::PaperL,
-                _ => panic!("unknown target fixture"),
-            };
-            assert_eq!(target.physical_dimensions(), (case.width, case.height));
-            let bmp = encode_bmp4(&IndexedImage {
-                width: case.width,
-                height: case.height,
-                indices: vec![6; case.width as usize * case.height as usize],
-            })
-            .unwrap();
-            assert_eq!(bmp.len(), case.file_size);
-            validate_bmp4(&bmp, target).unwrap();
-        }
+    fn generate_picture_canvas_aspect_fits_on_white() {
+        let input = RgbaImage::from_pixel(100, 100, Rgba([255, 0, 0, 255]));
+        let output = prepare_framebuffer(&input, FrameTarget::Paper7, ImageOrientation::Landscape);
+        assert_eq!(output.dimensions(), (800, 480));
+        assert_eq!(output.get_pixel(0, 0).0, [255, 255, 255, 255]);
+        assert_eq!(output.get_pixel(400, 240).0, [255, 0, 0, 255]);
+        let analysis =
+            prepare_analysis_canvas(&input, FrameTarget::PaperL, ImageOrientation::Portrait);
+        assert_eq!(analysis.dimensions(), (600, 800));
     }
 
     #[test]
@@ -633,6 +510,137 @@ mod tests {
         assert_eq!(independently_decoded.dimensions(), (800, 480));
         assert_eq!(independently_decoded.get_pixel(0, 0).0, [0, 0, 0]);
         assert_eq!(independently_decoded.get_pixel(1, 0).0, [0, 0, 255]);
+    }
+
+    #[test]
+    fn canonical_sources_match_generate_picture_browser_bmps_exactly() {
+        for (source_bytes, expected, target, orientation) in [
+            (
+                include_bytes!("../tests/fixtures/browser/paper7-source.png").as_slice(),
+                include_bytes!("../tests/fixtures/browser/paper7-auto.bmp").as_slice(),
+                FrameTarget::Paper7,
+                ImageOrientation::Landscape,
+            ),
+            (
+                include_bytes!("../tests/fixtures/browser/paperl-source.png").as_slice(),
+                include_bytes!("../tests/fixtures/browser/paperl-auto.bmp").as_slice(),
+                FrameTarget::PaperL,
+                ImageOrientation::Portrait,
+            ),
+        ] {
+            let decoded = decode_source(source_bytes).unwrap();
+            let rendered =
+                render(&decoded, target, OutputMode::ServerDitherBmp, orientation).unwrap();
+            assert_eq!(
+                rendered.bytes, expected,
+                "browser parity mismatch for {target:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn resized_browser_fixtures_meet_generate_picture_similarity_bounds() {
+        for (source_bytes, expected, target, orientation) in [
+            (
+                include_bytes!("../tests/fixtures/browser/paper7-resized-source.png").as_slice(),
+                include_bytes!("../tests/fixtures/browser/paper7-resized-auto.bmp").as_slice(),
+                FrameTarget::Paper7,
+                ImageOrientation::Landscape,
+            ),
+            (
+                include_bytes!("../tests/fixtures/browser/paperl-rotated-resized-source.png")
+                    .as_slice(),
+                include_bytes!("../tests/fixtures/browser/paperl-rotated-resized-auto.bmp")
+                    .as_slice(),
+                FrameTarget::PaperL,
+                ImageOrientation::Landscape,
+            ),
+        ] {
+            let decoded = decode_source(source_bytes).unwrap();
+            let profile = DitherProfile::generate_picture_auto_v2();
+            let analysis = prepare_analysis_canvas(&decoded.pixels, target, orientation);
+            let (classification, _) = resolve_auto_options(&analysis, &profile);
+            assert_eq!(classification.kind, crate::epd_auto::ImageKind::Photo);
+            let rendered =
+                render(&decoded, target, OutputMode::ServerDitherBmp, orientation).unwrap();
+            let actual = image::load_from_memory_with_format(&rendered.bytes, ImageFormat::Bmp)
+                .unwrap()
+                .into_rgb8();
+            let expected = image::load_from_memory_with_format(expected, ImageFormat::Bmp)
+                .unwrap()
+                .into_rgb8();
+            let similarity = box_filtered_ssim(&actual, &expected, 8);
+            let exact_mismatches = actual
+                .pixels()
+                .zip(expected.pixels())
+                .filter(|(actual, expected)| actual != expected)
+                .count();
+            let mut maximum_coverage_delta = 0.0_f64;
+            assert!(similarity >= 0.97, "SSIM {similarity} for {target:?}");
+            for (_, color) in DEVICE_PALETTE {
+                let actual_ratio = actual
+                    .pixels()
+                    .filter(|pixel| pixel.0 == [color.r, color.g, color.b])
+                    .count() as f64
+                    / f64::from(actual.width() * actual.height());
+                let expected_ratio = expected
+                    .pixels()
+                    .filter(|pixel| pixel.0 == [color.r, color.g, color.b])
+                    .count() as f64
+                    / f64::from(expected.width() * expected.height());
+                let delta = (actual_ratio - expected_ratio).abs();
+                maximum_coverage_delta = maximum_coverage_delta.max(delta);
+                assert!(
+                    delta <= 0.02,
+                    "coverage mismatch for {color:?} on {target:?}"
+                );
+            }
+            eprintln!(
+                "target={target:?} box8_ssim={similarity:.9} exact_mismatches={exact_mismatches} max_coverage_delta={maximum_coverage_delta:.9}"
+            );
+        }
+    }
+
+    fn box_filtered_ssim(a: &image::RgbImage, b: &image::RgbImage, block: u32) -> f64 {
+        assert_eq!(a.dimensions(), b.dimensions());
+        let mut av = Vec::new();
+        let mut bv = Vec::new();
+        for y in (0..a.height()).step_by(block as usize) {
+            for x in (0..a.width()).step_by(block as usize) {
+                for channel in 0..3 {
+                    let mut a_sum = 0.0;
+                    let mut b_sum = 0.0;
+                    let mut count = 0.0;
+                    for yy in y..(y + block).min(a.height()) {
+                        for xx in x..(x + block).min(a.width()) {
+                            a_sum += f64::from(a.get_pixel(xx, yy)[channel]);
+                            b_sum += f64::from(b.get_pixel(xx, yy)[channel]);
+                            count += 1.0;
+                        }
+                    }
+                    av.push(a_sum / count);
+                    bv.push(b_sum / count);
+                }
+            }
+        }
+        let a_mean = av.iter().sum::<f64>() / av.len() as f64;
+        let b_mean = bv.iter().sum::<f64>() / bv.len() as f64;
+        let mut a_var = 0.0;
+        let mut b_var = 0.0;
+        let mut covariance = 0.0;
+        for (a, b) in av.iter().zip(&bv) {
+            a_var += (a - a_mean).powi(2);
+            b_var += (b - b_mean).powi(2);
+            covariance += (a - a_mean) * (b - b_mean);
+        }
+        let divisor = (av.len() - 1).max(1) as f64;
+        a_var /= divisor;
+        b_var /= divisor;
+        covariance /= divisor;
+        let c1 = (0.01_f64 * 255.0).powi(2);
+        let c2 = (0.03_f64 * 255.0).powi(2);
+        ((2.0 * a_mean * b_mean + c1) * (2.0 * covariance + c2))
+            / ((a_mean.powi(2) + b_mean.powi(2) + c1) * (a_var + b_var + c2))
     }
 
     #[test]
@@ -666,7 +674,11 @@ mod tests {
         let input = source(4, 3);
         let jpeg = encode_jpeg(&input).unwrap();
         assert_eq!(image::guess_format(&jpeg).unwrap(), ImageFormat::Jpeg);
-        let indexed = firmware_dither(&input).unwrap();
+        let indexed = IndexedImage {
+            width: 4,
+            height: 3,
+            indices: vec![6; 12],
+        };
         let png = encode_indexed_png(&indexed).unwrap();
         assert_eq!(image::guess_format(&png).unwrap(), ImageFormat::Png);
     }
@@ -716,34 +728,13 @@ mod tests {
     }
 
     #[test]
-    fn committed_visual_regressions_are_full_frame_and_six_color() {
-        for fixture in [
-            include_bytes!("../tests/fixtures/visual/paper7-landscape.png").as_slice(),
-            include_bytes!("../tests/fixtures/visual/paper7-portrait.png").as_slice(),
-        ] {
-            let image = image::load_from_memory_with_format(fixture, ImageFormat::Png)
-                .unwrap()
-                .into_rgb8();
-            assert_eq!(
-                image.dimensions(),
-                FrameTarget::Paper7.physical_dimensions()
-            );
-            assert!(image.pixels().all(|pixel| {
-                DEVICE_PALETTE
-                    .iter()
-                    .any(|(_, color)| pixel.0 == [color.r, color.g, color.b])
-            }));
-        }
-    }
-
-    #[test]
     #[ignore = "release-mode rendering benchmark smoke test"]
     fn benchmark_full_frame_profiles() {
         let input = source(1600, 1200);
         for target in [FrameTarget::Paper7, FrameTarget::PaperL] {
             let started = std::time::Instant::now();
-            let framebuffer = prepare_framebuffer(&input, target, ImageOrientation::Landscape);
-            let indexed = firmware_dither(&framebuffer).unwrap();
+            let indexed =
+                generate_picture_dither(&input, target, ImageOrientation::Landscape).unwrap();
             let bmp = encode_bmp4(&indexed).unwrap();
             eprintln!(
                 "target={target:?} elapsed_ms={} bytes={}",

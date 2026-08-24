@@ -1,53 +1,84 @@
 # Rendering reference and regression policy
 
-The production server is pure Rust. JavaScript is used only to regenerate development fixtures from the pinned `vendor/epdoptimize` submodule.
+The production server is pure Rust. JavaScript and Chromium are development-only oracles used to regenerate committed fixtures; neither is present in the runtime image.
 
-## Pinned upstream
+## Pinned upstream behavior
 
-- Repository: `https://github.com/paperlesspaper/epdoptimize.git`
-- Release: `v1.2.0`
-- Commit: `555c7a3c42d9233a17b26ec399f3d57340dde8f5`
-- License: Apache-2.0; the upstream `LICENSE` remains in the submodule.
+Profile version 2 follows the PaperlessPaper offline web editor's observable default-plus-auto flow:
 
-After initializing submodules, regenerate the deterministic reference fixture with:
+- Offline firmware/web repository: `https://github.com/paperlesspaper/paperlesspaper-firmware-offline`
+- Commit: `0961aa69ffeddfe505f7a2bb4b7c45f49308b2d6`
+- Reference implementation: `web/src/GeneratePicture.js` and `web/src/app.js`
+- epdoptimize package: `1.2.0`
+- npm integrity: `sha512-0wZbhbP8lEmvei1Maacqn0dCcFCuAIlOZSNYDfRKwl6n9NUlVQz9OA42IE9V2PwB/UsSmFy/y9VBiPUIVMSKmQ==`
+- epdoptimize source commit/submodule: `555c7a3c42d9233a17b26ec399f3d57340dde8f5`
+- Browser fixture oracle: Chromium `147.0.7727.137`
+
+The web package declares ISC; epdoptimize is Apache-2.0 and retains its license in the submodule. Reference code is not compiled into the server.
+
+## GeneratePicture-compatible profile
+
+`src/epd_profile.rs` defines the fixed `generate_picture_auto_v2` profile. It deliberately has typed fields that can later back user-facing controls, but no additional tuning controls are currently exposed or persisted.
+
+The built-in profile reproduces these web defaults:
+
+- `spectra6Custom` calibrated colors in black/white/blue/green/red/yellow order: `#1f2226`, `#d6d6d6`, `#416ce1`, `#067406`, `#ea4843`, `#dbd529`;
+- hardware indices `0,6,1,2,3,5` for that order;
+- Auto-Optimieren with intent `natural`;
+- the web selector's Floyd–Steinberg override after recommendation;
+- serpentine scanning;
+- zero manual exposure, contrast, and saturation before the per-image auto recommendation.
+
+The Rust stages are intentionally separate:
+
+1. `renderer::prepare_analysis_canvas` and `prepare_framebuffer` preserve aspect ratio, center on white, and apply the web editor's orientation-mismatch transform. Paper L analyzes 600×800 then redraws independently at 1200×1600; Paper 7 analyzes and renders at 800×480.
+2. `epd_auto` ports epdoptimize image-style sampling/classification and the GeneratePicture-reachable natural recommendation behavior, including the web app's observable option-merging quirks.
+3. `epd_processing` applies reachable paper normalization, exposure/saturation/contrast or S-curve tone mapping, display/auto range fitting with chroma guard and white preservation, luma levels, and RGB/LAB conversion.
+4. `epd_pipeline` performs GeneratePicture's forced serpentine Floyd–Steinberg path against calibrated colors and maps palette positions directly to hardware indices.
+5. `renderer::encode_bmp4` emits the web-compatible top-down 4-bit BMP with a 118-byte header.
+
+The removed profile-v1 path used ideal native colors, RGB565 input, clean-color snapping, firmware integer error buffers, nearest-neighbor staged resize, stretching, and non-serpentine scanning. None of those operations remains in `ServerDitherBmp`.
+
+## Oracle fixtures and regeneration
+
+Initialize and build the pinned epdoptimize submodule, then regenerate RGBA algorithm fixtures:
 
 ```sh
+git submodule update --init vendor/epdoptimize
 npm ci --prefix vendor/epdoptimize
 npm run build --prefix vendor/epdoptimize
-node tools/generate_epdoptimize_fixtures.mjs
-cargo test dither::tests::matches_pinned_epdoptimize_error_diffusion_fixtures_exactly
+node tools/generate_generate_picture_fixtures.mjs
+cargo test epd_auto::tests::matches_generate_picture_auto_oracle_cases
 ```
 
-`tests/fixtures/epdoptimize-v1.2.0-error-diffusion.json` fixes diagnostic input RGBA bytes, the ideal Spectra 6 palette, every scoped error-diffusion kernel, both scan modes, upstream commit, and expected palette indices. `tests/fixtures/epdoptimize-v1.2.0-photo-like.json` adds a larger deterministic scene-like sample with gradients, sky, foliage, skin-like midtones, shadows, and highlights for representative kernels and both scan modes. Comparison is exact. The Rust implementation reproduces upstream `clampByte` (`Math.round` after clamping), immediate byte clamping, RGB distance tie order, mirrored offsets for serpentine rows, and edge clipping. There is currently no approximate upstream case; adding one requires a documented fixed metric and threshold before its golden is accepted.
+`tests/fixtures/generate-picture-auto-v2.json` covers ordinary, low-contrast, and high-contrast photos; flat illustration; line art; text/UI; pixel art; warm poster paper; grayscale; and transparency. It records source RGBA, classification/recommendation data, adjusted RGBA, palette positions, packed output, and hashes. Two clean generations must be identical.
 
-## Scoped Rust port
+The actual-browser fixtures use the upstream web application itself:
 
-The Rust core includes RGB quantization and these v1.2.0 maps: Floyd–Steinberg, false Floyd–Steinberg, Atkinson, Jarvis, Jarvis–Judice–Ninke, Stucki, Burkes, Sierra 3, Sierra 2, Sierra 2-4A, Fan, Shiau–Fan, and Shiau–Fan 2. Ordered, random, LAB/chroma, whole-image, automatic recommendation, tone/range, and edge-processing paths are intentionally outside the accepted subset.
+```sh
+npm ci --prefix tools/oracle
+npm run --prefix tools/oracle install-browser
+OFFLINE_FIRMWARE_DIR=/path/to/paperlesspaper-firmware-offline \
+CHROMIUM_PATH=/path/to/pinned/chromium \
+node tools/oracle/generate_browser_fixtures.mjs
+```
 
-## Firmware-compatible production profile
+`OFFLINE_FIRMWARE_DIR` must be checked out at the commit above. The generator loads source PNGs through the real UI, selects each display, clicks Auto-Optimieren, and downloads the resulting BMP. `tests/fixtures/browser/metadata.json` records provenance and hashes.
 
-`src/renderer.rs` defines profile version 1 from the checked-out offline firmware revision `0961aa6`:
+Canonical target-sized Paper 7 and Paper L sources are byte-identical between Rust and Chromium. Browser Canvas resampling is implementation-specific, so resized/letterboxed/rotated fixtures use explicit perceptual bounds after isolating exact algorithm parity:
 
-- ideal native colors and nibble values `0,1,2,3,5,6`;
-- clean-color thresholds from `snapColor`;
-- squared RGB nearest-color matching and firmware palette tie order;
-- left-to-right Floyd–Steinberg integer propagation using `7/16, 3/16, 5/16, 1/16` and explicit arithmetic right-shift behavior;
-- JPEGDEC-like RGB565 channel precision;
-- firmware width thresholds for 1/2, 1/4, and 1/8 prescaling followed by nearest-neighbor full-frame resize;
-- no tone mapping, dynamic-range compression, or serpentine scan.
+- one-eighth box-filtered SSIM must be at least `0.97`;
+- each hardware color's coverage ratio may differ by at most `0.02`;
+- exact mismatch counts and measured results are recorded in `tests/fixtures/browser/parity-report.json`.
 
-Intentional deviations are deterministic and tested:
+Current resized results are SSIM `0.996190762` for Paper 7 and `0.997071284` for rotated Paper L, with maximum color-coverage deltas `0.002679687` and `0.000109375` respectively.
 
-- Rust decoders apply exposed metadata orientation and support non-JPEG raster sources.
-- Alpha is composited onto white.
-- Error buffers use `i32` rather than the firmware's `int16_t`, avoiding overflow on pathological rows.
-- Paper L output follows the Web UI/streamer canonical `1200x1600` packed BMP rather than reproducing the firmware's inconsistent on-device `1600x1200` conversion layout.
-- Animated inputs use the first frame.
+The older general epdoptimize core fixtures remain useful: `tools/generate_epdoptimize_fixtures.mjs` verifies every scoped diffusion kernel in both scan directions against the same pinned epdoptimize release.
 
-The 4-bit BMP encoder is tested independently for top-down height, 118-byte header, row stride, palette table, nibble order, dimensions, and total length. Dithered previews are decoded from the same indexed representation used to construct the BMP. The committed `tests/fixtures/visual/paper7-{landscape,portrait}.png` files provide manually reviewed full-frame visual regressions; automated tests enforce their dimensions and six-color-only pixels.
+## Migration, format, and limits
 
-## Performance and limits
+`RENDER_PROFILE_VERSION = 2`. Queue entries retain their renderer profile. Startup rerenders profile-v1 server-dithered derivatives from retained immutable sources before serving them; the existing transactional publication and settings rollback boundaries prevent mixed-profile visibility.
 
-Rendering is serialized through one application-wide semaphore, runs in blocking workers, and is complete before frame serving; HTTP frame requests only read stored derivatives. On the development Windows host, the ignored release benchmark (`cargo test --release renderer::tests::benchmark_full_frame_profiles -- --ignored --nocapture`) rendered a synthetic 1600×1200 source to Paper 7 in 13 ms and Paper L in 58 ms, producing 192,118-byte and 960,118-byte BMPs. These measurements are smoke baselines rather than cross-machine latency guarantees.
+Paper 7 output is 800×480 and 192,118 bytes; Paper L is 1200×1600 and 960,118 bytes. The BMP encoder, preview encoder, and independent image decoder tests verify dimensions, top-down rows, palette table, nibble order, and exact preview/served pixels.
 
-Encoded uploads retain the configured request limit. All supplier/upload sources have an additional hard 100 MiB encoded limit. Decoders reject dimensions above 20,000 pixels per axis and allocations above 256 MiB. A single render is admitted at a time, so peak concurrent framebuffer/error-buffer use is bounded even when upload, preview, refill, and settings requests overlap.
+Encoded sources remain limited to 100 MiB, 20,000 pixels per axis, and 256 MiB decoded allocation. Rendering is serialized by one application-wide semaphore and runs in blocking workers. HTTP frame requests only read validated stored derivatives. The ignored release smoke benchmark on the development host completed Paper 7 in 61 ms and Paper L in 168 ms, producing 192,118-byte and 960,118-byte BMPs; these measurements are regression evidence, not cross-machine guarantees.
