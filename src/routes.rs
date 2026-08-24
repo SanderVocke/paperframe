@@ -1402,6 +1402,42 @@ mod tests {
             )
             .unwrap();
         }
+
+        let snapshot = state.settings.snapshot().await;
+        let mut form = SettingsForm::from_settings(
+            snapshot.generation,
+            state.csrf_token(),
+            &snapshot.settings,
+        );
+        form.output_mode = "direct_jpeg".into();
+        let response = router(state.clone())
+            .oneshot(
+                Request::post("/settings")
+                    .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
+                    .body(Body::from(serde_urlencoded::to_string(form).unwrap()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::SEE_OTHER);
+        assert_eq!(
+            state
+                .settings
+                .snapshot()
+                .await
+                .settings
+                .rendering
+                .output_mode,
+            OutputMode::DirectJpeg
+        );
+        for entry in state.queue.snapshot().await.entries {
+            let prepared = state.queue.prepare(&entry.id).await.unwrap();
+            assert_eq!(prepared.entry.media_type, "image/jpeg");
+            assert_eq!(
+                image::guess_format(&prepared.bytes).unwrap(),
+                image::ImageFormat::Jpeg
+            );
+        }
     }
 
     #[tokio::test]

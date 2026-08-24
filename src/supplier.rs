@@ -277,11 +277,12 @@ mod tests {
         let queue = directory.path().join("queue");
         std::fs::create_dir(&photos).unwrap();
         std::fs::create_dir(&queue).unwrap();
-        std::fs::write(
-            photos.join("a.jpg"),
-            include_bytes!("../tests/fixtures/images/a.jpg"),
-        )
-        .unwrap();
+        let image = image::RgbaImage::from_pixel(2, 3, image::Rgba([10, 20, 30, 200]));
+        let mut png = Vec::new();
+        image::DynamicImage::ImageRgba8(image)
+            .write_to(&mut std::io::Cursor::new(&mut png), image::ImageFormat::Png)
+            .unwrap();
+        std::fs::write(photos.join("a.png"), png).unwrap();
         std::fs::write(
             photos.join("b.jpg"),
             include_bytes!("../tests/fixtures/images/b.jpg"),
@@ -293,7 +294,7 @@ mod tests {
             id: "digi".into(),
             kind: SupplierKind::DigikamSqlite(DigikamSettings {
                 database_path: database,
-                query: "SELECT 2 AS image_id, '/library' AS root_path, '/' AS album_path, 'b.jpg' AS file_name UNION ALL SELECT 1, '/library', '/', 'a.jpg'".into(),
+                query: "SELECT 2 AS image_id, '/library' AS root_path, '/' AS album_path, 'b.jpg' AS file_name UNION ALL SELECT 1, '/library', '/', 'a.png'".into(),
                 path_mappings: vec![crate::config::PathMapping { database_root: "/library".into(), mounted_root: photos }],
                 max_candidates: 10,
             }),
@@ -310,7 +311,7 @@ mod tests {
                 .iter()
                 .map(|item| item.display_name.as_str())
                 .collect::<Vec<_>>(),
-            vec!["b.jpg", "a.jpg"]
+            vec!["b.jpg", "a.png"]
         );
     }
 
@@ -360,8 +361,10 @@ mod tests {
         image::DynamicImage::ImageRgba8(image)
             .write_to(&mut std::io::Cursor::new(&mut png), image::ImageFormat::Png)
             .unwrap();
-        std::fs::write(dir.path().join("photo.png"), png).unwrap();
+        std::fs::write(dir.path().join("photo.png"), &png).unwrap();
         std::fs::write(dir.path().join("ignored.txt"), b"not an image").unwrap();
+        std::fs::create_dir(dir.path().join("nested")).unwrap();
+        std::fs::write(dir.path().join("nested/photo.png"), png).unwrap();
         let supplied = scan_manual(dir.path(), &BTreeSet::new(), 10).unwrap();
         assert_eq!(supplied.len(), 1);
         assert_eq!(supplied[0].display_name, "photo.png");

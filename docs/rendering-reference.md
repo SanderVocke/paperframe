@@ -44,7 +44,7 @@ Intentional deviations are deterministic and tested:
 - Paper L output follows the Web UI/streamer canonical `1200x1600` packed BMP rather than reproducing the firmware's inconsistent on-device `1600x1200` conversion layout.
 - Animated inputs use the first frame.
 
-The 4-bit BMP encoder is tested independently for top-down height, 118-byte header, row stride, palette table, nibble order, dimensions, and total length. Dithered previews are decoded from the same indexed representation used to construct the BMP.
+The 4-bit BMP encoder is tested independently for top-down height, 118-byte header, row stride, palette table, nibble order, dimensions, and total length. Dithered previews are decoded from the same indexed representation used to construct the BMP. The committed `tests/fixtures/visual/paper7-{landscape,portrait}.png` files provide manually reviewed full-frame visual regressions; automated tests enforce their dimensions and six-color-only pixels.
 
 ## Performance and limits
 

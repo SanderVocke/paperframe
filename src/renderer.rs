@@ -659,6 +659,27 @@ mod tests {
     }
 
     #[test]
+    fn committed_visual_regressions_are_full_frame_and_six_color() {
+        for fixture in [
+            include_bytes!("../tests/fixtures/visual/paper7-landscape.png").as_slice(),
+            include_bytes!("../tests/fixtures/visual/paper7-portrait.png").as_slice(),
+        ] {
+            let image = image::load_from_memory_with_format(fixture, ImageFormat::Png)
+                .unwrap()
+                .into_rgb8();
+            assert_eq!(
+                image.dimensions(),
+                FrameTarget::Paper7.physical_dimensions()
+            );
+            assert!(image.pixels().all(|pixel| {
+                DEVICE_PALETTE
+                    .iter()
+                    .any(|(_, color)| pixel.0 == [color.r, color.g, color.b])
+            }));
+        }
+    }
+
+    #[test]
     #[ignore = "release-mode rendering benchmark smoke test"]
     fn benchmark_full_frame_profiles() {
         let input = source(1600, 1200);
