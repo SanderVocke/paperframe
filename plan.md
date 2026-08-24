@@ -1,138 +1,161 @@
-# Generic Image Modes and Sequential Folder Mode Plan
+# Rust Server-Side E-Paper Rendering Plan
 
 ## Goals
 
-Evolve the single-process Rust server so that frame serving, health/status reporting, and the settings interface are mode-independent, while image discovery and advancement behavior are supplied by an active image mode.
-
-- Preserve DigiKam SQLite daily selection as a fully working mode with its current safety and scheduling behavior.
-- Add a writable server-folder mode that serves JPEGs sequentially in filename order, advancing once per frame `GET` and wrapping after the last image.
-- Make folder contents visible as an ordered thumbnail queue and support safe web-based reordering, upload, and explicit refresh from disk.
-- Deliver both modes end-to-end through the existing frame URL and one settings/status interface.
+- Add a pure-Rust image-processing pipeline that ports the deterministic `epdoptimize` behavior needed by this project and validates the port against a pinned upstream reference.
+- Make the production rendering profile hard-coded and versioned so its resizing, six-color palette mapping, and Floyd–Steinberg behavior match the offline firmware's on-device JPEG path as closely as practical.
+- Decode supported raster source formats, preserve an immutable queued source, and create the frame representation at enqueue time: a firmware-compatible 4-bit BMP in server-dither mode or a JPEG in direct-JPEG mode.
+- Infer portrait or landscape from each decoded image, let the user override that value per queue entry, and rotate the rendered framebuffer so either orientation uses the panel's full pixel area when the user physically repositions the frame.
+- Add non-advancing dithered previews and the required global/per-image controls to the existing settings interface without weakening queue, source-confinement, advancement, or persistence guarantees.
 
 ## Scope
 
 Included:
 
-- A mode discriminator and mode-specific settings/runtime abstractions designed to admit future image sources without putting mode branches throughout HTTP handlers.
-- Compatibility handling for existing DigiKam settings and preservation of DigiKam query, source-confinement, cache, scheduler, and conditional-request behavior.
-- One configured top-level folder containing regular JPEG files; startup scanning and explicit refresh establish the in-memory queue.
-- Sequential frame serving, queue/cursor status, thumbnail display, reordering by filesystem rename, and bounded JPEG upload.
-- Serialized folder mutations, CSRF protection, stale-inventory protection, safe filenames/path confinement, and actionable errors.
-- Updated examples, documentation, unit/integration tests, and release-level end-to-end validation.
+- A pinned `epdoptimize` v1.2.0 reference and committed regression fixtures generated from it; the reference implementation is development/test provenance, not a production runtime dependency.
+- A Rust port of RGB nearest-palette quantization, non-serpentine and serpentine error diffusion, and all v1.2.0 named error-diffusion kernels: Floyd–Steinberg, Atkinson, false Floyd–Steinberg, Jarvis/Jarvis–Judice–Ninke, Stucki, Burkes, Sierra 3, Sierra 2, Sierra 2-4A, Fan, Shiau–Fan, and Shiau–Fan 2.
+- Explicit Spectra 6 calibrated/native palette handling and the fixed ideal six-color palette used by the firmware.
+- A separate, versioned firmware-compatible production profile: RGB matching, ideal Spectra 6 colors, clean-color snapping, Floyd–Steinberg weights, left-to-right scanning, no tone/range adjustment, and firmware-like nearest-neighbor resizing.
+- Global frame-output settings for target hardware (`paper_7` or `paper_l`) and serving mode (`server_dither_bmp` or `direct_jpeg`). Dither algorithm parameters remain code constants rather than user-editable settings.
+- Raster formats enabled by the selected Rust image-decoding crate, with byte-level decoding as the authority; documentation will list the exact compiled codec set. Animated formats use their first frame, and alpha is composited onto white.
+- Enqueue-time source validation, EXIF-aware dimensions where supported, orientation inference and persistence, derived BMP/JPEG publication, existing-queue migration, global-mode/target changes, per-entry orientation rerendering, original and dithered previews, and updated documentation/tests.
 
 Not included:
 
-- Recursive folder traversal, filesystem watching, remote/cloud sources, non-JPEG frame output, resizing/transcoding, or generated thumbnail files.
-- Multiple independent frames/cursors, per-client queues, persisted request history, or persistence of the folder cursor across process restarts.
-- Authentication, authorization, TLS, multiple replicas, or distributed filesystem coordination.
-- Changing DigiKam records or DigiKam-managed source files.
+- A JavaScript or Node.js production renderer, runtime calls to `epdoptimize`, or depending on browser-side rendering for supplier imports.
+- Full v1.2.0 parity for ordered/random/blue-noise/Hilbert/experimental modes, automatic recommendations, LAB/chroma matching, tone mapping, dynamic-range compression, clarity, edge processing, or image-derived palettes. These may be added later without changing the production profile.
+- User-editable dither kernels, palette calibration, tone controls, crop controls, or per-entry arbitrary rotation angles.
+- Animation playback, SVG/PDF/vector rendering, recursive manual-folder scanning, multiple frame targets, authentication/TLS, or changing firmware code.
 
 ## Immutable acceptance criteria
 
-1. The application remains one gracefully shutting-down Rust process and continues to expose `GET`/`HEAD /frame/current.jpg`, `/settings`, `/health/live`, and `/health/ready`.
-2. Settings identify an active image mode and isolate mode-specific configuration behind a clear mode boundary. Existing settings without a mode discriminator have a tested compatibility path to DigiKam mode, and the example configuration documents the canonical new format.
-3. DigiKam SQLite remains selectable as a mode and retains its existing read-only database/query enforcement, path confinement, `first`/`daily_random` choices, startup/daily/settings-triggered selection, atomic cache publication, failure retention, and status reporting.
-4. Folder mode has a configured writable server-side directory that is canonicalized and validated as separate from the cache and settings file. Only top-level regular, non-symlink JPEG files are eligible; unrelated, nested, temporary, unsafe, and unsupported files are not served.
-5. Folder inventory is loaded at startup and only changes through a successful upload, reorder, or explicit web refresh. Refresh detects eligible files added or removed manually on the server and reports scan/validation errors without corrupting the last valid in-memory queue.
-6. A newly initialized or refreshed folder queue is sorted deterministically by filename. Its first successful frame `GET` returns the first image, later successful frame `GET`s return successive images, and the sequence wraps after the final image.
-7. Folder cursor state is runtime-only. Restart and successful queue mutations reset the next image to the first item in the resulting order; this behavior is shown in status and documented.
-8. Each folder-mode frame `GET` atomically reserves/prepares exactly one queue item so concurrent requests cannot accidentally receive the same cursor position or race through a mutable shared `current.jpg`. A failed preparation does not advance the cursor. `HEAD`, thumbnail requests, health checks, and settings actions never advance it.
-9. Because folder mode changes the representation on each frame `GET`, its successful `GET`s return the next JPEG body rather than an incorrect `304`, and use explicit response cache policy appropriate for a rotating URL. DigiKam mode retains its current `Last-Modified`/`If-Modified-Since` behavior.
-10. An empty folder queue returns `404` from the frame endpoint and `503` from readiness. Folder readiness becomes successful when the active inventory contains a servable image; liveness remains independent of mode readiness.
-11. The settings/status page identifies the active mode and renders folder thumbnails in queue order, with an unambiguous next-image marker/cursor. Thumbnail retrieval uses a confined opaque identifier or equivalent safe lookup and does not expose arbitrary filesystem paths.
-12. A CSRF-protected reorder action accepts a complete ordering of the current inventory, rejects stale, duplicate, missing, or foreign entries, and renames the underlying files so ordinary alphabetical filename sorting reproduces the submitted order after refresh and restart.
-13. Reordering uses collision-safe generated names and a serialized two-phase/rollback-capable rename procedure so existing files are not overwritten and an error is not presented as a successful partial reorder. Temporary names are confined to the folder and recoverable/cleaned on startup or refresh.
-14. A CSRF-protected multipart upload accepts one or more bounded JPEG files, rejects traversal names, symlinks, non-JPEG content, oversized bodies/files, and collisions safely, publishes through `create_new` temporary files plus sync/rename, appends successful uploads deterministically, and never overwrites an existing image.
-15. Folder refresh, upload, reorder, cursor advancement, mode changes, and shutdown are coordinated so filesystem I/O occurs outside async locks where practical while inventory generations and mutation locks prevent lost updates and inconsistent queue state.
-16. Every settings or folder mutation uses POST/Redirect/GET on success and returns escaped, actionable feedback on failure. CSRF-invalid, stale-generation, invalid-mode, invalid-path, malformed multipart, and failed filesystem operations leave active settings/inventory and unrelated files unchanged.
-17. The settings UI can configure and activate each mode without exposing DigiKam-only controls as if they applied to folder mode. Switching to DigiKam triggers immediate selection; switching to folder mode validates/scans the folder immediately and disables DigiKam rollover work while inactive.
-18. Automated tests cover compatibility parsing, mode dispatch/switching, all existing DigiKam behavior, folder ordering/wrap/concurrency/failure behavior, refresh, upload, rename persistence/rollback, traversal/symlink/collision defenses, thumbnails, CSRF/stale updates, readiness, and frame caching semantics.
-19. Documentation explains both modes, writable/read-only storage boundaries, folder naming side effects, cursor/reset/cache behavior, upload limits, manual refresh, one-replica requirement, endpoint behavior, setup, and security limitations.
-20. The final release binary passes a clean end-to-end exercise of both modes, including actual HTTP settings/folder actions and restart persistence of reordered/uploaded filenames, with the full formatting, lint, test, and release-build suite passing.
+1. Production builds and normal automated tests remain a single Rust application with no Node.js, browser, JavaScript engine, ImageMagick, or native canvas runtime requirement.
+2. The Rust dither module implements RGB quantization plus every named v1.2.0 error-diffusion kernel listed in Scope, including deterministic palette tie-breaking, edge clipping, alpha handling at the renderer boundary, and optional serpentine traversal.
+3. Committed fixtures identify the pinned upstream commit, options, input RGBA bytes, palette, and expected palette-index output. Deterministic core cases match `epdoptimize` exactly where arithmetic semantics permit; every documented approximation has a fixed, reviewed tolerance and a regression test that fails when that tolerance is exceeded.
+4. A second set of characterization fixtures covers the offline firmware algorithm. The production profile fixes RGB matching, ideal black/blue/green/red/yellow/white colors, firmware clean-color thresholds, Floyd–Steinberg `7/16, 3/16, 5/16, 1/16` diffusion, non-serpentine scanning, integer/clamping behavior, no tone mapping, and firmware-like nearest-neighbor scaling. Intentional deviations are documented and regression-tested.
+5. The target setting supports Paper 7 (`800x480` physical framebuffer) and Paper L (`1200x1600` physical framebuffer). Generated BMPs use those exact dimensions and the firmware nibble mapping `0=black, 1=blue, 2=green, 3=red, 5=yellow, 6=white`.
+6. Source orientation is inferred after metadata orientation is applied: `height > width` is portrait and all other dimensions are landscape. The inferred value is stored per queue entry and can be overridden to portrait or landscape through a CSRF- and queue-generation-protected action.
+7. Rendering first fills the orientation-appropriate logical panel dimensions, then applies one documented 90-degree direction when logical and physical panel orientations differ. Portrait and landscape results consume the full physical framebuffer with no accidental letterboxing; the user-facing documentation explains how to rotate the physical frame to match.
+8. Manual-folder discovery, DigiKam supply, and direct upload accept every regular raster format enabled in the chosen Rust decoder, reject undecodable/mislabeled/oversized/unsafe inputs without publishing a queue entry, and retain current path-confinement and non-symlink guarantees.
+9. Each queue entry durably owns an immutable source plus metadata and a validated served derivative. In server-dither mode the derivative is a top-down, uncompressed 4-bit BMP with a valid header; in direct-JPEG mode it is a valid JPEG, preserving a suitable JPEG source without recompression where safe and converting other supported formats with fixed encoder settings.
+10. Enqueue publishes source, derivative, metadata, seen-history changes, and the descriptor as one recoverable queue mutation. Decode/render/write failure publishes none of them, does not mark the supplier candidate seen, and leaves the prior queue servable.
+11. Changing the global serving mode or frame target applies consistently to the whole queue from retained originals before the new setting becomes active. Failure leaves the old setting and all old served representations active; clients never observe a mixed global mode.
+12. The frame endpoint serves the stored derivative without rendering on request, with correct `Content-Type`, length, caching, `GET`/`HEAD`, readiness, and completed-fetch advancement behavior. A `.bmp` canonical/alias route may be added, but existing configured `/frame/current.jpg` clients retain a tested compatibility path.
+13. Original preview remains non-advancing. A dithered-preview option returns a browser-displayable, six-color preview produced by the same profile, target, and per-entry orientation as frame rendering; requesting either preview never advances or mutates queue order.
+14. The settings UI exposes the global target and serving mode, labels each entry's inferred/overridden orientation, and provides accessible portrait/landscape and original/dithered-preview controls. Mutations retain CSRF, stale-generation, escaped-error, and POST/Redirect/GET behavior.
+15. Existing version-1 JPEG queues and legacy `current.jpg` migration have a tested upgrade path that preserves queue order, IDs where practical, supplier seen history, and source bytes, and either produces valid derivatives or fails startup without deleting the old valid data.
+16. Rendering and bulk rerendering are bounded, occur off Tokio executor threads, do not hold async/global locks during CPU-heavy work, and retain the one-process/one-replica and trusted-LAN operational model.
+17. Automated coverage includes dither parity and approximation bounds, firmware-profile characterizations, codec acceptance/rejection, resize/rotation, BMP packing, JPEG conversion, queue transaction failure, migration, settings transitions, orientation overrides, preview/frame routes, HTTP headers, advancement, readiness, restart recovery, and security/staleness cases.
+18. Documentation and configuration examples describe supported source formats, first-frame/alpha behavior, target selection, serving modes, orientation convention, migration/storage impact, firmware URL setup, and why dither settings are intentionally hard-coded.
+19. The final clean-checkout validation passes formatting, strict linting, all tests, and a release build, and demonstrates both output modes and both image orientations through actual HTTP requests.
 
 ## Design rules and important constraints
 
-- Introduce a small mode contract for validation/activation, frame preparation, readiness, status, and settings presentation; keep shared routing, request tracking, response construction, health, and security concerns outside source-specific modules.
-- Represent mode-specific settings with strongly typed tagged data. Keep compatibility parsing explicit and tested rather than weakening validation with broadly optional fields.
-- Keep DigiKam source capabilities read-only and cache-owned writes unchanged. Model the folder directory separately as application-managed writable storage; never reuse its mutation capability for DigiKam paths.
-- Canonicalize roots and resolve every inventory/thumbnail/frame operation beneath the configured folder. Operate on regular files without following symlinks and never trust browser filenames or form-provided paths.
-- Define one deterministic filename comparison and one generated ordering-name format. Preserve a safe human-recognizable basename where possible, prevent prefix accumulation, and resolve duplicate/colliding names without overwriting.
-- Serialize scans and folder mutations. Use inventory generation tokens for browser actions and temporary same-directory files/names for upload and batch rename; sync successful durable mutations before publishing the new in-memory inventory.
-- Treat a refresh or mutation as a transaction from the runtime's perspective: build and validate a complete replacement inventory before swapping it in. Preserve the prior inventory and cursor when an operation fails.
-- Reset the folder cursor only for startup, active-mode activation, and successful inventory-changing actions. Merely viewing settings/status must not alter order or cursor.
-- Prepare a stable response source before committing cursor advancement, and define/test concurrent GET ordering. Do not infer successful device display or body receipt after the server has handed off a response.
-- Keep blocking directory scans, JPEG inspection, renames, syncs, and large file operations off Tokio executor threads. Bound upload request/file sizes and avoid holding global state locks during body transfer.
-- Use dedicated mutation endpoints/forms for settings, refresh, reorder, and upload, all protected by the existing per-process CSRF token. Retain automatic HTML escaping and generation-based lost-update protection.
-- Render browser thumbnails from the original JPEG through a non-advancing, confined endpoint and CSS sizing unless implementation evidence requires image processing; do not add transformation scope speculatively.
-- Retain one-process/one-replica deployment assumptions and trusted-LAN security boundary. Commit `Cargo.lock` when dependencies change.
+- Treat the upstream `epdoptimize` tag/commit and offline firmware revision as test oracles. Record provenance in fixture manifests and never silently refresh golden outputs.
+- Keep the reusable dither engine independent of HTTP, queue persistence, image decoding, and BMP/JPEG encoding. Represent dither output internally as palette indices so correctness and nibble packing can be tested separately.
+- Keep the production profile in one typed constant/versioned module. UI/configuration may select output mode and panel target, but must not reconstruct or partially override algorithm parameters.
+- Distinguish upstream parity from firmware compatibility: use upstream fixtures for the generic Rust kernels and firmware fixtures for snapping, fixed-point error propagation, decode downscaling, and final palette-index behavior.
+- Use deterministic arithmetic, scan order, palette order, resampling, alpha background, and JPEG encoder settings. If exact JS floating-point parity is required, use explicit `f64`; if ESP signed-shift behavior is required, encode that rounding rule explicitly rather than relying on platform behavior.
+- Decode and validate before accepting a candidate. Enforce encoded-byte, decoded-dimension, decoded-pixel, and render-memory limits to prevent decompression bombs and unbounded CPU/memory use.
+- Store source and derivative under opaque confined names. Extend the descriptor with explicit media type, source/derivative digests and lengths, source dimensions, orientation value/source, renderer profile version, and target; do not infer durable state from filename extensions.
+- Publish files with `create_new`, sync, rename, descriptor replacement, and startup cleanup/recovery consistent with current queue guarantees. Never overwrite or discard the last known-good representation before its replacement is complete.
+- Preserve frame serving as static file I/O. Perform enqueue/rerender work in bounded blocking tasks before queue publication, and define deterministic ordering when a settings-wide rerender races with enqueue/remove/reorder.
+- Keep source-format support aligned between DigiKam, manual folder, uploads, validation messages, HTML `accept`, examples, and tests. Content decoding is authoritative even when extension filtering is used to avoid opening unrelated files.
+- Preserve current queue identity/seen semantics: source identity derives from original bytes and supplier key, not the rendered derivative, so profile or orientation changes do not make a photo newly eligible.
+- Use the actual packed BMP as the source of truth for dithered preview, or prove byte-for-byte that a preview generated earlier in the pipeline has the same palette indices.
+- Retain existing request completion semantics: HTTP completion can advance the queue but does not claim that the frame decoded or displayed the derivative.
+- Commit `Cargo.lock`, migration logic, fixture provenance, and required license/attribution when dependencies or vendored references change.
 
 ## Implementation stages
 
-### Stage 1 — Generic configuration and mode boundary
+### Stage 1 — Pin references and define parity contracts
 
-- [x] Add strongly typed active-mode settings with explicit DigiKam and folder variants, compatibility deserialization for the existing DigiKam settings shape, per-mode validation, and updated example TOML.
-- [x] Define mode-neutral frame metadata/status/readiness interfaces and refactor shared app state so routes and health checks do not depend directly on `SelectionResult` or DigiKam scheduler fields.
-- [x] Move current DigiKam selection/scheduling behavior behind the DigiKam mode implementation without changing its source/cache capability boundary.
-- [x] Add tests for old/new settings loading and persistence, invalid/mixed mode fields, mode-specific validation, and unchanged DigiKam selection behavior.
-- [x] Verify with `cargo fmt --check`, strict Clippy, and the full tests; commit the generic configuration/mode milestone.
+- [ ] Add the `epdoptimize` v1.2.0 source as a pinned development/reference submodule or equivalent immutable fixture-generation reference, record its commit and Apache-2.0 attribution, and ensure production Cargo/Docker builds do not depend on it being executable.
+- [ ] Inventory v1.2.0 palette ordering, diffusion maps, scan/edge/tie behavior, and numeric operations for the scoped algorithms; separately transcribe the checked-out firmware palette, snapping, JPEG scale thresholds, integer diffusion, framebuffer dimensions, and BMP expectations.
+- [ ] Create a deterministic fixture generator that accepts raw RGBA inputs and explicit options, emits palette-index goldens plus a manifest, and includes tiny diagnostic patterns, gradients, hard palette ties, edges, odd dimensions, alpha, and representative photos.
+- [ ] Add firmware characterization fixtures produced by a small faithful host-side reference or independently checked vectors, including negative error rounding, clean-color thresholds, nearest-neighbor resize mapping, and Paper 7/Paper L packing cases.
+- [ ] Document which comparisons must be exact and define fixed metrics/thresholds for any unavoidable approximate cases before accepting the Rust port.
+- [ ] Verify fixture regeneration from the pinned reference, stable fixture hashes across repeated runs, and license/provenance completeness; commit the reference/fixture-contract milestone.
 
-### Stage 2 — Folder inventory and safe filesystem operations
+### Stage 2 — Implement and verify the pure-Rust dither core
 
 Depends on Stage 1.
 
-- [x] Add a folder-mode module that canonicalizes/validates its managed root, recovers recognized temporary operations, scans only eligible top-level regular JPEGs, assigns safe opaque runtime identifiers, and builds a filename-sorted inventory.
-- [x] Implement synchronized inventory generation and cursor state with deterministic reset, sequential reservation/preparation, wraparound, no-advance-on-failure, and a snapshot API for status/UI.
-- [x] Implement explicit refresh as a complete validated inventory replacement while preserving the previous snapshot on failure.
-- [x] Implement bounded, content-validated multipart upload using confined `create_new` temporary files, collision-safe destination naming, sync/rename publication, and deterministic queue update.
-- [x] Implement complete-order validation and collision-safe two-phase renaming so refreshed alphabetical order matches the submitted order, including rollback/recovery behavior.
-- [x] Unit-test ordering, wrap/reset, empty/invalid folders, manual add/remove refresh, concurrent reservations, unreadable/deleted files, filename edge cases, traversal/symlink rejection, upload failures/collisions, reorder persistence, injected rename failure, and temporary recovery.
-- [x] Verify formatting, strict linting, and all tests; commit the folder storage/queue milestone.
+- [ ] Add typed palette, color, diffusion-kernel, scan, and indexed-image models with checked dimensions and deterministic palette tie-breaking.
+- [ ] Port RGB nearest-palette quantization and all scoped v1.2.0 diffusion maps, including forward and serpentine traversal, boundary clipping, error accumulation, and aliases such as Jarvis/Jarvis–Judice–Ninke.
+- [ ] Add table-driven unit tests for each kernel's weights/divisor, scan direction, edge behavior, palette ties, clamping, and malformed/overflowing inputs.
+- [ ] Run the committed upstream fixtures through the Rust engine and enforce exact index equality or the predeclared approximation metric; make mismatch diagnostics emit useful per-pixel counts/diffs without rewriting goldens.
+- [ ] Add property tests/invariants where useful: every output index belongs to the palette, dimensions are preserved, pure palette colors remain stable, deterministic runs are identical, and serpentine reversal mirrors the intended kernel offsets.
+- [ ] Benchmark representative Paper 7 and Paper L buffers and establish bounded memory/concurrency defaults suitable for enqueue-time processing.
+- [ ] Verify formatting, strict Clippy, dither unit/regression tests, and release-mode benchmark smoke tests; commit the Rust dither-core milestone.
 
-### Stage 3 — Mode-aware runtime, scheduler, frame serving, and health
+### Stage 3 — Add the firmware-compatible renderer and encoders
 
-Depends on Stages 1–2.
+Depends on Stage 2.
 
-- [x] Add active-mode activation/switching that validates and initializes the replacement runtime before publishing it, triggers immediate DigiKam selection or folder scan as applicable, and prevents inactive DigiKam rollover work.
-- [x] Refactor the scheduler/trigger loop to delegate only mode-relevant background work while preserving single-flight retries, graceful cancellation, and stale DigiKam cache retention.
-- [x] Refactor frame `GET`/`HEAD` through the generic mode contract: preserve DigiKam conditional responses, make folder `GET` advance and return the next body with rotating-resource cache headers, and make folder `HEAD` peek without advancing.
-- [x] Make readiness and status mode-aware while preserving common direct-peer last-GET tracking and error handling.
-- [x] Add integration tests for dynamic mode switches, startup activation, folder GET sequence/wrap, simultaneous GETs, failed GET/no advance, HEAD/no advance, mode-specific conditional headers, readiness transitions, request tracking, and shutdown during mode work.
-- [x] Verify formatting, strict linting, and all tests; commit the mode runtime/serving milestone.
+- [ ] Add pure-Rust raster decoding with an explicit codec feature list, first-frame behavior, white alpha compositing, metadata-orientation handling, and encoded/decoded resource limits.
+- [ ] Implement orientation inference and the deterministic logical-to-physical transform for Paper 7 and Paper L, including the fixed 90-degree convention and full-frame firmware-like nearest-neighbor resize path.
+- [ ] Implement the versioned production profile using the firmware ideal palette, clean-color snapping thresholds, non-serpentine Floyd–Steinberg kernel, explicit ESP-compatible integer rounding/clamping, and no hidden image-dependent adjustments.
+- [ ] Implement a 4-bit indexed BMP encoder/parser/validator with top-down rows, correct palette/header fields, firmware nibble mapping, exact dimensions, overflow checks, and no row-order or padding ambiguity.
+- [ ] Implement deterministic JPEG output for non-JPEG sources and safe pass-through rules for valid JPEG input, including fixed quality/subsampling/alpha behavior where encoding is required.
+- [ ] Implement a browser preview conversion from the final indexed/BMP representation to PNG or another reliably displayable lossless format without changing indices.
+- [ ] Test all supported codec families with small fixtures, corrupt/mislabeled/oversized files, square-image inference, both orientation transforms, both targets, alpha/animation rules, exact BMP bytes, firmware-profile vectors, and JPEG decodeability.
+- [ ] Verify generated BMPs with an independent parser and the offline firmware/Web-UI format expectations, then run formatting, strict linting, tests, and a release build; commit the renderer/encoder milestone.
 
-### Stage 4 — Folder settings, thumbnails, upload, refresh, and reorder UI
+### Stage 4 — Redesign queue persistence and enqueue-time rendering
 
-Depends on Stages 2–3.
+Depends on Stage 3.
 
-- [x] Update `/settings` to show active mode, shared runtime state, mode-appropriate configuration/status, and folder queue thumbnails in serving order with the next item clearly marked.
-- [x] Add a safe non-advancing thumbnail route resolved through the current inventory rather than user-provided filesystem paths.
-- [x] Add CSRF- and inventory-generation-protected forms/routes for explicit disk refresh, multipart upload, and complete queue reordering, with operation-specific body limits and POST/Redirect/GET success behavior.
-- [x] Ensure UI mode changes validate/activate transactionally and render escaped submitted values plus actionable errors without changing settings or runtime on failure.
-- [x] Test thumbnail ordering/content/non-advancement, successful and failed refresh/upload/reorder HTTP flows, stale inventory and settings generations, CSRF rejection, multipart/body limits, HTML escaping, PRG redirects, and filename changes visible after reload.
-- [x] Perform a browser-oriented accessibility/usability pass so ordering controls work without relying solely on drag-and-drop or JavaScript.
-- [x] Verify formatting, strict linting, and all tests; commit the complete web-interface milestone.
+- [ ] Introduce a versioned queue descriptor that records source and derivative metadata, orientation and whether it is inferred/overridden, renderer profile/target, media type, lengths, and digests while preserving supplier identity and seen history.
+- [ ] Split opaque queue storage into confined source and served-derivative objects, and update startup reconciliation, prepare/current/remove/reorder/advance, backup expectations, and digest validation for both files.
+- [ ] Refactor supplier and upload requests to carry general encoded raster bytes; broaden manual-folder discovery and DigiKam validation consistently with the decoder while retaining top-level-only, regular-file, non-symlink, and path-confinement rules.
+- [ ] Add a rendering service that decodes and renders batches in bounded blocking work before acquiring the short queue publication lock, then atomically publishes all source/derivative files, descriptor changes, and seen marks.
+- [ ] Implement server-dither enqueue to produce BMP and direct-JPEG enqueue to pass through or convert to JPEG; ensure failures skip/report supplier candidates or reject uploads without partial queue or seen-history changes.
+- [ ] Implement transactional whole-queue regeneration for global mode/target changes and single-entry regeneration for orientation overrides, with explicit coordination against concurrent enqueue/remove/reorder and last-known-good retention.
+- [ ] Add version-1 queue and legacy `current.jpg` migration/recovery, including interrupted temporary cleanup and a failure path that preserves old objects for diagnosis/rollback.
+- [ ] Test mixed source formats, batch truncation, render failures, publication/descriptor failures, concurrent mutations, global transition rollback, per-entry rerender rollback, restart, orphan cleanup, migration, source immutability, and unchanged queue advancement/order semantics.
+- [ ] Verify formatting, strict linting, all queue/renderer tests, and a release build; commit the queue/rendering integration milestone.
 
-### Stage 5 — Examples, operations documentation, and safety audit
+### Stage 5 — Mode-aware serving, previews, and web controls
 
-Depends on Stages 1–4.
+Depends on Stage 4.
 
-- [x] Update README/configuration examples for selecting both modes, compatibility/migration, folder permissions and separation, startup/refresh behavior, filename-based order and rename side effects, cursor resets/wrap, uploads, thumbnail endpoints, readiness, and mode-specific HTTP caching.
-- [x] Update container/Kubernetes-administrator guidance to distinguish read-only DigiKam mounts from the writable managed folder and retain the one-replica, trusted-LAN, non-root, persistent-storage, and graceful-shutdown requirements.
-- [x] Audit all open/create/remove/rename call sites and demonstrate that DigiKam remains immutable, folder writes remain under its canonical root, cache/settings writes remain under their roots, and all browser-controlled identifiers are confined.
-- [x] Verify the documented local setup from empty temporary directories, then run formatting, strict linting, tests, and a release build; commit the documentation/safety milestone.
+- [ ] Add validated global settings for frame target and output mode, compatibility defaults for existing settings files, canonical serialization, form parsing, and transaction ordering that prevents settings from selecting unbuilt derivatives.
+- [ ] Refactor frame response construction to use derivative media metadata and dynamic `Content-Type` while preserving completed-fetch serialization/advancement, `HEAD`, conditional requests, no-store behavior, readiness, last-request tracking, and body-drop semantics.
+- [ ] Preserve `/frame/current.jpg` as a tested compatibility endpoint and add/document a format-appropriate canonical endpoint or alias without causing redirects or duplicate advancement.
+- [ ] Keep original preview/thumbnail routes non-advancing and add a dithered-preview route based on the current production profile, target, and per-entry orientation; define bounded on-demand behavior when direct-JPEG mode has no stored BMP preview.
+- [ ] Add settings-page controls for target and global output mode, per-card inferred/overridden portrait/landscape controls, and an accessible original/dithered preview switch or links with clear current-mode/status labels.
+- [ ] Protect orientation and global mutations with CSRF and generation checks, render submitted values/errors safely, and retain POST/Redirect/GET on success.
+- [ ] Add route/template tests for BMP and JPEG bodies/headers, `GET`/`HEAD`/conditional/completed-fetch behavior, non-advancing previews, readiness during failed transitions, global settings persistence/staleness, orientation override/staleness, HTML escaping, and controls usable without drag-and-drop.
+- [ ] Perform a browser usability pass at desktop/mobile widths and verify that preview requests and settings-page asset caching never expose frame images through the service worker cache.
+- [ ] Verify formatting, strict linting, all tests, and a release build; commit the complete web/HTTP milestone.
 
-### Stage 6 — Final end-to-end validation
+### Stage 6 — Documentation, operations, and safety/performance audit
+
+Depends on Stages 1–5.
+
+- [ ] Update README, settings examples, UI help, and endpoint reference for codec support, image limits, first-frame/alpha rules, hard-coded profile behavior, target/output modes, portrait convention, physical-frame repositioning, BMP firmware configuration, and direct-JPEG conversion.
+- [ ] Document queue layout/version migration, source versus derivative retention, storage growth, backup/rollback requirements, global rerender behavior, and how renderer/profile changes affect existing entries.
+- [ ] Update Docker/Kubernetes guidance and manifests for expected CPU, memory, temporary disk, persistent queue growth, one-replica operation, and graceful shutdown during rendering without adding non-Rust runtime packages.
+- [ ] Audit decoder limits and every source/derivative open/create/read/remove/rename path for confinement, symlink behavior, collision safety, cleanup, and preservation of DigiKam/manual source immutability.
+- [ ] Measure enqueue and whole-queue regeneration on representative Paper 7/Paper L photos; confirm bounded concurrency keeps frame serving responsive and document supported operational limits.
+- [ ] Verify all documented clean-install, migration, backup, and rollback procedures from temporary directories; commit the documentation/operations milestone.
+
+### Stage 7 — Final end-to-end validation
 
 Depends on all previous stages.
 
-- [x] From a clean checkout, build a release binary and create a representative read-only DigiKam catalog/photo tree plus separate writable settings, cache, and managed-folder storage.
-- [x] Start with a legacy DigiKam settings file; verify compatibility, startup selection, daily-mode status/readiness, GET/HEAD/conditional behavior, and unchanged database/source hashes and metadata.
-- [x] Switch through the HTTP settings interface to folder mode; verify immediate alphabetical thumbnails/readiness and exact sequential frame bodies through wrap, with HEAD/thumbnail/health/settings requests not advancing the cursor.
-- [x] Upload JPEGs through HTTP, reorder the complete queue, confirm underlying alphabetical filenames encode the new order, add/remove files directly on disk, and verify only explicit refresh reconciles them.
-- [x] Restart and verify uploaded/reordered files remain in the displayed/served order while the runtime cursor resets to the documented first image; switch back to DigiKam and verify immediate selection still works.
-- [x] Exercise concurrent frame GETs and invalid/stale/CSRF-invalid/oversized/non-JPEG/traversal/collision operations; verify deterministic advancement, proper errors, no overwrite/escape, prior-state retention, and temporary-file cleanup.
-- [x] Send SIGTERM during normal serving and folder/DigiKam work; verify graceful exit and intact settings, cache, catalog, source photos, managed images, and ordering.
-- [x] Run `cargo fmt --check`, `cargo clippy --all-targets --all-features -- -D warnings`, `cargo test`, and `cargo build --release`; record exact results in the implementation summary.
-- [x] Commit any final validated fixes as a meaningful milestone and leave the working tree clean.
+- [ ] From a clean checkout with submodules initialized only for reference verification, regenerate/check fixture provenance, then build and run the release server without Node.js or other non-Rust rendering tools installed.
+- [ ] Exercise manual-folder, DigiKam, and multipart-upload ingestion with JPEG, PNG, BMP, WebP, and at least one additional enabled codec; verify corrupt, mislabeled, animated, alpha, oversized, symlink, nested, and traversal cases follow the documented behavior.
+- [ ] In Paper 7 server-dither mode, enqueue portrait, landscape, and square images; inspect original/dithered previews, override orientations, fetch frame `GET`/`HEAD`, parse exact 800x480 4-bit BMPs, and verify order/advancement/readiness/restart behavior.
+- [ ] Repeat the orientation/render/parse checks for 1200x1600 Paper L output and verify the documented physical-rotation convention uses the complete framebuffer.
+- [ ] Switch transactionally to direct-JPEG mode and back through the HTTP settings interface; verify JPEG pass-through/conversion, BMP regeneration from retained originals, correct media headers, no mixed mode, stale/CSRF rejection, and rollback after an injected render/publication failure.
+- [ ] Start from a version-1 queue and legacy settings, verify migration preserves order/seen state/source content, and interrupt a batch enqueue/global rerender to verify restart cleanup and last-known-good serving.
+- [ ] Exercise simultaneous frame downloads, previews, enqueue, reorder, remove, orientation change, and global rerender; verify no deadlock, event-loop starvation, accidental preview advancement, lost update, or partial descriptor/filesystem state.
+- [ ] Confirm representative Rust outputs remain within every exact/approximate upstream and firmware regression bound and manually review committed visual fixtures for portrait/landscape, gradients, photographs, and hard edges.
+- [ ] Send SIGTERM during idle operation, enqueue rendering, global rerender, and body streaming; verify graceful exit and intact settings, queue descriptor, originals, derivatives, supplier sources, and restart recovery.
+- [ ] Run `cargo fmt --check`, `cargo clippy --all-targets --all-features -- -D warnings`, `cargo test`, and `cargo build --release`; record exact results and fixture/profile versions in `implementation-summary.md`.
+- [ ] Commit any final validated fixes as a meaningful milestone and leave the working tree clean.
 
 ## Execution contract
 
