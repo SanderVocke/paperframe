@@ -145,17 +145,17 @@ Depends on Stages 1–5.
 
 Depends on all previous stages.
 
-- [ ] From a clean checkout with submodules initialized only for reference verification, regenerate/check fixture provenance, then build and run the release server without Node.js or other non-Rust rendering tools installed.
-- [ ] Exercise manual-folder, DigiKam, and multipart-upload ingestion with JPEG, PNG, BMP, WebP, and at least one additional enabled codec; verify corrupt, mislabeled, animated, alpha, oversized, symlink, nested, and traversal cases follow the documented behavior.
-- [ ] In Paper 7 server-dither mode, enqueue portrait, landscape, and square images; inspect original/dithered previews, override orientations, fetch frame `GET`/`HEAD`, parse exact 800x480 4-bit BMPs, and verify order/advancement/readiness/restart behavior.
-- [ ] Repeat the orientation/render/parse checks for 1200x1600 Paper L output and verify the documented physical-rotation convention uses the complete framebuffer.
-- [ ] Switch transactionally to direct-JPEG mode and back through the HTTP settings interface; verify JPEG pass-through/conversion, BMP regeneration from retained originals, correct media headers, no mixed mode, stale/CSRF rejection, and rollback after an injected render/publication failure.
-- [ ] Start from a version-1 queue and legacy settings, verify migration preserves order/seen state/source content, and interrupt a batch enqueue/global rerender to verify restart cleanup and last-known-good serving.
-- [ ] Exercise simultaneous frame downloads, previews, enqueue, reorder, remove, orientation change, and global rerender; verify no deadlock, event-loop starvation, accidental preview advancement, lost update, or partial descriptor/filesystem state.
-- [ ] Confirm representative Rust outputs remain within every exact/approximate upstream and firmware regression bound and manually review committed visual fixtures for portrait/landscape, gradients, photographs, and hard edges.
-- [ ] Send SIGTERM during idle operation, enqueue rendering, global rerender, and body streaming; verify graceful exit and intact settings, queue descriptor, originals, derivatives, supplier sources, and restart recovery.
-- [ ] Run `cargo fmt --check`, `cargo clippy --all-targets --all-features -- -D warnings`, `cargo test`, and `cargo build --release`; record exact results and fixture/profile versions in `implementation-summary.md`.
-- [ ] Commit any final validated fixes as a meaningful milestone and leave the working tree clean.
+- [x] From a clean checkout with submodules initialized only for reference verification, regenerate/check fixture provenance, then build and run the release server without Node.js or other non-Rust rendering tools installed.
+- [x] Exercise manual-folder, DigiKam, and multipart-upload ingestion with JPEG, PNG, BMP, WebP, and at least one additional enabled codec; verify corrupt, mislabeled, animated, alpha, oversized, symlink, nested, and traversal cases follow the documented behavior.
+- [x] In Paper 7 server-dither mode, enqueue portrait, landscape, and square images; inspect original/dithered previews, override orientations, fetch frame `GET`/`HEAD`, parse exact 800x480 4-bit BMPs, and verify order/advancement/readiness/restart behavior.
+- [x] Repeat the orientation/render/parse checks for 1200x1600 Paper L output and verify the documented physical-rotation convention uses the complete framebuffer.
+- [x] Switch transactionally to direct-JPEG mode and back through the HTTP settings interface; verify JPEG pass-through/conversion, BMP regeneration from retained originals, correct media headers, no mixed mode, stale/CSRF rejection, and rollback after an injected render/publication failure.
+- [x] Start from a version-1 queue and legacy settings, verify migration preserves order/seen state/source content, and interrupt a batch enqueue/global rerender to verify restart cleanup and last-known-good serving.
+- [x] Exercise simultaneous frame downloads, previews, enqueue, reorder, remove, orientation change, and global rerender; verify no deadlock, event-loop starvation, accidental preview advancement, lost update, or partial descriptor/filesystem state.
+- [x] Confirm representative Rust outputs remain within every exact/approximate upstream and firmware regression bound and manually review committed visual fixtures for portrait/landscape, gradients, photographs, and hard edges.
+- [x] Send SIGTERM during idle operation, enqueue rendering, global rerender, and body streaming; verify graceful exit and intact settings, queue descriptor, originals, derivatives, supplier sources, and restart recovery.
+- [x] Run `cargo fmt --check`, `cargo clippy --all-targets --all-features -- -D warnings`, `cargo test`, and `cargo build --release`; record exact results and fixture/profile versions in `implementation-summary.md`.
+- [x] Commit any final validated fixes as a meaningful milestone and leave the working tree clean.
 
 ## Execution contract
 

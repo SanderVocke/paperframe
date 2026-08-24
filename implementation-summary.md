@@ -1,53 +1,65 @@
-# Shared Managed Queue Refactor — Implementation and Audit Summary
+# Rust Server-Side E-Paper Rendering — Implementation and Audit Summary
 
 ## Objective
 
-Complete [`refactor.md`](refactor.md): make one durable application-owned JPEG queue responsible for current/upcoming order and serving; reduce DigiKam and manual-folder modes to read-only suppliers; independently support completed-fetch, scheduled, and manual advancement; expose universal queue controls; retain migration, safety, and one-process operation.
+Complete [`plan.md`](plan.md): port the required deterministic `epdoptimize` behavior to Rust, add a firmware-compatible production renderer, render immutable queue derivatives at enqueue time, support common raster sources, expose global output/target and per-image orientation controls, serve firmware-ready BMPs or JPEGs, provide dithered previews, preserve queue safety, and validate the result end to end.
 
-## Requirement-to-artifact checklist
+## Prompt-to-artifact and acceptance checklist
 
-| Acceptance criteria | Evidence |
+| Requirement / acceptance criteria | Concrete evidence |
 |---|---|
-| AC 1–3: common process/endpoints, independent settings, target default 10, compatibility | `src/config.rs` defines `QueueSettings`, `AdvancementSettings`, collection-shaped `SupplierSettings`, defaults/validation, old tagged/untagged settings migration, and `cache_dir` alias. `config.example.toml` and both settings examples parse in tests. |
-| AC 4–6: queue-only writes, opaque objects, versioned durable descriptor and recovery | `src/queue.rs` exclusively owns `objects/` and `queue-state.toml`, uses random IDs, immutable metadata/provenance/seen state, `create_new`, sync, atomic rename, generation publication, rollback, orphan/temp cleanup, digest verification, and descriptor version rejection. Tests cover migration, restart, stale generations, missing/corrupt state, orphans, atomic batch failure, and injected descriptor-persistence failure. |
-| AC 7–8: current is ordinary first entry, reorder/remove, last-image retention | `QueueStore::reorder`, `remove`, `advance*`; route and queue tests move/remove current, promote successor, retain sole entry on advance, and allow explicit sole removal. Real HTTP validation reported `SOLE_RETENTION_RESET_E2E_OK`. |
-| AC 9–11: revision events, all-change notification, coalesced target refill/retry | `QueueEvent`, `watch` channel, demand reasons, `src/refill.rs` single-flight loop, fresh target checks, atomic bounded enqueue, event coalescing, polling, and bounded retry. Event/refill/background-shutdown tests prove mutation and blocked-demand events plus next-unseen refill without loops. |
-| AC 12: DigiKam SQL-order read-only supplier | `src/catalog.rs`, `src/source.rs`, and `DigikamSupplier` retain SQL shape/read-only checks and canonical source reader confinement. `digikam_supplier_preserves_exact_query_order` verifies literal query order; catalog/source tests cover mutation SQL, aliases/types/limits, no sidecars, traversal, and symlinks. |
-| AC 13–15: read-only polling manual supplier, immutable copies, persisted seen state | `ManualSupplier`, `validate_manual_root`, and `scan_manual` discover top-level regular JPEGs alphabetically and compute content-version identities. Queue provenance/seen is committed atomically and resettable. Tests cover alphabetical discovery, changed content, source deletion/modification isolation, removal continuing to next unseen, restart seen persistence, source unavailability with queue readiness, and no source writes. |
-| AC 16: future multi-supplier boundary | `Supplier` trait and `SupplierRegistry { suppliers: Vec<Arc<dyn Supplier>> }`; canonical settings are a supplier list but currently validate exactly one. `registry_contract_already_supports_multiple_suppliers` exercises two trait implementations and shared polling selection. |
-| AC 17: three common advancement policies and multi-time scheduling | `AdvancementSettings`; `src/scheduler.rs` operates only on `QueueStore::advance`, supports multiple times, timezone/DST, future-only startup behavior, runtime reconfiguration, and shutdown. Unit tests cover ordering and DST; real E2E exercised an actual scheduled transition plus manual and every-fetch policies. |
-| AC 18–21: frame qualification, completion, concurrency, caching | `get_image`, direct-peer allowlist, ignored forwarding/UA data, `CompletionStream`, owned serialization permit, chunk pacing/backpressure opportunity, drop-without-completion, and `advance_if_current`. Every-fetch is bodyful/no-store; stable policies retain conditional `Last-Modified`/`304`. Tests cover body collection vs dropped body, serialized GETs, unmatched IP, HEAD, manual conditional GET, sole retention; real throttled disconnect/full-transfer E2E covered transport behavior. |
-| AC 22–23: universal web queue UI/actions regardless supplier | `templates/settings.html` and `src/routes.rs` expose common current-first thumbnails/provenance, complete reorder, per-entry remove, direct multipart upload, explicit advance, supplier refresh/history reset, and decoupled settings. IDs are opaque; CSRF/settings/queue generations, bounds, escaping, PRG, and source isolation are implemented. HTTP tests cover thumbnail, CSRF rejection, current removal, and direct upload. |
-| AC 24: readiness follows current queue, not supplier | `health_ready` validates current managed object. Tests prove valid queue remains ready with unavailable supplier and sole current; actual HTTP proves empty is `503` and history reset/refill returns `200`. |
-| AC 25: automated coverage | 35 tests span config/migration, catalog/source, queue durability/events, suppliers/registry, refill, scheduler, serving completion/classification/caching, universal HTTP controls, source isolation, restart, and shutdown. |
-| AC 26: documentation | Rewritten `README.md`, `config.example.toml`, `settings.example.toml`, and `settings.folder.example.toml` cover architecture, queue descriptor, current/target semantics, polling, seen reset, migration, body-completion limitation, direct-peer classification, storage, security, and deployment. |
-| AC 27: release E2E | Release process started from legacy `cache_dir` + `folder_sequence`; filled alphabetical queue, preserved copied bytes after source modification, explicitly refreshed, directly uploaded/reordered, rejected incomplete throttled transfer advancement, advanced after full transfer, restarted descriptor/order, exercised stable `304`, manual advance, switched to DigiKam with SQL-order append, verified nonmatching IP no-advance, waited for actual scheduled advance, checked source/catalog hashes, SIGTERM, and temp cleanup. Output: `REFACTOR_E2E_OK root=/tmp/tmp.qT3eWRr4nT port=58457 count=3 first=d.jpg`. Follow-ups reported `SOLE_RETENTION_RESET_E2E_OK` and `INFLIGHT_REFACTOR_SIGTERM_OK`. |
-
-## Commits and staged milestones
-
-- `7182845` — shared queue/configuration, supplier registry/refill, advancement serving, universal UI foundation, and retirement of mode-owned cache/folder selection modules.
-- `138225b` — atomic batch operations, event/refill/source behavior hardening, expanded tests, and architecture documentation.
-- Final audit/validation milestone is recorded by repository history after this file.
+| Pure Rust production; no Node/browser/canvas runtime (AC 1) | `src/dither.rs` and `src/renderer.rs`; `Cargo.toml` has only Rust dependencies. Clean worktree release build succeeded with the Node installation removed from `PATH`; the Linux/WSL release build also succeeded where `node` is absent. `vendor/` and fixture tools are excluded from Docker context. |
+| Pinned upstream and license/provenance (AC 2–3) | `.gitmodules` pins `vendor/epdoptimize`; gitlink is v1.2.0 commit `555c7a3c42d9233a17b26ec399f3d57340dde8f5`. Upstream Apache-2.0 license remains in the submodule. `docs/rendering-reference.md` records provenance and exact comparison policy. |
+| Scoped 1:1 dither port (AC 2) | `src/dither.rs` implements RGB quantization, deterministic tie order, forward/serpentine traversal, clipping, immediate byte rounding, and all 13 scoped v1.2.0 kernels/aliases. Table/invariant tests cover maps, ties, malformed dimensions, palette stability, clamping, and determinism. |
+| Upstream regression correctness (AC 3) | `tools/generate_epdoptimize_fixtures.mjs` generates diagnostic and photo-like palette-index fixtures for all scoped kernels/both scans. Rust compares exact indices. Regeneration repeated with stable SHA-256 `d9dbaad17e045634fb3141642b3bca00ae81e57ed856d056261c8b1b400f0dde` for the main fixture. There are no approximate cases. |
+| Firmware-compatible hard-coded profile (AC 4) | `RENDER_PROFILE_VERSION = 1`, `DEVICE_PALETTE`, `prepare_framebuffer`, and `firmware_dither` encode ideal colors/nibbles, snap thresholds, RGB565 precision, width pre-scaling, floor-mapped nearest resize, non-serpentine integer Floyd–Steinberg, and arithmetic negative shifts. `firmware-profile-v1.json` covers thresholds, negative shifts, resize mapping, and both target BMP sizes. Intentional deviations are documented. |
+| Paper 7/Paper L BMP compatibility (AC 5) | Typed `FrameTarget`; exact `800x480` and `1200x1600` dimensions; top-down 4-bit `encode_bmp4` with 118-byte header and nibble map `0,1,2,3,5,6`. Tests validate bytes, lengths, rows, palette, and independently decode BMPs through `image`. Actual HTTP E2E parsed 192,118-byte Paper 7 and 960,118-byte Paper L BMPs. |
+| Orientation inference, override, and full-area transform (AC 6–7) | `ImageOrientation::infer` uses `height > width`, square is landscape; decoder applies exposed metadata orientation first. `prepare_framebuffer` renders orientation-appropriate logical dimensions and fixed clockwise rotation into the physical framebuffer. Queue metadata records inferred/override source. `/queue/orientation` rerenders atomically. Unit, route, HTTP E2E, and committed visual fixtures cover portrait/landscape/targets. |
+| Common raster ingestion and safety (AC 8) | `image = 0.25.6` enables JPEG, PNG, GIF, WebP, BMP, TIFF, TGA, PNM, DDS, HDR, ICO, QOI, and Farbfeld. `decode_source_named` combines byte guessing with extension hints, decoder dimensions/allocation limits, first-frame handling, EXIF orientation, and white alpha compositing. Manual, DigiKam, and upload paths use the same decoder. Tests cover codec round trips, DigiKam PNG, manual PNG/nesting, multipart PNG, animation, alpha, corruption, oversize headers, path confinement, traversal, and symlinks. |
+| Immutable source plus validated derivative (AC 9) | Queue descriptor v2 stores opaque source/derivative names, digests, lengths, media type, source dimensions, orientation provenance, target, and profile. `prepare_source` and `prepare` independently verify confinement, regular-file status, digest, decode/media validity. Direct JPEG passes through suitable JPEGs and deterministically encodes other sources at quality 90. |
+| Atomic enqueue and seen semantics (AC 10) | `enqueue_rendered_batch` validates all sources/derivatives, publishes `create_new` synced temporaries, renames, then descriptor/seen state. Failures clean staged objects and do not publish in-memory state. Existing atomic-batch, descriptor-failure, source-immutability, next-unseen, and multipart tests remain green. Rendering happens before the short queue publication lock and supplier candidates are marked seen only after commit. |
+| Transactional global rerender (AC 11) | `QueueStore::rerender_all` holds the queue mutation boundary, renders retained sources in bounded blocking work, publishes new uniquely named derivatives as a batch, then swaps descriptor and removes old files. Settings activation rerenders first and rolls back on stale/persistence failure. Route test switches BMP→JPEG and validates every derivative; injected descriptor failure retains old bytes/media. |
+| Static frame serving and HTTP semantics (AC 12) | `/frame/current.jpg` and `/frame/current.bmp` share static derivative serving with dynamic media type/length. Stable conditional `GET`/`HEAD`, every-fetch no-store/completion advancement, dropped-body behavior, allowlists, serialization, readiness, and last-request tracking remain covered. No frame request performs rendering. |
+| Original and dithered previews (AC 13) | `/queue/preview` and thumbnail transcode retained source without advancing; `/queue/dithered-preview` returns a lossless PNG from the same indexed production representation and current orientation/target. One application-wide render semaphore bounds upload/refill/preview/settings work. Route test proves PNG output and unchanged generation. Service worker allowlist excludes all image/settings routes. |
+| Web controls and mutation protection (AC 14) | `templates/settings.html` exposes frame model/output mode, inferred/overridden labels, original/dithered links, and no-JavaScript orientation form. Routes retain CSRF, settings generation, queue generation, escaped Askama rendering, and PRG. Desktop/mobile headless Edge screenshots were generated and manually reviewed; responsive CSS and service-worker behavior were inspected. |
+| Queue/settings migration (AC 15) | Settings without `[rendering]` default to direct JPEG. Descriptor v1 migration copies legacy derivatives to immutable `.source`, decodes dimensions/orientation, writes v2, and preserves order/seen data. Legacy `current.jpg` is also preserved before configured startup rerender. Migration, missing/corrupt state, restart, source-copy, and whole-directory backup/restore tests pass. |
+| Bounded work and operations (AC 16) | `render_serialization` semaphore admits one render; CPU work uses `spawn_blocking`; queue mutation serializes rerender/enqueue/remove/reorder. Decoder limits are 20,000 px/axis and 256 MiB. Release benchmark: Paper 7 13 ms/192,118 bytes and Paper L 58 ms/960,118 bytes on the development host. `docs/containers.md` documents memory, CPU, disk, one-replica, and grace requirements. |
+| Automated coverage (AC 17) | 63 tests: 62 passing and one intentionally ignored release benchmark. Coverage includes exact upstream/firmware fixtures, codecs, profile, orientation, BMP/JPEG/PNG, queue atomicity/migration/rollback/backup/events, suppliers, settings, previews, frame HTTP semantics, global mode transitions, upload conversion, concurrency, readiness, and shutdown. |
+| Documentation (AC 18) | Updated `README.md`, `docs/rendering-reference.md`, `docs/containers.md`, settings examples, Docker seed, Kubernetes ConfigMap/query/resources, endpoint table, queue layout, storage/migration/backup, source formats, image limits, profile, orientation convention, physical repositioning, and firmware URL instructions. |
+| Final validation (AC 19) | Clean detached worktree at `5f6aed3` with initialized pinned submodule built/tested under Rust 1.85 without Node in `PATH`. Actual HTTP E2E exercised Paper L BMP, inferred orientations, global direct JPEG, Paper 7 rerender, PNG upload, override, backup/restore/restart. Linux E2E sent SIGTERM during a 20-image global Paper L rerender and during a 960,118-byte body stream; requests completed, all descriptors/files remained valid, no temporaries remained, and restart/readiness succeeded. A 20-image enqueue-render SIGTERM run likewise completed with 20 BMP entries and no temporary files. |
 
 ## Safety audit
 
-Production writes are confined to:
+Production writes remain confined to:
 
-- `src/config.rs`: atomic settings replacement.
-- `src/queue.rs`: managed queue descriptor and opaque objects.
+- `src/config.rs`: atomically replace the configured settings file and clean only its recognized temporaries.
+- `src/queue.rs`: create/reconcile opaque objects and `queue-state.toml` beneath the canonical queue root; migrate/copy only queue-owned legacy objects; remove only descriptor-owned or recognized temporary/orphan files.
 
-`src/catalog.rs` opens SQLite read-only/query-only; `src/source.rs` and `src/supplier.rs` only read supplier files. No source link/copy destination, source rename/remove/write, database mutation, filename-order mutation, application database, Kubernetes artifact, image transformation, or multi-replica coordination was added.
+`src/catalog.rs` opens SQLite read-only/query-only. `src/source.rs` opens confined source files read-only. `src/supplier.rs` canonicalizes manual roots/files, rejects symlinks/escapes, and only reads sources. `src/renderer.rs` performs in-memory decoding/rendering. Browser identifiers are opaque queue IDs; no source path is accepted by preview/orientation routes.
+
+## Milestone commits
+
+- `3aeb630` — actionable rendering implementation plan.
+- `a015f03` — pinned reference, exact Rust dither port, renderer, source/derivative queue, modes, previews, controls, docs, and core tests.
+- `050b2af` — Rust 1.85 dependency pinning, compatibility hardening, queue recovery/backup/rollback coverage, and completed stage tracking.
+- `5f6aed3` — expanded codec/DigiKam/upload/mode regression coverage and manually reviewed visual fixtures.
 
 ## Final gates
 
-Executed from the repository root:
+Run from the repository root:
 
 ```text
 cargo fmt --check
 cargo clippy --all-targets --all-features -- -D warnings
 cargo test
 cargo build --release
+cargo +1.85.0 check --locked
+cargo +1.85.0 test --locked
 git diff --check
 ```
 
-All pass. The final test count/result and clean-tree evidence are rechecked after the final milestone commit.
+The ignored benchmark is run separately with:
+
+```text
+cargo test --release renderer::tests::benchmark_full_frame_profiles -- --ignored --nocapture
+```
