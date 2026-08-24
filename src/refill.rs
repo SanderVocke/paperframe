@@ -5,7 +5,7 @@ use tokio::sync::watch;
 use tracing::{error, info};
 
 use crate::{
-    queue::{EnqueueRequest, QueueEventReason},
+    queue::{QueueEventReason, RenderedEnqueueRequest},
     state::AppState,
 };
 
@@ -53,19 +53,65 @@ pub async fn refill_once(state: &AppState) -> Result<usize> {
         let deficit = target - count;
         let seen = state.queue.seen(supplier.id()).await;
         let candidates = supplier.supply(seen, deficit).await?;
-        let requests = candidates
-            .into_iter()
-            .take(deficit)
-            .map(|candidate| EnqueueRequest {
-                display_name: candidate.display_name,
-                bytes: candidate.bytes,
-                supplier_id: Some(supplier.id().to_owned()),
-                source_key: Some(candidate.source_key),
-            })
-            .collect();
+        let rendering = settings.rendering.clone();
+        let supplier_id = supplier.id().to_owned();
+        let _render_permit = state.render_serialization.clone().acquire_owned().await?;
+        let requests = tokio::task::spawn_blocking(move || {
+            candidates
+                .into_iter()
+                .take(deficit)
+                .filter_map(|candidate| {
+                    let decoded = match crate::renderer::decode_source_named(
+                        &candidate.bytes,
+                        Some(&candidate.display_name),
+                    ) {
+                        Ok(decoded) => decoded,
+                        Err(error) => {
+                            tracing::warn!(image = %candidate.display_name, %error, "supplier image could not be decoded");
+                            return None;
+                        }
+                    };
+                    let rendered = match if rendering.output_mode == crate::renderer::OutputMode::DirectJpeg
+                        && decoded.format == image::ImageFormat::Jpeg
+                    {
+                        Ok(crate::renderer::RenderedImage {
+                            bytes: candidate.bytes.clone(),
+                            media_type: "image/jpeg",
+                            extension: "jpg",
+                        })
+                    } else {
+                        crate::renderer::render(
+                            &decoded,
+                            rendering.target,
+                            rendering.output_mode,
+                            decoded.orientation,
+                        )
+                    } {
+                        Ok(rendered) => rendered,
+                        Err(error) => {
+                            tracing::warn!(image = %candidate.display_name, %error, "supplier image could not be rendered");
+                            return None;
+                        }
+                    };
+                    Some(RenderedEnqueueRequest {
+                        display_name: candidate.display_name,
+                        source_bytes: candidate.bytes,
+                        derivative_bytes: rendered.bytes,
+                        media_type: rendered.media_type.into(),
+                        source_width: decoded.pixels.width(),
+                        source_height: decoded.pixels.height(),
+                        orientation: decoded.orientation,
+                        frame_target: rendering.target,
+                        supplier_id: Some(supplier_id.clone()),
+                        source_key: Some(candidate.source_key),
+                    })
+                })
+                .collect::<Vec<_>>()
+        })
+        .await?;
         added += state
             .queue
-            .enqueue_batch(None, Some(target), requests)
+            .enqueue_rendered_batch(None, Some(target), requests)
             .await?
             .len();
     }

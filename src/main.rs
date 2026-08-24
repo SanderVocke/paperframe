@@ -1,7 +1,9 @@
 pub mod catalog;
 pub mod config;
+pub mod dither;
 pub mod queue;
 mod refill;
+pub mod renderer;
 mod routes;
 pub mod scheduler;
 pub mod source;

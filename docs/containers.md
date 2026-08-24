@@ -8,7 +8,7 @@ The image:
 
 - listens on port `8080`;
 - runs as the non-root user and group `10001:10001`;
-- stores writable settings, queue state, and managed JPEG copies under `/data`;
+- stores writable settings, queue state, immutable sources, and rendered BMP/JPEG derivatives under `/data`;
 - reads bootstrap configuration from `/config/config.toml`;
 - expects a manual photo folder at `/photos` with the default settings;
 - handles `SIGTERM` for graceful shutdown; and
@@ -17,6 +17,8 @@ The image:
 On the first start of a new `/data` volume, the entrypoint creates `/data/settings.toml` from the bundled manual-folder defaults. It never overwrites an existing settings file. Changes made in the web app are therefore retained when `/data` is persistent.
 
 Source photos and DigiKam files should always be mounted read-only. Only `/data` needs write access.
+
+Each queued item stores its encoded source and one served derivative. A Paper 7 BMP is about 188 KiB and a Paper L BMP about 938 KiB, in addition to the original, so size persistent storage for the queue target and source-photo sizes. Rendering is pure Rust, serialized to one job, and uses bounded decoded-image memory; the example 512 MiB memory limit accommodates the 256 MiB decoder ceiling plus a Paper L framebuffer/error buffers. CPU limits primarily affect enqueue, preview, and settings-wide rerender latency, not static frame downloads. Keep enough termination grace for an in-progress render and descriptor publication.
 
 ## Build and run with Docker
 
@@ -160,7 +162,7 @@ In the ConfigMap:
 - set `mounted_root` to the corresponding path inside the container; and
 - customize the query if desired.
 
-The supplied query chooses active JPEG files in stable image-ID order and limits the catalog scan to 100,000 candidates.
+The supplied query chooses active JPEG, PNG, and WebP files in stable image-ID order and limits the catalog scan to 100,000 candidates.
 
 The ConfigMap settings are copied only when `/data/settings.toml` does not exist. This is intentional: subsequent web-app changes live on the PVC and survive pod replacements. Editing `settings.toml` in the ConfigMap does not replace settings on an existing data claim. Use the web app, or deliberately update the file on the PVC while the Deployment is stopped.
 
@@ -203,7 +205,7 @@ The application itself has no authentication or TLS. Do not publish it directly 
 
 - Keep `replicas: 1`; queue storage is not designed for concurrent writers.
 - Preserve the `Recreate` deployment strategy to avoid overlapping old and new pods.
-- Back up all of `/data`, not just individual JPEGs or `settings.toml`.
+- Back up all of `/data`, not just individual source/derivative objects or `settings.toml`.
 - Keep the source library read-only.
 - Give termination at least 30 seconds so in-flight responses and state changes can finish.
 - When upgrading, publish a new immutable image tag, change the Deployment image, and use `kubectl rollout status deployment/paperframe`.

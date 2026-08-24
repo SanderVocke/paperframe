@@ -3,7 +3,7 @@ use std::{net::IpAddr, sync::Arc};
 use anyhow::{Context, Result, bail};
 use axum::http::StatusCode;
 use chrono::{DateTime, Utc};
-use tokio::sync::{Mutex, RwLock, watch};
+use tokio::sync::{Mutex, RwLock, Semaphore, watch};
 
 use crate::{
     config::{Config, Settings, SettingsManager, SupplierKind},
@@ -35,6 +35,7 @@ pub struct AppState {
     last_image_request: RwLock<Option<ImageRequest>>,
     runtime_trigger: watch::Sender<u64>,
     pub frame_serialization: Arc<Mutex<()>>,
+    pub render_serialization: Arc<Semaphore>,
     csrf_token: String,
 }
 
@@ -51,6 +52,27 @@ impl AppState {
             SupplierKind::DigikamSqlite(_)
         );
         let queue = QueueStore::new(&config.queue_dir, migrate_current).await?;
+        let expected_media = match snapshot.settings.rendering.output_mode {
+            crate::renderer::OutputMode::ServerDitherBmp => "image/bmp",
+            crate::renderer::OutputMode::DirectJpeg => "image/jpeg",
+        };
+        let queue_snapshot = queue.snapshot().await;
+        let needs_rerender = queue_snapshot.entries.iter().any(|entry| {
+            entry.media_type != expected_media
+                || (snapshot.settings.rendering.output_mode
+                    == crate::renderer::OutputMode::ServerDitherBmp
+                    && (entry.frame_target != snapshot.settings.rendering.target
+                        || entry.renderer_profile != crate::renderer::RENDER_PROFILE_VERSION))
+        });
+        if needs_rerender {
+            queue
+                .rerender_all(
+                    snapshot.settings.rendering.target,
+                    snapshot.settings.rendering.output_mode,
+                )
+                .await
+                .context("failed to render existing queue for configured frame output")?;
+        }
         let registry =
             SupplierRegistry::prepare(&snapshot.settings.suppliers, queue.root(), false).await?;
         let (runtime_trigger, _) = watch::channel(0);
@@ -63,6 +85,7 @@ impl AppState {
             last_image_request: RwLock::new(None),
             runtime_trigger,
             frame_serialization: Arc::new(Mutex::new(())),
+            render_serialization: Arc::new(Semaphore::new(1)),
             csrf_token: random_token(),
         }))
     }

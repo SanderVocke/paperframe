@@ -70,24 +70,24 @@ Not included:
 
 ### Stage 1 — Pin references and define parity contracts
 
-- [ ] Add the `epdoptimize` v1.2.0 source as a pinned development/reference submodule or equivalent immutable fixture-generation reference, record its commit and Apache-2.0 attribution, and ensure production Cargo/Docker builds do not depend on it being executable.
-- [ ] Inventory v1.2.0 palette ordering, diffusion maps, scan/edge/tie behavior, and numeric operations for the scoped algorithms; separately transcribe the checked-out firmware palette, snapping, JPEG scale thresholds, integer diffusion, framebuffer dimensions, and BMP expectations.
-- [ ] Create a deterministic fixture generator that accepts raw RGBA inputs and explicit options, emits palette-index goldens plus a manifest, and includes tiny diagnostic patterns, gradients, hard palette ties, edges, odd dimensions, alpha, and representative photos.
-- [ ] Add firmware characterization fixtures produced by a small faithful host-side reference or independently checked vectors, including negative error rounding, clean-color thresholds, nearest-neighbor resize mapping, and Paper 7/Paper L packing cases.
-- [ ] Document which comparisons must be exact and define fixed metrics/thresholds for any unavoidable approximate cases before accepting the Rust port.
-- [ ] Verify fixture regeneration from the pinned reference, stable fixture hashes across repeated runs, and license/provenance completeness; commit the reference/fixture-contract milestone.
+- [x] Add the `epdoptimize` v1.2.0 source as a pinned development/reference submodule or equivalent immutable fixture-generation reference, record its commit and Apache-2.0 attribution, and ensure production Cargo/Docker builds do not depend on it being executable.
+- [x] Inventory v1.2.0 palette ordering, diffusion maps, scan/edge/tie behavior, and numeric operations for the scoped algorithms; separately transcribe the checked-out firmware palette, snapping, JPEG scale thresholds, integer diffusion, framebuffer dimensions, and BMP expectations.
+- [x] Create a deterministic fixture generator that accepts raw RGBA inputs and explicit options, emits palette-index goldens plus a manifest, and includes tiny diagnostic patterns, gradients, hard palette ties, edges, odd dimensions, alpha, and representative photos.
+- [x] Add firmware characterization fixtures produced by a small faithful host-side reference or independently checked vectors, including negative error rounding, clean-color thresholds, nearest-neighbor resize mapping, and Paper 7/Paper L packing cases.
+- [x] Document which comparisons must be exact and define fixed metrics/thresholds for any unavoidable approximate cases before accepting the Rust port.
+- [x] Verify fixture regeneration from the pinned reference, stable fixture hashes across repeated runs, and license/provenance completeness; commit the reference/fixture-contract milestone.
 
 ### Stage 2 — Implement and verify the pure-Rust dither core
 
 Depends on Stage 1.
 
-- [ ] Add typed palette, color, diffusion-kernel, scan, and indexed-image models with checked dimensions and deterministic palette tie-breaking.
-- [ ] Port RGB nearest-palette quantization and all scoped v1.2.0 diffusion maps, including forward and serpentine traversal, boundary clipping, error accumulation, and aliases such as Jarvis/Jarvis–Judice–Ninke.
-- [ ] Add table-driven unit tests for each kernel's weights/divisor, scan direction, edge behavior, palette ties, clamping, and malformed/overflowing inputs.
-- [ ] Run the committed upstream fixtures through the Rust engine and enforce exact index equality or the predeclared approximation metric; make mismatch diagnostics emit useful per-pixel counts/diffs without rewriting goldens.
-- [ ] Add property tests/invariants where useful: every output index belongs to the palette, dimensions are preserved, pure palette colors remain stable, deterministic runs are identical, and serpentine reversal mirrors the intended kernel offsets.
-- [ ] Benchmark representative Paper 7 and Paper L buffers and establish bounded memory/concurrency defaults suitable for enqueue-time processing.
-- [ ] Verify formatting, strict Clippy, dither unit/regression tests, and release-mode benchmark smoke tests; commit the Rust dither-core milestone.
+- [x] Add typed palette, color, diffusion-kernel, scan, and indexed-image models with checked dimensions and deterministic palette tie-breaking.
+- [x] Port RGB nearest-palette quantization and all scoped v1.2.0 diffusion maps, including forward and serpentine traversal, boundary clipping, error accumulation, and aliases such as Jarvis/Jarvis–Judice–Ninke.
+- [x] Add table-driven unit tests for each kernel's weights/divisor, scan direction, edge behavior, palette ties, clamping, and malformed/overflowing inputs.
+- [x] Run the committed upstream fixtures through the Rust engine and enforce exact index equality or the predeclared approximation metric; make mismatch diagnostics emit useful per-pixel counts/diffs without rewriting goldens.
+- [x] Add property tests/invariants where useful: every output index belongs to the palette, dimensions are preserved, pure palette colors remain stable, deterministic runs are identical, and serpentine reversal mirrors the intended kernel offsets.
+- [x] Benchmark representative Paper 7 and Paper L buffers and establish bounded memory/concurrency defaults suitable for enqueue-time processing.
+- [x] Verify formatting, strict Clippy, dither unit/regression tests, and release-mode benchmark smoke tests; commit the Rust dither-core milestone.
 
 ### Stage 3 — Add the firmware-compatible renderer and encoders
 

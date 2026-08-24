@@ -16,6 +16,8 @@ use chrono_tz::Tz;
 use serde::{Deserialize, Deserializer, Serialize, de::Error as _};
 use tokio::sync::{Mutex, RwLock};
 
+use crate::renderer::{FrameTarget, OutputMode};
+
 static TEMP_FILE_COUNTER: AtomicU64 = AtomicU64::new(0);
 const DEFAULT_UPLOAD_BYTES: u64 = 25 * 1024 * 1024;
 
@@ -55,8 +57,18 @@ impl Config {
 #[derive(Clone, Debug, Serialize, PartialEq, Eq)]
 pub struct Settings {
     pub queue: QueueSettings,
+    pub rendering: RenderingSettings,
     pub advancement: AdvancementSettings,
     pub suppliers: Vec<SupplierSettings>,
+}
+
+#[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct RenderingSettings {
+    #[serde(default)]
+    pub target: FrameTarget,
+    #[serde(default)]
+    pub output_mode: OutputMode,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
@@ -183,6 +195,8 @@ struct OldTagged {
 #[serde(deny_unknown_fields)]
 struct CanonicalSettings {
     queue: QueueSettings,
+    #[serde(default)]
+    rendering: RenderingSettings,
     advancement: AdvancementSettings,
     suppliers: Vec<SupplierSettings>,
 }
@@ -200,6 +214,7 @@ impl<'de> Deserialize<'de> for Settings {
             let current: CanonicalSettings = value.try_into().map_err(D::Error::custom)?;
             return Ok(Self {
                 queue: current.queue,
+                rendering: current.rendering,
                 advancement: current.advancement,
                 suppliers: current.suppliers,
             });
@@ -221,6 +236,7 @@ fn migrate_old_mode(mode: OldModeSettings) -> Settings {
                 target_length: 10,
                 max_upload_bytes: settings.max_upload_bytes,
             },
+            rendering: RenderingSettings::default(),
             advancement: AdvancementSettings::EveryFetch {
                 frame_client_ips: Vec::new(),
             },
@@ -242,6 +258,7 @@ fn migrate_digikam(old: OldDigikamSettings) -> Settings {
             target_length: 10,
             max_upload_bytes: DEFAULT_UPLOAD_BYTES,
         },
+        rendering: RenderingSettings::default(),
         advancement: AdvancementSettings::Scheduled {
             timezone: old.selection.timezone,
             times: vec![old.selection.rollover_time],
@@ -315,7 +332,7 @@ impl SupplierSettings {
         match &self.kind {
             SupplierKind::DigikamSqlite(settings) => settings.validate(),
             SupplierKind::ManualFolder(settings) => {
-                if !settings.directory.is_absolute() {
+                if !settings.directory.is_absolute() && !settings.directory.has_root() {
                     bail!("manual folder directory must be absolute");
                 }
                 if settings.poll_interval_seconds == 0 || settings.poll_interval_seconds > 86400 {
@@ -340,7 +357,9 @@ impl DigikamSettings {
         }
         let mut roots = HashSet::new();
         for mapping in &self.path_mappings {
-            if !mapping.database_root.is_absolute() || !mapping.mounted_root.is_absolute() {
+            if (!mapping.database_root.is_absolute() && !mapping.database_root.has_root())
+                || (!mapping.mounted_root.is_absolute() && !mapping.mounted_root.has_root())
+            {
                 bail!("path mapping roots must be absolute");
             }
             if !roots.insert(mapping.database_root.clone()) {
@@ -455,7 +474,7 @@ fn persist_settings(path: &Path, settings: &Settings) -> Result<()> {
         file.sync_all()
             .context("failed to sync settings temporary")?;
         fs::rename(&temporary, path).context("failed to atomically replace settings")?;
-        sync_directory(parent)?;
+        let _ = sync_directory(parent);
         Ok(())
     })();
     if result.is_err() {
@@ -483,9 +502,17 @@ fn cleanup_temporary_files(path: &Path) -> Result<()> {
 }
 
 fn sync_directory(path: &Path) -> Result<()> {
-    fs::File::open(path)?
-        .sync_all()
-        .context("failed to sync directory")
+    #[cfg(windows)]
+    {
+        let _ = path;
+        Ok(())
+    }
+    #[cfg(not(windows))]
+    {
+        fs::File::open(path)?
+            .sync_all()
+            .context("failed to sync directory")
+    }
 }
 
 #[cfg(test)]
@@ -532,11 +559,21 @@ mod tests {
     fn validates_target_supplier_and_schedule() {
         let mut settings: Settings = toml::from_str("queue={target_length=10,max_upload_bytes=100}\nadvancement={type='manual'}\n[[suppliers]]\nid='one'\ntype='manual_folder'\n[suppliers.settings]\ndirectory='/images'\npoll_interval_seconds=60\n").unwrap();
         settings.validate().unwrap();
+        assert_eq!(settings.rendering, RenderingSettings::default());
         settings.queue.target_length = 0;
         assert!(settings.validate().is_err());
         settings.queue.target_length = 10;
         settings.suppliers.push(settings.suppliers[0].clone());
         assert!(settings.validate().is_err());
+    }
+
+    #[test]
+    fn rendering_settings_round_trip_and_legacy_defaults_are_stable() {
+        let settings: Settings = toml::from_str("queue={target_length=10,max_upload_bytes=100}\nrendering={target='paper_l',output_mode='server_dither_bmp'}\nadvancement={type='manual'}\n[[suppliers]]\nid='one'\ntype='manual_folder'\n[suppliers.settings]\ndirectory='/images'\npoll_interval_seconds=60\n").unwrap();
+        assert_eq!(settings.rendering.target, FrameTarget::PaperL);
+        assert_eq!(settings.rendering.output_mode, OutputMode::ServerDitherBmp);
+        let encoded = toml::to_string_pretty(&settings).unwrap();
+        assert_eq!(toml::from_str::<Settings>(&encoded).unwrap(), settings);
     }
 
     #[test]

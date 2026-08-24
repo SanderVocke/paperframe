@@ -1,6 +1,6 @@
 # Paper frame server
 
-Paper frame server keeps a rotating list of JPEGs for a PaperlessPaper frame and serves the current image over HTTP.
+Paper frame server keeps a rotating list of photos for a PaperlessPaper frame, converts them to the configured frame representation, and serves the current image over HTTP.
 
 You choose:
 
@@ -16,7 +16,7 @@ The server copies selected images into its own managed queue. It never renames, 
 
 ### 1. Prepare the files
 
-You need Rust 1.85 or newer and this repository. Only JPEG input is supported; the server does not convert other image formats. From the repository root:
+You need Rust 1.85 or newer and this repository. The server accepts common raster formats and converts them at enqueue time. From the repository root:
 
 ```sh
 mkdir -p data/queue data/source-images
@@ -45,7 +45,7 @@ poll_interval_seconds = 60
 EOF
 ```
 
-Put `.jpg` or `.jpeg` files directly in `data/source-images`. Subfolders are not scanned.
+Put supported raster images directly in `data/source-images`. Subfolders are not scanned.
 
 ### 2. Start the server
 
@@ -63,6 +63,21 @@ The configuration path is optional and defaults to `config.toml`. To enable debu
 Replace `SERVER_IP` with the computer's LAN address. Configure the frame to fetch the frame-image URL. The control page shows readiness, refill errors, the current image, upcoming images, and all queue/settings controls.
 
 The quick-start policy is `manual`, so test downloads cannot unexpectedly move the queue. After confirming that the frame works, choose another policy on the control page if wanted.
+
+## Image processing and orientation
+
+The server has two global output modes:
+
+- **Server dither BMP** decodes the source, applies a fixed firmware-compatible six-color Floyd–Steinberg profile, and stores a ready-to-display 4-bit BMP. Configure either `/frame/current.bmp` or the backward-compatible `/frame/current.jpg`; the latter may return `image/bmp` because the firmware detects the body by its `BM` signature.
+- **Direct JPEG** preserves a suitable JPEG without recompression and converts other sources to JPEG. The frame performs its normal on-device processing.
+
+Select Paper 7 (`800×480`) or Paper L (`1200×1600`) in Frame settings. Existing settings without a `[rendering]` section retain the compatibility default of direct JPEG; the supplied new-install examples select server dithering.
+
+The compiled decoder supports JPEG, PNG, GIF, WebP, BMP, TIFF, TGA, PNM, DDS, HDR, ICO, QOI, and Farbfeld. Animated formats use their first frame, metadata orientation is applied where the decoder exposes it, and transparency is composited onto white. Encoded uploads are bounded by `max_upload_bytes`; decoded images are also dimension/allocation limited.
+
+Orientation is inferred after metadata orientation: taller images are portrait and square images are landscape. Each queue card can override it. The renderer stretches to the complete orientation-appropriate panel area and uses a fixed clockwise 90° transform when logical and physical orientations differ. Reposition the physical frame clockwise to match the displayed image. Auto Rotation in the offline firmware still handles only the final 180° correction.
+
+Dither parameters are intentionally not user-editable. The versioned profile uses the firmware's ideal black/blue/green/red/yellow/white palette, RGB nearest-color matching, clean-color thresholds, non-serpentine Floyd–Steinberg diffusion, RGB565-like input precision, and nearest-neighbor resizing. Each queue card links to the original and to a non-advancing lossless dithered preview.
 
 ### Install the control page as an app
 
@@ -84,7 +99,7 @@ The first queue entry is always the current image.
 
 - **Advance now** moves to the next entry.
 - **Remove** deletes that managed copy. Removing the current entry promotes the next one.
-- **Upload JPEGs** adds independent copies directly to the queue.
+- **Upload photos** accepts any enabled raster format and adds independent source/derived copies to the queue.
 - **Save order** applies the complete current-first order shown in the text box. Move whole lines and do not alter their opaque IDs.
 - **Non-advancing preview** lets you inspect an entry without triggering fetch-based advancement.
 
@@ -117,7 +132,7 @@ Use [`settings.folder.example.toml`](settings.folder.example.toml) as a referenc
 
 The folder supplier:
 
-- Reads only top-level regular `.jpg` and `.jpeg` files.
+- Reads only top-level regular files with enabled raster-image extensions and validates their contents.
 - Ignores subfolders, symlinks, and other extensions.
 - Discovers files in alphabetical filename order.
 - Polls at `poll_interval_seconds` and can be refreshed from the control page.
@@ -145,7 +160,7 @@ The query must return these exact columns:
 | `image_id` | Stable DigiKam image ID |
 | `root_path` | DigiKam album-root path |
 | `album_path` | Path below that root |
-| `file_name` | JPEG filename only |
+| `file_name` | Supported raster-image filename only |
 
 The SQL `ORDER BY` controls supply order. Each returned `root_path` must exactly match a `database_root` mapping. `mounted_root` is the corresponding directory on the machine or inside the container running this service.
 
@@ -157,7 +172,7 @@ database_root = "/home/alice/Pictures"
 mounted_root = "/photos"
 ```
 
-The database is opened read-only and query-only. Photos are opened read-only beneath mapped roots. Invalid paths, symlink escapes, missing files, and invalid JPEGs are skipped or reported without changing DigiKam data.
+The database is opened read-only and query-only. Photos are opened read-only beneath mapped roots. Invalid paths, symlink escapes, missing files, and undecodable images are skipped or reported without changing DigiKam data.
 
 For a live DigiKam catalog using SQLite WAL mode, expose a consistent database/WAL/SHM set or, preferably, point the service at a safe snapshot.
 
@@ -221,7 +236,8 @@ The managed queue looks like this:
 queue/
   queue-state.toml
   objects/
-    <opaque-id>.jpg
+    <opaque-id>.source
+    <opaque-id>.<bmp-or-jpg>
 ```
 
 Do not manually edit, reorder, or remove these files while the server is running. Use the control page. To preserve queue order and supplier history, stop the server and back up the whole queue directory together.
@@ -259,7 +275,7 @@ The queue has no valid current image. Check the **Refill** error, then verify th
 
 - The source path/database/mapped roots are accessible to the service user.
 - The manual source path is absolute and separate from the queue.
-- JPEGs are valid and, for a manual source, directly inside the configured folder.
+- Images decode in one of the enabled raster formats and, for a manual source, are directly inside the configured folder.
 - The DigiKam query returns the four required columns.
 
 After fixing the issue, click **Refresh supplier and refill**.
@@ -274,7 +290,7 @@ Under `every_fetch`, configure `frame_client_ips` with only the frame's direct I
 
 ### DigiKam returns rows but nothing is queued
 
-Check server logs and verify that each returned `root_path` exactly matches a `database_root`, the corresponding `mounted_root` exists, and `album_path` plus `file_name` resolves to a readable JPEG beneath it.
+Check server logs and verify that each returned `root_path` exactly matches a `database_root`, the corresponding `mounted_root` exists, and `album_path` plus `file_name` resolves to a readable supported image beneath it.
 
 ### A queue/settings action is rejected as stale
 
@@ -286,7 +302,7 @@ Reload `/settings` and retry. Another action changed the generation shown in you
 - Run as a non-root user with writes limited to the settings and queue locations.
 - Give SIGTERM enough grace for in-flight image responses and state writes.
 - `GET /health/live` reports process liveness.
-- `GET /health/ready` returns `200` only when the current managed JPEG can be served.
+- `GET /health/ready` returns `200` only when the current managed derivative can be served.
 - Use persistent storage for the settings file and queue root.
 
 There is no authentication, authorization, or TLS. CSRF and stale-generation checks protect the control page from accidental/cross-site mutations but are not access control. Keep the service on a trusted network or use an authenticating TLS proxy.
@@ -301,12 +317,15 @@ Most users only need `/settings` and `/frame/current.jpg`.
 | `GET` | `/manifest.webmanifest` | Progressive web app metadata |
 | `GET` | `/sw.js` | Static-assets-only service worker |
 | `GET` | `/pwa/*` | Progressive web app icons |
-| `GET` / `HEAD` | `/frame/current.jpg` | Current frame image |
+| `GET` / `HEAD` | `/frame/current.jpg` | Backward-compatible current frame representation |
+| `GET` / `HEAD` | `/frame/current.bmp` | Format-appropriate alias for the same current representation |
 | `GET` | `/queue/thumbnail/{id}` | Non-advancing thumbnail |
-| `GET` | `/queue/preview/{id}` | Non-advancing full preview |
+| `GET` | `/queue/preview/{id}` | Non-advancing full original preview |
+| `GET` | `/queue/dithered-preview/{id}` | Non-advancing six-color preview |
 | `POST` | `/queue/reorder` | Save complete current-first order |
 | `POST` | `/queue/remove` | Remove any queue entry |
-| `POST` | `/queue/upload` | Append uploaded JPEG copies |
+| `POST` | `/queue/upload` | Decode/render and append uploaded images |
+| `POST` | `/queue/orientation` | Override and rerender one entry's orientation |
 | `POST` | `/queue/advance` | Advance when a successor exists |
 | `POST` | `/supplier/refresh` | Scan/refill now |
 | `POST` | `/supplier/reset-seen` | Clear imported-candidate history |

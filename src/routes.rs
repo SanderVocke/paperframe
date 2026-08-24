@@ -26,9 +26,10 @@ use tracing::{Level, error, info};
 use crate::{
     config::{
         AdvancementSettings, DigikamSettings, ManualFolderSettings, PathMapping, QueueSettings,
-        ReplaceSettingsError, Settings, SupplierKind, SupplierSettings,
+        RenderingSettings, ReplaceSettingsError, Settings, SupplierKind, SupplierSettings,
     },
     queue::{PreparedImage, QueueEntry, QueueEventReason},
+    renderer::{FrameTarget, OutputMode},
     state::{AppState, ImageRequest},
 };
 
@@ -58,9 +59,12 @@ pub fn router(state: Arc<AppState>) -> Router {
         )
         .route("/queue/thumbnail/{id}", get(queue_thumbnail))
         .route("/queue/preview/{id}", get(queue_preview))
+        .route("/queue/dithered-preview/{id}", get(queue_dithered_preview))
+        .route("/queue/orientation", post(set_queue_orientation))
         .route("/supplier/refresh", post(refresh_supplier))
         .route("/supplier/reset-seen", post(reset_supplier_seen))
         .route("/frame/current.jpg", get(get_image).head(head_image))
+        .route("/frame/current.bmp", get(get_image).head(head_image))
         .route("/health/live", get(|| async { StatusCode::OK }))
         .route("/health/ready", get(health_ready))
         .layer(DefaultBodyLimit::max(SETTINGS_LIMIT))
@@ -131,6 +135,8 @@ struct QueueView {
     display_name: String,
     provenance: String,
     is_current: bool,
+    orientation_label: String,
+    portrait: bool,
     order_line: String,
 }
 
@@ -149,6 +155,10 @@ struct SettingsTemplate {
     supplier_status: String,
     target_length: String,
     max_upload_bytes: String,
+    target_paper_7: bool,
+    target_paper_l: bool,
+    output_dither_bmp: bool,
+    output_direct_jpeg: bool,
     policy_every_fetch: bool,
     policy_scheduled: bool,
     policy_manual: bool,
@@ -173,6 +183,8 @@ struct SettingsForm {
     csrf_token: String,
     target_length: String,
     max_upload_bytes: String,
+    frame_target: String,
+    output_mode: String,
     advancement_type: String,
     frame_client_ips: String,
     schedule_timezone: String,
@@ -203,6 +215,13 @@ struct ReorderForm {
     csrf_token: String,
     queue_generation: String,
     order: String,
+}
+#[derive(Deserialize)]
+struct OrientationForm {
+    csrf_token: String,
+    queue_generation: String,
+    id: String,
+    orientation: String,
 }
 
 async fn settings_page(State(state): State<Arc<AppState>>) -> Response {
@@ -236,6 +255,19 @@ async fn update_settings(
             .await;
         }
     };
+    let live_before = state.settings.snapshot().await;
+    if live_before.generation != expected {
+        return render_error(
+            &state,
+            form,
+            StatusCode::CONFLICT,
+            &format!(
+                "Settings changed concurrently; current generation is {}",
+                live_before.generation
+            ),
+        )
+        .await;
+    }
     let proposed = match form.to_settings() {
         Ok(settings) => settings,
         Err(message) => {
@@ -254,6 +286,37 @@ async fn update_settings(
             .await;
         }
     };
+    let rendering_changed = proposed.rendering != live_before.settings.rendering;
+    let _render_permit = if rendering_changed {
+        match state.render_serialization.clone().acquire_owned().await {
+            Ok(permit) => Some(permit),
+            Err(error) => {
+                return render_error(
+                    &state,
+                    form,
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    &error.to_string(),
+                )
+                .await;
+            }
+        }
+    } else {
+        None
+    };
+    if rendering_changed
+        && let Err(error) = state
+            .queue
+            .rerender_all(proposed.rendering.target, proposed.rendering.output_mode)
+            .await
+    {
+        return render_error(
+            &state,
+            form,
+            StatusCode::UNPROCESSABLE_ENTITY,
+            &format!("Could not rebuild queued images: {error}"),
+        )
+        .await;
+    }
     match state.settings.replace(expected, proposed).await {
         Ok(_) => {
             state.activate_registry(registry).await;
@@ -261,6 +324,12 @@ async fn update_settings(
             Redirect::to("/settings").into_response()
         }
         Err(ReplaceSettingsError::Stale { current_generation }) => {
+            if rendering_changed {
+                let old = &live_before.settings.rendering;
+                if let Err(error) = state.queue.rerender_all(old.target, old.output_mode).await {
+                    error!(%error, "failed to roll back queue rendering after stale settings update");
+                }
+            }
             render_error(
                 &state,
                 form,
@@ -272,9 +341,17 @@ async fn update_settings(
             .await
         }
         Err(ReplaceSettingsError::Invalid(message)) => {
+            if rendering_changed {
+                let old = &live_before.settings.rendering;
+                let _ = state.queue.rerender_all(old.target, old.output_mode).await;
+            }
             render_error(&state, form, StatusCode::UNPROCESSABLE_ENTITY, &message).await
         }
         Err(ReplaceSettingsError::Persistence(message)) => {
+            if rendering_changed {
+                let old = &live_before.settings.rendering;
+                let _ = state.queue.rerender_all(old.target, old.output_mode).await;
+            }
             render_error(&state, form, StatusCode::INTERNAL_SERVER_ERROR, &message).await
         }
     }
@@ -360,6 +437,10 @@ async fn render_settings(
         supplier_status,
         target_length: form.target_length,
         max_upload_bytes: form.max_upload_bytes,
+        target_paper_7: form.frame_target == "paper_7",
+        target_paper_l: form.frame_target == "paper_l",
+        output_dither_bmp: form.output_mode == "server_dither_bmp",
+        output_direct_jpeg: form.output_mode == "direct_jpeg",
         policy_every_fetch: form.advancement_type == "every_fetch",
         policy_scheduled: form.advancement_type == "scheduled",
         policy_manual: form.advancement_type == "manual",
@@ -400,6 +481,19 @@ fn queue_view(index: usize, entry: &QueueEntry) -> QueueView {
         display_name: entry.display_name.clone(),
         provenance,
         is_current: index == 0,
+        orientation_label: format!(
+            "{}{}",
+            match entry.orientation {
+                crate::renderer::ImageOrientation::Portrait => "Portrait",
+                crate::renderer::ImageOrientation::Landscape => "Landscape",
+            },
+            if entry.orientation_source == crate::renderer::OrientationSource::Inferred {
+                " (inferred)"
+            } else {
+                ""
+            }
+        ),
+        portrait: entry.orientation == crate::renderer::ImageOrientation::Portrait,
         order_line: format!("{}\t{}", entry.id, entry.display_name),
     }
 }
@@ -545,20 +639,61 @@ async fn upload_queue(State(state): State<Arc<AppState>>, mut multipart: Multipa
         Err((status, message)) => return plain(status, &message),
     };
     if uploads.is_empty() {
-        return plain(StatusCode::UNPROCESSABLE_ENTITY, "Select at least one JPEG");
+        return plain(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "Select at least one image",
+        );
     }
-    let requests = uploads
-        .into_iter()
-        .map(|(display_name, bytes)| crate::queue::EnqueueRequest {
-            display_name,
-            bytes,
-            supplier_id: None,
-            source_key: None,
-        })
-        .collect();
+    let rendering = settings.rendering;
+    let _render_permit = match state.render_serialization.clone().acquire_owned().await {
+        Ok(permit) => permit,
+        Err(error) => return plain(StatusCode::SERVICE_UNAVAILABLE, &error.to_string()),
+    };
+    let requests = match tokio::task::spawn_blocking(move || -> anyhow::Result<Vec<_>> {
+        uploads
+            .into_iter()
+            .map(|(display_name, bytes)| {
+                let decoded = crate::renderer::decode_source_named(&bytes, Some(&display_name))?;
+                let rendered = if rendering.output_mode == OutputMode::DirectJpeg
+                    && decoded.format == image::ImageFormat::Jpeg
+                {
+                    crate::renderer::RenderedImage {
+                        bytes: bytes.clone(),
+                        media_type: "image/jpeg",
+                        extension: "jpg",
+                    }
+                } else {
+                    crate::renderer::render(
+                        &decoded,
+                        rendering.target,
+                        rendering.output_mode,
+                        decoded.orientation,
+                    )?
+                };
+                Ok(crate::queue::RenderedEnqueueRequest {
+                    display_name,
+                    source_bytes: bytes,
+                    derivative_bytes: rendered.bytes,
+                    media_type: rendered.media_type.into(),
+                    source_width: decoded.pixels.width(),
+                    source_height: decoded.pixels.height(),
+                    orientation: decoded.orientation,
+                    frame_target: rendering.target,
+                    supplier_id: None,
+                    source_key: None,
+                })
+            })
+            .collect()
+    })
+    .await
+    {
+        Ok(Ok(requests)) => requests,
+        Ok(Err(error)) => return plain(StatusCode::UNPROCESSABLE_ENTITY, &error.to_string()),
+        Err(error) => return plain(StatusCode::INTERNAL_SERVER_ERROR, &error.to_string()),
+    };
     match state
         .queue
-        .enqueue_batch(Some(generation), None, requests)
+        .enqueue_rendered_batch(Some(generation), None, requests)
         .await
     {
         Ok(_) => Redirect::to("/settings").into_response(),
@@ -579,24 +714,114 @@ async fn queue_thumbnail(
     State(state): State<Arc<AppState>>,
     AxumPath(id): AxumPath<String>,
 ) -> Response {
-    preview_response(state.queue.prepare(&id).await)
+    original_preview_response(&state, state.queue.prepare_source(&id).await).await
 }
 async fn queue_preview(
     State(state): State<Arc<AppState>>,
     AxumPath(id): AxumPath<String>,
 ) -> Response {
-    preview_response(state.queue.prepare(&id).await)
+    original_preview_response(&state, state.queue.prepare_source(&id).await).await
 }
-fn preview_response(result: anyhow::Result<PreparedImage>) -> Response {
-    match result {
-        Ok(image) => jpeg_response(
+async fn original_preview_response(
+    state: &Arc<AppState>,
+    result: anyhow::Result<crate::queue::PreparedSource>,
+) -> Response {
+    let source = match result {
+        Ok(source) => source,
+        Err(error) => return plain(StatusCode::NOT_FOUND, &error.to_string()),
+    };
+    let _render_permit = match state.render_serialization.clone().acquire_owned().await {
+        Ok(permit) => permit,
+        Err(error) => return plain(StatusCode::SERVICE_UNAVAILABLE, &error.to_string()),
+    };
+    let rendered = tokio::task::spawn_blocking(move || -> anyhow::Result<Vec<u8>> {
+        let decoded =
+            crate::renderer::decode_source_named(&source.bytes, Some(&source.entry.display_name))?;
+        crate::renderer::encode_jpeg(&decoded.pixels)
+    })
+    .await;
+    match rendered {
+        Ok(Ok(bytes)) => image_response(
             StatusCode::OK,
-            Body::from(image.bytes.clone()),
-            image.bytes.len(),
+            Body::from(bytes.clone()),
+            bytes.len(),
+            "image/jpeg",
             None,
-            Some("no-store"),
+            Some("private, no-store"),
         ),
-        Err(_) => plain(StatusCode::NOT_FOUND, "Queue image not found"),
+        Ok(Err(error)) => plain(StatusCode::UNPROCESSABLE_ENTITY, &error.to_string()),
+        Err(error) => plain(StatusCode::INTERNAL_SERVER_ERROR, &error.to_string()),
+    }
+}
+async fn queue_dithered_preview(
+    State(state): State<Arc<AppState>>,
+    AxumPath(id): AxumPath<String>,
+) -> Response {
+    let source = match state.queue.prepare_source(&id).await {
+        Ok(source) => source,
+        Err(error) => return plain(StatusCode::NOT_FOUND, &error.to_string()),
+    };
+    let target = state.settings.snapshot().await.settings.rendering.target;
+    let orientation = source.entry.orientation;
+    let _render_permit = match state.render_serialization.clone().acquire_owned().await {
+        Ok(permit) => permit,
+        Err(error) => return plain(StatusCode::SERVICE_UNAVAILABLE, &error.to_string()),
+    };
+    let rendered = tokio::task::spawn_blocking(move || -> anyhow::Result<Vec<u8>> {
+        let decoded =
+            crate::renderer::decode_source_named(&source.bytes, Some(&source.entry.display_name))?;
+        crate::renderer::dithered_preview_png(&decoded, target, orientation)
+    })
+    .await;
+    match rendered {
+        Ok(Ok(bytes)) => image_response(
+            StatusCode::OK,
+            Body::from(bytes.clone()),
+            bytes.len(),
+            "image/png",
+            None,
+            Some("private, no-store"),
+        ),
+        Ok(Err(error)) => plain(StatusCode::UNPROCESSABLE_ENTITY, &error.to_string()),
+        Err(error) => plain(StatusCode::INTERNAL_SERVER_ERROR, &error.to_string()),
+    }
+}
+async fn set_queue_orientation(
+    State(state): State<Arc<AppState>>,
+    Form(form): Form<OrientationForm>,
+) -> Response {
+    let generation = match validate_action(&state, &form.csrf_token, &form.queue_generation) {
+        Ok(value) => value,
+        Err((status, message)) => return plain(status, &message),
+    };
+    let orientation = match form.orientation.as_str() {
+        "portrait" => crate::renderer::ImageOrientation::Portrait,
+        "landscape" => crate::renderer::ImageOrientation::Landscape,
+        _ => {
+            return plain(
+                StatusCode::UNPROCESSABLE_ENTITY,
+                "Unknown image orientation",
+            );
+        }
+    };
+    let rendering = state.settings.snapshot().await.settings.rendering;
+    let _render_permit = match state.render_serialization.clone().acquire_owned().await {
+        Ok(permit) => permit,
+        Err(error) => return plain(StatusCode::SERVICE_UNAVAILABLE, &error.to_string()),
+    };
+    match state
+        .queue
+        .set_orientation(
+            generation,
+            &form.id,
+            orientation,
+            rendering.target,
+            rendering.output_mode,
+        )
+        .await
+    {
+        Ok(_) => Redirect::to("/settings").into_response(),
+        Err(error) => plain(StatusCode::CONFLICT, &error.to_string()),
     }
 }
 
@@ -664,16 +889,17 @@ async fn stable_current_response(
     };
     let modified = httpdate::fmt_http_date(image.modified);
     if !no_store && is_not_modified(headers, image.modified) {
-        return jpeg_response(
+        return image_response(
             StatusCode::NOT_MODIFIED,
             Body::empty(),
             0,
+            &image.entry.media_type,
             Some(&modified),
             None,
         );
     }
     let length = image.bytes.len();
-    jpeg_response(
+    image_response(
         StatusCode::OK,
         if include_body {
             Body::from(image.bytes)
@@ -681,6 +907,7 @@ async fn stable_current_response(
             Body::empty()
         },
         length,
+        &image.entry.media_type,
         if no_store { None } else { Some(&modified) },
         if no_store { Some("no-store") } else { None },
     )
@@ -692,6 +919,8 @@ fn completion_response(
     permit: OwnedMutexGuard<()>,
 ) -> Response {
     let id = image.entry.id;
+    let media_type = image.entry.media_type;
+    let length = image.bytes.len();
     let stream = CompletionStream {
         bytes: Bytes::from(image.bytes),
         completion: Some((queue, id, permit)),
@@ -699,7 +928,8 @@ fn completion_response(
     };
     Response::builder()
         .status(StatusCode::OK)
-        .header(header::CONTENT_TYPE, "image/jpeg")
+        .header(header::CONTENT_TYPE, media_type)
+        .header(header::CONTENT_LENGTH, length)
         .header(header::CACHE_CONTROL, "no-store")
         .body(Body::from_stream(stream))
         .unwrap_or_else(|_| Response::new(Body::empty()))
@@ -737,16 +967,17 @@ impl Stream for CompletionStream {
     }
 }
 
-fn jpeg_response(
+fn image_response(
     status: StatusCode,
     body: Body,
     length: usize,
+    media_type: &str,
     modified: Option<&str>,
     cache: Option<&str>,
 ) -> Response {
     let mut builder = Response::builder()
         .status(status)
-        .header(header::CONTENT_TYPE, "image/jpeg");
+        .header(header::CONTENT_TYPE, media_type);
     if status != StatusCode::NOT_MODIFIED {
         builder = builder.header(header::CONTENT_LENGTH, length);
     }
@@ -789,6 +1020,16 @@ impl SettingsForm {
             csrf_token: csrf.into(),
             target_length: settings.queue.target_length.to_string(),
             max_upload_bytes: settings.queue.max_upload_bytes.to_string(),
+            frame_target: match settings.rendering.target {
+                FrameTarget::Paper7 => "paper_7",
+                FrameTarget::PaperL => "paper_l",
+            }
+            .into(),
+            output_mode: match settings.rendering.output_mode {
+                OutputMode::ServerDitherBmp => "server_dither_bmp",
+                OutputMode::DirectJpeg => "direct_jpeg",
+            }
+            .into(),
             advancement_type: "manual".into(),
             frame_client_ips: String::new(),
             schedule_timezone: "UTC".into(),
@@ -902,6 +1143,18 @@ impl SettingsForm {
                     .parse()
                     .map_err(|_| "Maximum upload bytes must be an integer")?,
             },
+            rendering: RenderingSettings {
+                target: match self.frame_target.as_str() {
+                    "paper_7" => FrameTarget::Paper7,
+                    "paper_l" => FrameTarget::PaperL,
+                    _ => return Err("Unknown frame target".into()),
+                },
+                output_mode: match self.output_mode.as_str() {
+                    "server_dither_bmp" => OutputMode::ServerDitherBmp,
+                    "direct_jpeg" => OutputMode::DirectJpeg,
+                    _ => return Err("Unknown frame output mode".into()),
+                },
+            },
             advancement,
             suppliers: vec![SupplierSettings {
                 id: self.supplier_id.trim().into(),
@@ -942,9 +1195,9 @@ mod tests {
 
     use super::*;
 
-    const A: &[u8] = b"\xff\xd8\xffA\xff\xd9";
-    const B: &[u8] = b"\xff\xd8\xffB\xff\xd9";
-    const C: &[u8] = b"\xff\xd8\xffC\xff\xd9";
+    const A: &[u8] = include_bytes!("../tests/fixtures/images/a.jpg");
+    const B: &[u8] = include_bytes!("../tests/fixtures/images/b.jpg");
+    const C: &[u8] = include_bytes!("../tests/fixtures/images/c.jpg");
 
     async fn manual_state(policy: AdvancementSettings) -> (tempfile::TempDir, Arc<AppState>) {
         let directory = tempdir().unwrap();
@@ -960,6 +1213,7 @@ mod tests {
                 target_length: 3,
                 max_upload_bytes: 1024,
             },
+            rendering: RenderingSettings::default(),
             advancement: policy,
             suppliers: vec![SupplierSettings {
                 id: "manual".into(),
@@ -992,6 +1246,18 @@ mod tests {
             .extension(ConnectInfo(SocketAddr::from((ip, 1234))))
             .body(Body::empty())
             .unwrap()
+    }
+
+    fn tiny_png() -> Vec<u8> {
+        let image = image::RgbaImage::from_pixel(2, 3, image::Rgba([12, 34, 56, 128]));
+        let mut bytes = Vec::new();
+        image::DynamicImage::ImageRgba8(image)
+            .write_to(
+                &mut std::io::Cursor::new(&mut bytes),
+                image::ImageFormat::Png,
+            )
+            .unwrap();
+        bytes
     }
 
     async fn bytes(response: Response) -> Vec<u8> {
@@ -1086,6 +1352,122 @@ mod tests {
             assert_eq!(u32::from_be_bytes(png[16..20].try_into().unwrap()), size);
             assert_eq!(u32::from_be_bytes(png[20..24].try_into().unwrap()), size);
         }
+    }
+
+    #[tokio::test]
+    async fn global_rendering_settings_rerender_the_whole_queue_before_activation() {
+        let (_directory, state) = manual_state(AdvancementSettings::Manual).await;
+        let snapshot = state.settings.snapshot().await;
+        let mut form = SettingsForm::from_settings(
+            snapshot.generation,
+            state.csrf_token(),
+            &snapshot.settings,
+        );
+        form.output_mode = "server_dither_bmp".into();
+        let response = router(state.clone())
+            .oneshot(
+                Request::post("/settings")
+                    .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
+                    .body(Body::from(serde_urlencoded::to_string(form).unwrap()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::SEE_OTHER);
+        assert_eq!(
+            state
+                .settings
+                .snapshot()
+                .await
+                .settings
+                .rendering
+                .output_mode,
+            OutputMode::ServerDitherBmp
+        );
+        let queue = state.queue.snapshot().await;
+        assert!(
+            queue
+                .entries
+                .iter()
+                .all(|entry| entry.media_type == "image/bmp")
+        );
+        for entry in queue.entries {
+            crate::renderer::validate_bmp4(
+                &state.queue.prepare(&entry.id).await.unwrap().bytes,
+                FrameTarget::Paper7,
+            )
+            .unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn dithered_frame_preview_and_orientation_override_are_non_advancing() {
+        let (_directory, state) = manual_state(AdvancementSettings::Manual).await;
+        let mut settings = state.settings.snapshot().await.settings;
+        settings.rendering.output_mode = OutputMode::ServerDitherBmp;
+        state
+            .queue
+            .rerender_all(settings.rendering.target, settings.rendering.output_mode)
+            .await
+            .unwrap();
+        state.settings.replace(1, settings).await.unwrap();
+        let before = state.queue.snapshot().await;
+
+        let frame = router(state.clone())
+            .oneshot(
+                Request::get("/frame/current.bmp")
+                    .extension(ConnectInfo(SocketAddr::from(([127, 0, 0, 1], 1))))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(frame.headers()[header::CONTENT_TYPE], "image/bmp");
+        crate::renderer::validate_bmp4(&bytes(frame).await, FrameTarget::Paper7).unwrap();
+
+        let preview = router(state.clone())
+            .oneshot(
+                Request::get(format!("/queue/dithered-preview/{}", before.entries[0].id))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(preview.headers()[header::CONTENT_TYPE], "image/png");
+        assert_eq!(
+            image::guess_format(&bytes(preview).await).unwrap(),
+            image::ImageFormat::Png
+        );
+        assert_eq!(state.queue.snapshot().await.generation, before.generation);
+
+        let generation = before.generation.to_string();
+        let body = serde_urlencoded::to_string([
+            ("csrf_token", state.csrf_token()),
+            ("queue_generation", generation.as_str()),
+            ("id", before.entries[0].id.as_str()),
+            ("orientation", "portrait"),
+        ])
+        .unwrap();
+        let changed = router(state.clone())
+            .oneshot(
+                Request::post("/queue/orientation")
+                    .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
+                    .body(Body::from(body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(changed.status(), StatusCode::SEE_OTHER);
+        let after = state.queue.snapshot().await;
+        assert_eq!(
+            after.entries[0].orientation,
+            crate::renderer::ImageOrientation::Portrait
+        );
+        assert_eq!(
+            after.entries[0].orientation_source,
+            crate::renderer::OrientationSource::Override
+        );
+        assert_eq!(after.entries.len(), before.entries.len());
     }
 
     #[tokio::test]
@@ -1265,10 +1647,10 @@ mod tests {
         let generation = state.queue.snapshot().await.generation;
         let boundary = "queue-upload-boundary";
         let mut body = format!(
-            "--{boundary}\r\nContent-Disposition: form-data; name=\"csrf_token\"\r\n\r\n{}\r\n--{boundary}\r\nContent-Disposition: form-data; name=\"queue_generation\"\r\n\r\n{generation}\r\n--{boundary}\r\nContent-Disposition: form-data; name=\"images\"; filename=\"direct.jpg\"\r\nContent-Type: image/jpeg\r\n\r\n",
+            "--{boundary}\r\nContent-Disposition: form-data; name=\"csrf_token\"\r\n\r\n{}\r\n--{boundary}\r\nContent-Disposition: form-data; name=\"queue_generation\"\r\n\r\n{generation}\r\n--{boundary}\r\nContent-Disposition: form-data; name=\"images\"; filename=\"direct.png\"\r\nContent-Type: image/png\r\n\r\n",
             state.csrf_token()
         ).into_bytes();
-        body.extend_from_slice(A);
+        body.extend_from_slice(&tiny_png());
         body.extend_from_slice(format!("\r\n--{boundary}--\r\n").as_bytes());
         let response = app
             .oneshot(
@@ -1283,16 +1665,33 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::SEE_OTHER);
-        assert!(
-            state
-                .queue
-                .snapshot()
-                .await
-                .entries
-                .iter()
-                .any(|entry| entry.display_name == "direct.jpg" && entry.supplier_id.is_none())
+        assert!(state.queue.snapshot().await.entries.iter().any(|entry| {
+            entry.display_name == "direct.png"
+                && entry.supplier_id.is_none()
+                && entry.media_type == "image/jpeg"
+                && entry.orientation == crate::renderer::ImageOrientation::Portrait
+        }));
+        let uploaded = state
+            .queue
+            .snapshot()
+            .await
+            .entries
+            .into_iter()
+            .find(|entry| entry.display_name == "direct.png")
+            .unwrap();
+        assert_eq!(
+            image::guess_format(
+                &state
+                    .queue
+                    .prepare_source(&uploaded.id)
+                    .await
+                    .unwrap()
+                    .bytes
+            )
+            .unwrap(),
+            image::ImageFormat::Png
         );
-        assert!(!directory.path().join("source/direct.jpg").exists());
+        assert!(!directory.path().join("source/direct.png").exists());
     }
 
     #[tokio::test]
@@ -1327,11 +1726,7 @@ mod tests {
     #[tokio::test]
     async fn background_refill_reacts_to_queue_events_and_shuts_down() {
         let (directory, state) = manual_state(AdvancementSettings::Manual).await;
-        fs::write(
-            directory.path().join("source/d.jpg"),
-            b"\xff\xd8\xffD\xff\xd9",
-        )
-        .unwrap();
+        fs::write(directory.path().join("source/d.jpg"), A).unwrap();
         let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
         let task = tokio::spawn(refill::run(state.clone(), shutdown_rx));
         tokio::time::sleep(TokioDuration::from_millis(5)).await;
@@ -1370,11 +1765,7 @@ mod tests {
             .await
             .unwrap()
             .bytes;
-        fs::write(
-            directory.path().join("source/b.jpg"),
-            b"\xff\xd8\xffCHANGED\xff\xd9",
-        )
-        .unwrap();
+        fs::write(directory.path().join("source/b.jpg"), C).unwrap();
         fs::remove_file(directory.path().join("source/a.jpg")).unwrap();
         assert_eq!(
             state
@@ -1393,11 +1784,7 @@ mod tests {
             .await
             .unwrap();
         // c was already queued, and removed a remains seen; add d as the next alphabetical unseen candidate.
-        fs::write(
-            directory.path().join("source/d.jpg"),
-            b"\xff\xd8\xffD\xff\xd9",
-        )
-        .unwrap();
+        fs::write(directory.path().join("source/d.jpg"), A).unwrap();
         refill::refill_once(&state).await.unwrap();
         let names = state
             .queue

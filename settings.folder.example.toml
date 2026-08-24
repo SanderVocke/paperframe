@@ -7,6 +7,12 @@ target_length = 10
 # Maximum size of one complete upload request (25 MiB here).
 max_upload_bytes = 26214400
 
+[rendering]
+# Compatibility default is direct_jpeg. Use server_dither_bmp to send a
+# ready-to-display six-color BMP and avoid on-frame dithering.
+target = "paper_7" # or "paper_l"
+output_mode = "server_dither_bmp"
+
 [advancement]
 # Options: "manual", "scheduled", or "every_fetch".
 type = "every_fetch"
@@ -23,6 +29,6 @@ id = "primary"
 type = "manual_folder"
 
 [suppliers.settings]
-# Top-level .jpg/.jpeg files are discovered alphabetically. No recursion.
+# Top-level supported raster images are discovered alphabetically. No recursion.
 directory = "/absolute/path/to/source-images"
 poll_interval_seconds = 60

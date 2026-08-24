@@ -1,0 +1,3 @@
+[submodule "vendor/epdoptimize"]
+	path = vendor/epdoptimize
+	url = https://github.com/paperlesspaper/epdoptimize.git

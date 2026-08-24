@@ -6,6 +6,10 @@
 target_length = 10
 max_upload_bytes = 26214400
 
+[rendering]
+target = "paper_7"
+output_mode = "server_dither_bmp"
+
 [advancement]
 type = "manual"
 

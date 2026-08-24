@@ -115,7 +115,7 @@ impl Supplier for DigikamSupplier {
                             let mut bytes = Vec::new();
                             let result = std::io::Read::read_to_end(&mut source, &mut bytes)
                                 .context("failed to read candidate")
-                                .and_then(|_| validate_jpeg(&bytes));
+                                .and_then(|_| validate_image(&bytes, &candidate.file_name.to_string_lossy()));
                             if let Err(error) = result {
                                 tracing::warn!(supplier = %supplier_id, image_id = candidate.image_id, %error, "DigiKam candidate skipped");
                                 continue;
@@ -206,14 +206,15 @@ fn validate_manual_root(configured: &Path, queue_root: &Path) -> Result<PathBuf>
 }
 
 fn scan_manual(root: &Path, seen: &BTreeSet<String>, limit: usize) -> Result<Vec<SuppliedImage>> {
+    let root = std::fs::canonicalize(root).context("failed to resolve manual source root")?;
     let mut paths = Vec::new();
-    for entry in std::fs::read_dir(root).context("failed to scan manual source")? {
+    for entry in std::fs::read_dir(&root).context("failed to scan manual source")? {
         let entry = entry?;
         let name = entry.file_name();
         let name = name
             .to_str()
             .context("manual JPEG filenames must be UTF-8")?;
-        if !is_jpeg_name(name) {
+        if !is_supported_image_name(name) {
             continue;
         }
         let metadata = std::fs::symlink_metadata(entry.path())?;
@@ -227,7 +228,7 @@ fn scan_manual(root: &Path, seen: &BTreeSet<String>, limit: usize) -> Result<Vec
     for (name, path) in paths {
         let canonical =
             std::fs::canonicalize(&path).context("failed to resolve manual source image")?;
-        if !canonical.starts_with(root) {
+        if !canonical.starts_with(&root) {
             bail!("manual source image escapes source root");
         }
         let metadata = std::fs::symlink_metadata(&canonical)?;
@@ -236,7 +237,7 @@ fn scan_manual(root: &Path, seen: &BTreeSet<String>, limit: usize) -> Result<Vec
         }
         let bytes = std::fs::read(&canonical)
             .with_context(|| format!("failed to read manual image {name}"))?;
-        validate_jpeg(&bytes).with_context(|| format!("invalid manual JPEG {name}"))?;
+        validate_image(&bytes, &name).with_context(|| format!("invalid manual image {name}"))?;
         let content_digest = Sha256::digest(&bytes)
             .iter()
             .map(|byte| format!("{byte:02x}"))
@@ -257,16 +258,11 @@ fn scan_manual(root: &Path, seen: &BTreeSet<String>, limit: usize) -> Result<Vec
     Ok(supplied)
 }
 
-fn is_jpeg_name(name: &str) -> bool {
-    let lower = name.to_ascii_lowercase();
-    lower.ends_with(".jpg") || lower.ends_with(".jpeg")
+fn is_supported_image_name(name: &str) -> bool {
+    image::ImageFormat::from_path(name).is_ok()
 }
-fn validate_jpeg(bytes: &[u8]) -> Result<()> {
-    if bytes.len() < 5 || !bytes.starts_with(&[0xff, 0xd8, 0xff]) || !bytes.ends_with(&[0xff, 0xd9])
-    {
-        bail!("invalid JPEG markers");
-    }
-    Ok(())
+fn validate_image(bytes: &[u8], name: &str) -> Result<()> {
+    crate::renderer::decode_source_named(bytes, Some(name)).map(|_| ())
 }
 
 #[cfg(test)]
@@ -281,8 +277,16 @@ mod tests {
         let queue = directory.path().join("queue");
         std::fs::create_dir(&photos).unwrap();
         std::fs::create_dir(&queue).unwrap();
-        std::fs::write(photos.join("a.jpg"), b"\xff\xd8\xffA\xff\xd9").unwrap();
-        std::fs::write(photos.join("b.jpg"), b"\xff\xd8\xffB\xff\xd9").unwrap();
+        std::fs::write(
+            photos.join("a.jpg"),
+            include_bytes!("../tests/fixtures/images/a.jpg"),
+        )
+        .unwrap();
+        std::fs::write(
+            photos.join("b.jpg"),
+            include_bytes!("../tests/fixtures/images/b.jpg"),
+        )
+        .unwrap();
         let database = directory.path().join("catalog.db");
         rusqlite::Connection::open(&database).unwrap();
         let configured = SupplierSettings {
@@ -349,10 +353,33 @@ mod tests {
     }
 
     #[test]
+    fn manual_supply_accepts_enabled_non_jpeg_formats() {
+        let dir = tempdir().unwrap();
+        let image = image::RgbaImage::from_pixel(2, 3, image::Rgba([1, 2, 3, 128]));
+        let mut png = Vec::new();
+        image::DynamicImage::ImageRgba8(image)
+            .write_to(&mut std::io::Cursor::new(&mut png), image::ImageFormat::Png)
+            .unwrap();
+        std::fs::write(dir.path().join("photo.png"), png).unwrap();
+        std::fs::write(dir.path().join("ignored.txt"), b"not an image").unwrap();
+        let supplied = scan_manual(dir.path(), &BTreeSet::new(), 10).unwrap();
+        assert_eq!(supplied.len(), 1);
+        assert_eq!(supplied[0].display_name, "photo.png");
+    }
+
+    #[test]
     fn manual_supply_is_alphabetical_and_changed_content_is_new() {
         let dir = tempdir().unwrap();
-        std::fs::write(dir.path().join("b.jpg"), b"\xff\xd8\xffB\xff\xd9").unwrap();
-        std::fs::write(dir.path().join("a.jpg"), b"\xff\xd8\xffA\xff\xd9").unwrap();
+        std::fs::write(
+            dir.path().join("b.jpg"),
+            include_bytes!("../tests/fixtures/images/b.jpg"),
+        )
+        .unwrap();
+        std::fs::write(
+            dir.path().join("a.jpg"),
+            include_bytes!("../tests/fixtures/images/a.jpg"),
+        )
+        .unwrap();
         let first = scan_manual(dir.path(), &BTreeSet::new(), 10).unwrap();
         assert_eq!(
             first
@@ -362,7 +389,11 @@ mod tests {
             vec!["a.jpg", "b.jpg"]
         );
         let seen = first.iter().map(|item| item.source_key.clone()).collect();
-        std::fs::write(dir.path().join("a.jpg"), b"\xff\xd8\xffNEW\xff\xd9").unwrap();
+        std::fs::write(
+            dir.path().join("a.jpg"),
+            include_bytes!("../tests/fixtures/images/c.jpg"),
+        )
+        .unwrap();
         let changed = scan_manual(dir.path(), &seen, 10).unwrap();
         assert_eq!(changed.len(), 1);
         assert_eq!(changed[0].display_name, "a.jpg");

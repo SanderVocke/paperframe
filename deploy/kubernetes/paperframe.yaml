@@ -20,6 +20,10 @@ data:
     target_length = 10
     max_upload_bytes = 26214400
 
+    [rendering]
+    target = "paper_7"
+    output_mode = "server_dither_bmp"
+
     [advancement]
     type = "manual"
 
@@ -43,6 +47,8 @@ data:
       AND (
           lower(Images.name) LIKE '%.jpg'
           OR lower(Images.name) LIKE '%.jpeg'
+          OR lower(Images.name) LIKE '%.png'
+          OR lower(Images.name) LIKE '%.webp'
       )
     ORDER BY Images.id
     LIMIT 100000
