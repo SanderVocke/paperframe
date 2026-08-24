@@ -58,9 +58,9 @@ The configuration path is optional and defaults to `config.toml`. To enable debu
 ### 3. Open the control page and connect the frame
 
 - Control page: `http://SERVER_IP:8080/settings`
-- Frame image: `http://SERVER_IP:8080/frame/current.jpg`
+- Frame image (stable, backward-compatible URL): `http://SERVER_IP:8080/frame/current.jpg`
 
-Replace `SERVER_IP` with the computer's LAN address. Configure the frame to fetch the frame-image URL. The control page shows readiness, refill errors, the current image, upcoming images, and all queue/settings controls.
+Replace `SERVER_IP` with the computer's LAN address. Configure the frame to fetch the frame-image URL. Despite the `.jpg` suffix, this endpoint serves the configured current representation: `image/bmp` in server-dither mode or `image/jpeg` in direct-JPEG mode. `/frame/current.bmp` is an alias for the same response. The control page shows readiness, refill errors, the current image, upcoming images, and all queue/settings controls.
 
 The quick-start policy is `manual`, so test downloads cannot unexpectedly move the queue. After confirming that the frame works, choose another policy on the control page if wanted.
 
@@ -101,7 +101,7 @@ The first queue entry is always the current image.
 - **Remove** deletes that managed copy. Removing the current entry promotes the next one.
 - **Upload photos** accepts any enabled raster format and adds independent source/derived copies to the queue.
 - **Save order** applies the complete current-first order shown in the text box. Move whole lines and do not alter their opaque IDs.
-- **Non-advancing preview** lets you inspect an entry without triggering fetch-based advancement.
+- **Non-advancing preview** opens an in-page comparison: the undithered original is always shown, and a server-dithered entry also shows its exact six-color result. Each side links to the retained full source or stored frame derivative.
 
 Advancing never consumes the only remaining image, so the frame keeps displaying it. Removing that sole entry is allowed and empties the queue. An empty queue makes the frame URL return `404` and `/health/ready` return `503`.
 
@@ -212,7 +212,7 @@ type = "every_fetch"
 frame_client_ips = ["192.168.1.50"]
 ```
 
-A successful qualifying `GET /frame/current.jpg` advances after the server finishes the response body. `HEAD`, previews, health checks, and streams dropped before server-side completion do not advance.
+A successful qualifying `GET` to either `/frame/current.jpg` or `/frame/current.bmp` advances after the server finishes the response body. `HEAD`, previews, health checks, and streams dropped before server-side completion do not advance.
 
 Set `frame_client_ips` to the frame's IP so browser requests do not advance the queue. An empty list means **every direct client IP qualifies**. Matching uses the direct TCP peer and deliberately ignores `Forwarded`, `X-Forwarded-For`, and `User-Agent`; when using a reverse proxy, the direct peer will normally be the proxy.
 
@@ -309,7 +309,7 @@ There is no authentication, authorization, or TLS. CSRF and stale-generation che
 
 ## HTTP reference
 
-Most users only need `/settings` and `/frame/current.jpg`.
+Most users only need `/settings` and the stable `/frame/current.jpg` endpoint. The `.jpg` and `.bmp` frame paths are aliases; the configured output mode determines the response format.
 
 | Method | Path | Purpose |
 |---|---|---|
@@ -317,11 +317,13 @@ Most users only need `/settings` and `/frame/current.jpg`.
 | `GET` | `/manifest.webmanifest` | Progressive web app metadata |
 | `GET` | `/sw.js` | Static-assets-only service worker |
 | `GET` | `/pwa/*` | Progressive web app icons |
-| `GET` / `HEAD` | `/frame/current.jpg` | Backward-compatible current frame representation |
-| `GET` / `HEAD` | `/frame/current.bmp` | Format-appropriate alias for the same current representation |
+| `GET` / `HEAD` | `/frame/current.jpg` | Stable backward-compatible endpoint; returns the configured JPEG or BMP representation |
+| `GET` / `HEAD` | `/frame/current.bmp` | Alias for the same configured representation |
 | `GET` | `/queue/thumbnail/{id}` | Non-advancing thumbnail |
-| `GET` | `/queue/preview/{id}` | Non-advancing full original preview |
-| `GET` | `/queue/dithered-preview/{id}` | Non-advancing six-color preview |
+| `GET` | `/queue/preview/{id}` | Browser-compatible, undithered original preview |
+| `GET` | `/queue/original/{id}` | Retained original source bytes |
+| `GET` | `/queue/rendered/{id}` | Stored frame derivative bytes (BMP or JPEG) |
+| `GET` | `/queue/dithered-preview/{id}` | Browser-compatible, non-advancing six-color preview |
 | `POST` | `/queue/reorder` | Save complete current-first order |
 | `POST` | `/queue/remove` | Remove any queue entry |
 | `POST` | `/queue/upload` | Decode/render and append uploaded images |

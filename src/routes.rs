@@ -59,6 +59,8 @@ pub fn router(state: Arc<AppState>) -> Router {
         )
         .route("/queue/thumbnail/{id}", get(queue_thumbnail))
         .route("/queue/preview/{id}", get(queue_preview))
+        .route("/queue/original/{id}", get(queue_original))
+        .route("/queue/rendered/{id}", get(queue_rendered))
         .route("/queue/dithered-preview/{id}", get(queue_dithered_preview))
         .route("/queue/orientation", post(set_queue_orientation))
         .route("/supplier/refresh", post(refresh_supplier))
@@ -137,6 +139,7 @@ struct QueueView {
     is_current: bool,
     orientation_label: String,
     portrait: bool,
+    is_dithered: bool,
     order_line: String,
 }
 
@@ -501,6 +504,7 @@ fn queue_view(index: usize, entry: &QueueEntry) -> QueueView {
             }
         ),
         portrait: entry.orientation == crate::renderer::ImageOrientation::Portrait,
+        is_dithered: entry.media_type == "image/bmp",
         order_line: format!("{}\t{}", entry.id, entry.display_name),
     }
 }
@@ -719,6 +723,66 @@ async fn queue_preview(
     AxumPath(id): AxumPath<String>,
 ) -> Response {
     original_preview_response(&state, state.queue.prepare_source(&id).await).await
+}
+async fn queue_original(
+    State(state): State<Arc<AppState>>,
+    AxumPath(id): AxumPath<String>,
+) -> Response {
+    let source = match state.queue.prepare_source(&id).await {
+        Ok(source) => source,
+        Err(error) => return plain(StatusCode::NOT_FOUND, &error.to_string()),
+    };
+    let media_type = source_media_type(&source.entry.display_name, &source.bytes);
+    image_response(
+        StatusCode::OK,
+        Body::from(source.bytes.clone()),
+        source.bytes.len(),
+        media_type,
+        None,
+        Some("private, no-store"),
+    )
+}
+async fn queue_rendered(
+    State(state): State<Arc<AppState>>,
+    AxumPath(id): AxumPath<String>,
+) -> Response {
+    let rendered = match state.queue.prepare(&id).await {
+        Ok(rendered) => rendered,
+        Err(error) => return plain(StatusCode::NOT_FOUND, &error.to_string()),
+    };
+    image_response(
+        StatusCode::OK,
+        Body::from(rendered.bytes.clone()),
+        rendered.bytes.len(),
+        &rendered.entry.media_type,
+        None,
+        Some("private, no-store"),
+    )
+}
+fn source_media_type(name: &str, bytes: &[u8]) -> &'static str {
+    let format = image::guess_format(bytes).ok().or_else(|| {
+        std::path::Path::new(name)
+            .extension()
+            .and_then(|extension| extension.to_str())
+            .and_then(image::ImageFormat::from_extension)
+    });
+    match format {
+        Some(image::ImageFormat::Jpeg) => "image/jpeg",
+        Some(image::ImageFormat::Png) => "image/png",
+        Some(image::ImageFormat::Gif) => "image/gif",
+        Some(image::ImageFormat::WebP) => "image/webp",
+        Some(image::ImageFormat::Bmp) => "image/bmp",
+        Some(image::ImageFormat::Tiff) => "image/tiff",
+        Some(image::ImageFormat::Tga) => "image/x-tga",
+        Some(image::ImageFormat::Ico) => "image/x-icon",
+        Some(image::ImageFormat::Pnm) => "image/x-portable-anymap",
+        Some(image::ImageFormat::Dds) => "image/vnd-ms.dds",
+        Some(image::ImageFormat::Hdr) => "image/vnd.radiance",
+        Some(image::ImageFormat::OpenExr) => "image/x-exr",
+        Some(image::ImageFormat::Qoi) => "image/qoi",
+        Some(image::ImageFormat::Farbfeld) | None => "application/octet-stream",
+        Some(_) => "application/octet-stream",
+    }
 }
 async fn original_preview_response(
     state: &Arc<AppState>,
@@ -1508,6 +1572,25 @@ mod tests {
             image::guess_format(&bytes(preview).await).unwrap(),
             image::ImageFormat::Png
         );
+        let rendered = router(state.clone())
+            .oneshot(
+                Request::get(format!("/queue/rendered/{}", before.entries[0].id))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(rendered.headers()[header::CONTENT_TYPE], "image/bmp");
+        crate::renderer::validate_bmp4(&bytes(rendered).await, FrameTarget::Paper7).unwrap();
+        let page = router(state.clone())
+            .oneshot(Request::get("/settings").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        let page = String::from_utf8(bytes(page).await.to_vec()).unwrap();
+        assert!(page.contains("<dialog class=\"preview-dialog\""));
+        assert!(page.contains("data-dithered=\"true\""));
+        assert!(page.contains("/queue/original/"));
+        assert!(page.contains("/queue/rendered/"));
         assert_eq!(state.queue.snapshot().await.generation, before.generation);
 
         let generation = before.generation.to_string();
@@ -1675,6 +1758,37 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(bytes(thumbnail).await, A);
+        let original = app
+            .clone()
+            .oneshot(
+                Request::get(format!("/queue/original/{}", before.entries[0].id))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(original.headers()[header::CONTENT_TYPE], "image/jpeg");
+        assert_eq!(bytes(original).await, A);
+        let rendered = app
+            .clone()
+            .oneshot(
+                Request::get(format!("/queue/rendered/{}", before.entries[0].id))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(rendered.headers()[header::CONTENT_TYPE], "image/jpeg");
+        assert_eq!(bytes(rendered).await, A);
+        let page = app
+            .clone()
+            .oneshot(Request::get("/settings").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        let page = String::from_utf8(bytes(page).await.to_vec()).unwrap();
+        assert!(page.contains("data-preview-trigger"));
+        assert!(page.contains("data-dithered=\"false\""));
+        assert!(!page.contains("class=\"photo-link\" href="));
         assert_eq!(state.queue.snapshot().await.generation, before.generation);
 
         let bad = serde_urlencoded::to_string([
