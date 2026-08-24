@@ -93,53 +93,53 @@ Depends on Stage 1.
 
 Depends on Stage 2.
 
-- [ ] Add pure-Rust raster decoding with an explicit codec feature list, first-frame behavior, white alpha compositing, metadata-orientation handling, and encoded/decoded resource limits.
-- [ ] Implement orientation inference and the deterministic logical-to-physical transform for Paper 7 and Paper L, including the fixed 90-degree convention and full-frame firmware-like nearest-neighbor resize path.
-- [ ] Implement the versioned production profile using the firmware ideal palette, clean-color snapping thresholds, non-serpentine Floyd–Steinberg kernel, explicit ESP-compatible integer rounding/clamping, and no hidden image-dependent adjustments.
-- [ ] Implement a 4-bit indexed BMP encoder/parser/validator with top-down rows, correct palette/header fields, firmware nibble mapping, exact dimensions, overflow checks, and no row-order or padding ambiguity.
-- [ ] Implement deterministic JPEG output for non-JPEG sources and safe pass-through rules for valid JPEG input, including fixed quality/subsampling/alpha behavior where encoding is required.
-- [ ] Implement a browser preview conversion from the final indexed/BMP representation to PNG or another reliably displayable lossless format without changing indices.
-- [ ] Test all supported codec families with small fixtures, corrupt/mislabeled/oversized files, square-image inference, both orientation transforms, both targets, alpha/animation rules, exact BMP bytes, firmware-profile vectors, and JPEG decodeability.
-- [ ] Verify generated BMPs with an independent parser and the offline firmware/Web-UI format expectations, then run formatting, strict linting, tests, and a release build; commit the renderer/encoder milestone.
+- [x] Add pure-Rust raster decoding with an explicit codec feature list, first-frame behavior, white alpha compositing, metadata-orientation handling, and encoded/decoded resource limits.
+- [x] Implement orientation inference and the deterministic logical-to-physical transform for Paper 7 and Paper L, including the fixed 90-degree convention and full-frame firmware-like nearest-neighbor resize path.
+- [x] Implement the versioned production profile using the firmware ideal palette, clean-color snapping thresholds, non-serpentine Floyd–Steinberg kernel, explicit ESP-compatible integer rounding/clamping, and no hidden image-dependent adjustments.
+- [x] Implement a 4-bit indexed BMP encoder/parser/validator with top-down rows, correct palette/header fields, firmware nibble mapping, exact dimensions, overflow checks, and no row-order or padding ambiguity.
+- [x] Implement deterministic JPEG output for non-JPEG sources and safe pass-through rules for valid JPEG input, including fixed quality/subsampling/alpha behavior where encoding is required.
+- [x] Implement a browser preview conversion from the final indexed/BMP representation to PNG or another reliably displayable lossless format without changing indices.
+- [x] Test all supported codec families with small fixtures, corrupt/mislabeled/oversized files, square-image inference, both orientation transforms, both targets, alpha/animation rules, exact BMP bytes, firmware-profile vectors, and JPEG decodeability.
+- [x] Verify generated BMPs with an independent parser and the offline firmware/Web-UI format expectations, then run formatting, strict linting, tests, and a release build; commit the renderer/encoder milestone.
 
 ### Stage 4 — Redesign queue persistence and enqueue-time rendering
 
 Depends on Stage 3.
 
-- [ ] Introduce a versioned queue descriptor that records source and derivative metadata, orientation and whether it is inferred/overridden, renderer profile/target, media type, lengths, and digests while preserving supplier identity and seen history.
-- [ ] Split opaque queue storage into confined source and served-derivative objects, and update startup reconciliation, prepare/current/remove/reorder/advance, backup expectations, and digest validation for both files.
-- [ ] Refactor supplier and upload requests to carry general encoded raster bytes; broaden manual-folder discovery and DigiKam validation consistently with the decoder while retaining top-level-only, regular-file, non-symlink, and path-confinement rules.
-- [ ] Add a rendering service that decodes and renders batches in bounded blocking work before acquiring the short queue publication lock, then atomically publishes all source/derivative files, descriptor changes, and seen marks.
-- [ ] Implement server-dither enqueue to produce BMP and direct-JPEG enqueue to pass through or convert to JPEG; ensure failures skip/report supplier candidates or reject uploads without partial queue or seen-history changes.
-- [ ] Implement transactional whole-queue regeneration for global mode/target changes and single-entry regeneration for orientation overrides, with explicit coordination against concurrent enqueue/remove/reorder and last-known-good retention.
-- [ ] Add version-1 queue and legacy `current.jpg` migration/recovery, including interrupted temporary cleanup and a failure path that preserves old objects for diagnosis/rollback.
-- [ ] Test mixed source formats, batch truncation, render failures, publication/descriptor failures, concurrent mutations, global transition rollback, per-entry rerender rollback, restart, orphan cleanup, migration, source immutability, and unchanged queue advancement/order semantics.
-- [ ] Verify formatting, strict linting, all queue/renderer tests, and a release build; commit the queue/rendering integration milestone.
+- [x] Introduce a versioned queue descriptor that records source and derivative metadata, orientation and whether it is inferred/overridden, renderer profile/target, media type, lengths, and digests while preserving supplier identity and seen history.
+- [x] Split opaque queue storage into confined source and served-derivative objects, and update startup reconciliation, prepare/current/remove/reorder/advance, backup expectations, and digest validation for both files.
+- [x] Refactor supplier and upload requests to carry general encoded raster bytes; broaden manual-folder discovery and DigiKam validation consistently with the decoder while retaining top-level-only, regular-file, non-symlink, and path-confinement rules.
+- [x] Add a rendering service that decodes and renders batches in bounded blocking work before acquiring the short queue publication lock, then atomically publishes all source/derivative files, descriptor changes, and seen marks.
+- [x] Implement server-dither enqueue to produce BMP and direct-JPEG enqueue to pass through or convert to JPEG; ensure failures skip/report supplier candidates or reject uploads without partial queue or seen-history changes.
+- [x] Implement transactional whole-queue regeneration for global mode/target changes and single-entry regeneration for orientation overrides, with explicit coordination against concurrent enqueue/remove/reorder and last-known-good retention.
+- [x] Add version-1 queue and legacy `current.jpg` migration/recovery, including interrupted temporary cleanup and a failure path that preserves old objects for diagnosis/rollback.
+- [x] Test mixed source formats, batch truncation, render failures, publication/descriptor failures, concurrent mutations, global transition rollback, per-entry rerender rollback, restart, orphan cleanup, migration, source immutability, and unchanged queue advancement/order semantics.
+- [x] Verify formatting, strict linting, all queue/renderer tests, and a release build; commit the queue/rendering integration milestone.
 
 ### Stage 5 — Mode-aware serving, previews, and web controls
 
 Depends on Stage 4.
 
-- [ ] Add validated global settings for frame target and output mode, compatibility defaults for existing settings files, canonical serialization, form parsing, and transaction ordering that prevents settings from selecting unbuilt derivatives.
-- [ ] Refactor frame response construction to use derivative media metadata and dynamic `Content-Type` while preserving completed-fetch serialization/advancement, `HEAD`, conditional requests, no-store behavior, readiness, last-request tracking, and body-drop semantics.
-- [ ] Preserve `/frame/current.jpg` as a tested compatibility endpoint and add/document a format-appropriate canonical endpoint or alias without causing redirects or duplicate advancement.
-- [ ] Keep original preview/thumbnail routes non-advancing and add a dithered-preview route based on the current production profile, target, and per-entry orientation; define bounded on-demand behavior when direct-JPEG mode has no stored BMP preview.
-- [ ] Add settings-page controls for target and global output mode, per-card inferred/overridden portrait/landscape controls, and an accessible original/dithered preview switch or links with clear current-mode/status labels.
-- [ ] Protect orientation and global mutations with CSRF and generation checks, render submitted values/errors safely, and retain POST/Redirect/GET on success.
-- [ ] Add route/template tests for BMP and JPEG bodies/headers, `GET`/`HEAD`/conditional/completed-fetch behavior, non-advancing previews, readiness during failed transitions, global settings persistence/staleness, orientation override/staleness, HTML escaping, and controls usable without drag-and-drop.
-- [ ] Perform a browser usability pass at desktop/mobile widths and verify that preview requests and settings-page asset caching never expose frame images through the service worker cache.
-- [ ] Verify formatting, strict linting, all tests, and a release build; commit the complete web/HTTP milestone.
+- [x] Add validated global settings for frame target and output mode, compatibility defaults for existing settings files, canonical serialization, form parsing, and transaction ordering that prevents settings from selecting unbuilt derivatives.
+- [x] Refactor frame response construction to use derivative media metadata and dynamic `Content-Type` while preserving completed-fetch serialization/advancement, `HEAD`, conditional requests, no-store behavior, readiness, last-request tracking, and body-drop semantics.
+- [x] Preserve `/frame/current.jpg` as a tested compatibility endpoint and add/document a format-appropriate canonical endpoint or alias without causing redirects or duplicate advancement.
+- [x] Keep original preview/thumbnail routes non-advancing and add a dithered-preview route based on the current production profile, target, and per-entry orientation; define bounded on-demand behavior when direct-JPEG mode has no stored BMP preview.
+- [x] Add settings-page controls for target and global output mode, per-card inferred/overridden portrait/landscape controls, and an accessible original/dithered preview switch or links with clear current-mode/status labels.
+- [x] Protect orientation and global mutations with CSRF and generation checks, render submitted values/errors safely, and retain POST/Redirect/GET on success.
+- [x] Add route/template tests for BMP and JPEG bodies/headers, `GET`/`HEAD`/conditional/completed-fetch behavior, non-advancing previews, readiness during failed transitions, global settings persistence/staleness, HTML escaping, and controls usable without drag-and-drop.
+- [x] Perform a browser usability pass at desktop/mobile widths and verify that preview requests and settings-page asset caching never expose frame images through the service worker cache.
+- [x] Verify formatting, strict linting, all tests, and a release build; commit the complete web/HTTP milestone.
 
 ### Stage 6 — Documentation, operations, and safety/performance audit
 
 Depends on Stages 1–5.
 
-- [ ] Update README, settings examples, UI help, and endpoint reference for codec support, image limits, first-frame/alpha rules, hard-coded profile behavior, target/output modes, portrait convention, physical-frame repositioning, BMP firmware configuration, and direct-JPEG conversion.
-- [ ] Document queue layout/version migration, source versus derivative retention, storage growth, backup/rollback requirements, global rerender behavior, and how renderer/profile changes affect existing entries.
-- [ ] Update Docker/Kubernetes guidance and manifests for expected CPU, memory, temporary disk, persistent queue growth, one-replica operation, and graceful shutdown during rendering without adding non-Rust runtime packages.
-- [ ] Audit decoder limits and every source/derivative open/create/read/remove/rename path for confinement, symlink behavior, collision safety, cleanup, and preservation of DigiKam/manual source immutability.
-- [ ] Measure enqueue and whole-queue regeneration on representative Paper 7/Paper L photos; confirm bounded concurrency keeps frame serving responsive and document supported operational limits.
-- [ ] Verify all documented clean-install, migration, backup, and rollback procedures from temporary directories; commit the documentation/operations milestone.
+- [x] Update README, settings examples, UI help, and endpoint reference for codec support, image limits, first-frame/alpha rules, hard-coded profile behavior, target/output modes, portrait convention, physical-frame repositioning, BMP firmware configuration, and direct-JPEG conversion.
+- [x] Document queue layout/version migration, source versus derivative retention, storage growth, backup/rollback requirements, global rerender behavior, and how renderer/profile changes affect existing entries.
+- [x] Update Docker/Kubernetes guidance and manifests for expected CPU, memory, temporary disk, persistent queue growth, one-replica operation, and graceful shutdown during rendering without adding non-Rust runtime packages.
+- [x] Audit decoder limits and every source/derivative open/create/read/remove/rename path for confinement, symlink behavior, collision safety, cleanup, and preservation of DigiKam/manual source immutability.
+- [x] Measure enqueue and whole-queue regeneration on representative Paper 7/Paper L photos; confirm bounded concurrency keeps frame serving responsive and document supported operational limits.
+- [x] Verify all documented clean-install, migration, backup, and rollback procedures from temporary directories; commit the documentation/operations milestone.
 
 ### Stage 7 — Final end-to-end validation
 

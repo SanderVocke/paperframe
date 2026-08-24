@@ -303,19 +303,23 @@ async fn update_settings(
     } else {
         None
     };
-    if rendering_changed
-        && let Err(error) = state
+    if rendering_changed {
+        match state
             .queue
             .rerender_all(proposed.rendering.target, proposed.rendering.output_mode)
             .await
-    {
-        return render_error(
-            &state,
-            form,
-            StatusCode::UNPROCESSABLE_ENTITY,
-            &format!("Could not rebuild queued images: {error}"),
-        )
-        .await;
+        {
+            Ok(_) => {}
+            Err(error) => {
+                return render_error(
+                    &state,
+                    form,
+                    StatusCode::UNPROCESSABLE_ENTITY,
+                    &format!("Could not rebuild queued images: {error}"),
+                )
+                .await;
+            }
+        }
     }
     match state.settings.replace(expected, proposed).await {
         Ok(_) => {

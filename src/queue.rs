@@ -546,10 +546,11 @@ impl QueueStore {
         if let Some(expected) = expected {
             require_generation(&current, expected)?;
         }
-        if let Some(id) = id
-            && current.entries.first().map(|entry| entry.id.as_str()) != Some(id)
-        {
-            return Ok(false);
+        match id {
+            Some(id) if current.entries.first().map(|entry| entry.id.as_str()) != Some(id) => {
+                return Ok(false);
+            }
+            _ => {}
         }
         if current.entries.len() <= 1 {
             self.notify(QueueEventReason::BlockedAdvance, current.generation);
@@ -1306,6 +1307,61 @@ mod tests {
         let reloaded = QueueStore::new(dir.path(), false).await.unwrap();
         assert_eq!(reloaded.current().await.unwrap().unwrap().bytes, A);
         assert!(reloaded.seen("s").await.contains("b"));
+    }
+
+    #[tokio::test]
+    async fn whole_queue_directory_backup_restores_source_derivative_and_order() {
+        let original = tempdir().unwrap();
+        let queue = QueueStore::new(original.path(), false).await.unwrap();
+        let a = queue
+            .enqueue(
+                "a.jpg".into(),
+                A.to_vec(),
+                Some("s".into()),
+                Some("a".into()),
+            )
+            .await
+            .unwrap();
+        queue.preserve_legacy_source(&a.id).await.unwrap();
+        let b = queue
+            .enqueue(
+                "b.jpg".into(),
+                B.to_vec(),
+                Some("s".into()),
+                Some("b".into()),
+            )
+            .await
+            .unwrap();
+        queue.preserve_legacy_source(&b.id).await.unwrap();
+        let before = queue.snapshot().await;
+        drop(queue);
+
+        let backup = tempdir().unwrap();
+        fs::copy(
+            original.path().join(STATE_FILE),
+            backup.path().join(STATE_FILE),
+        )
+        .unwrap();
+        fs::create_dir(backup.path().join(OBJECTS_DIR)).unwrap();
+        for entry in fs::read_dir(original.path().join(OBJECTS_DIR)).unwrap() {
+            let entry = entry.unwrap();
+            fs::copy(
+                entry.path(),
+                backup.path().join(OBJECTS_DIR).join(entry.file_name()),
+            )
+            .unwrap();
+        }
+        let restored = QueueStore::new(backup.path(), false).await.unwrap();
+        assert_eq!(restored.snapshot().await.entries, before.entries);
+        assert_eq!(restored.current().await.unwrap().unwrap().bytes, A);
+        assert_eq!(
+            restored
+                .prepare_source(&before.entries[0].id)
+                .await
+                .unwrap()
+                .bytes,
+            A
+        );
     }
 
     #[tokio::test]
