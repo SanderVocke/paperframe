@@ -132,6 +132,17 @@ fn pwa_icon(bytes: &'static [u8]) -> Response {
 }
 
 #[derive(Clone)]
+struct ImageRequestView {
+    client_ip: String,
+    requested_at: String,
+    requested_at_unix: i64,
+    relative_time: String,
+    status_code: u16,
+    status_label: &'static str,
+    successful: bool,
+}
+
+#[derive(Clone)]
 struct QueueView {
     id: String,
     display_name: String,
@@ -153,6 +164,7 @@ struct SettingsTemplate {
     reorder_lines: String,
     ready: bool,
     last_request: String,
+    image_requests: Vec<ImageRequestView>,
     refill_status: String,
     refill_detail: Option<String>,
     supplier_status: String,
@@ -398,15 +410,16 @@ async fn render_settings(
         .map(|entry| entry.order_line.as_str())
         .collect::<Vec<_>>()
         .join("\n");
-    let last_request = state
-        .last_image_request()
+    let now = Utc::now();
+    let image_requests = state
+        .image_requests()
         .await
-        .map(|request| {
-            request
-                .requested_at
-                .format("%b %-d at %H:%M UTC")
-                .to_string()
-        })
+        .into_iter()
+        .map(|request| image_request_view(request, now))
+        .collect::<Vec<_>>();
+    let last_request = image_requests
+        .first()
+        .map(|request| request.relative_time.clone())
         .unwrap_or_else(|| "No activity yet".into());
     let refill = state.refill_status().await;
     let (refill_status, refill_detail) = if refill.running {
@@ -442,6 +455,7 @@ async fn render_settings(
         reorder_lines,
         ready: !queue.entries.is_empty(),
         last_request,
+        image_requests,
         refill_status,
         refill_detail,
         supplier_status,
@@ -477,6 +491,38 @@ async fn render_settings(
                 "failed to render settings",
             )
         }
+    }
+}
+
+fn image_request_view(request: ImageRequest, now: chrono::DateTime<Utc>) -> ImageRequestView {
+    let successful =
+        request.response_status.is_success() || request.response_status == StatusCode::NOT_MODIFIED;
+    ImageRequestView {
+        client_ip: request.client_ip.to_string(),
+        requested_at: request.requested_at.to_rfc3339(),
+        requested_at_unix: request.requested_at.timestamp(),
+        relative_time: relative_time(request.requested_at, now),
+        status_code: request.response_status.as_u16(),
+        status_label: if request.response_status == StatusCode::NOT_MODIFIED {
+            "Cache current"
+        } else if successful {
+            "Served"
+        } else {
+            "Failed"
+        },
+        successful,
+    }
+}
+
+fn relative_time(requested_at: chrono::DateTime<Utc>, now: chrono::DateTime<Utc>) -> String {
+    let seconds = now.signed_duration_since(requested_at).num_seconds().max(0);
+    match seconds {
+        0..=9 => "Just now".into(),
+        10..=59 => format!("{seconds} seconds ago"),
+        60..=119 => "1 minute ago".into(),
+        120..=3599 => format!("{} minutes ago", seconds / 60),
+        3600..=7199 => "1 hour ago".into(),
+        _ => format!("{} hours ago", seconds / 3600),
     }
 }
 
@@ -932,13 +978,27 @@ async fn get_image(
     response
 }
 
-async fn head_image(State(state): State<Arc<AppState>>, headers: HeaderMap) -> Response {
+async fn head_image(
+    State(state): State<Arc<AppState>>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
+) -> Response {
     let _transition = state.rendering_transition.read().await;
     let every_fetch = matches!(
         state.settings.snapshot().await.settings.advancement,
         AdvancementSettings::EveryFetch { .. }
     );
-    stable_current_response(&state, &headers, false, every_fetch).await
+    let response = stable_current_response(&state, &headers, false, every_fetch).await;
+    let status = response.status();
+    state
+        .record_image_request(ImageRequest {
+            requested_at: Utc::now(),
+            client_ip: peer.ip(),
+            response_status: status,
+        })
+        .await;
+    info!(client_ip = %peer.ip(), %status, "frame image HEAD requested");
+    response
 }
 
 async fn stable_current_response(
@@ -1372,6 +1432,65 @@ mod tests {
             fs::read(directory.path().join("source/a.jpg")).unwrap(),
             source_hash
         );
+    }
+
+    #[tokio::test]
+    async fn recent_frame_requests_show_clients_results_and_expire_after_two_hours() {
+        let (_directory, state) = manual_state(AdvancementSettings::Manual).await;
+        let app = router(state.clone());
+
+        let served = app
+            .clone()
+            .oneshot(frame_request("GET", [10, 0, 0, 2]))
+            .await
+            .unwrap();
+        assert_eq!(served.status(), StatusCode::OK);
+        assert_eq!(bytes(served).await, A);
+
+        let head = app
+            .clone()
+            .oneshot(frame_request("HEAD", [10, 0, 0, 3]))
+            .await
+            .unwrap();
+        assert_eq!(head.status(), StatusCode::OK);
+
+        state
+            .record_image_request(ImageRequest {
+                requested_at: Utc::now(),
+                client_ip: IpAddr::from([10, 0, 0, 4]),
+                response_status: StatusCode::NOT_FOUND,
+            })
+            .await;
+        state
+            .record_image_request(ImageRequest {
+                requested_at: Utc::now() - chrono::Duration::hours(3),
+                client_ip: IpAddr::from([10, 0, 0, 5]),
+                response_status: StatusCode::INTERNAL_SERVER_ERROR,
+            })
+            .await;
+
+        let requests = state.image_requests().await;
+        assert_eq!(requests.len(), 3);
+        assert_eq!(requests[0].client_ip, IpAddr::from([10, 0, 0, 4]));
+        assert!(
+            !requests
+                .iter()
+                .any(|request| request.client_ip == IpAddr::from([10, 0, 0, 5]))
+        );
+
+        let page = app
+            .oneshot(Request::get("/settings").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        let html = String::from_utf8(bytes(page).await).unwrap();
+        assert!(html.contains("Recent frame requests"));
+        assert!(html.contains("10.0.0.2"));
+        assert!(html.contains("10.0.0.3"));
+        assert!(html.contains("10.0.0.4"));
+        assert!(!html.contains("10.0.0.5"));
+        assert!(html.contains("Served"));
+        assert!(html.contains("Failed"));
+        assert!(html.contains("HTTP 404"));
     }
 
     #[tokio::test]

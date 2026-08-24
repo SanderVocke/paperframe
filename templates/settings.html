@@ -77,6 +77,7 @@ textarea.code{min-height:210px;font:12px/1.5 ui-monospace,SFMono-Regular,Consola
 .choice-help{margin-top:8px;padding:10px 12px;border-radius:11px;background:#f2f0eb;color:var(--muted);font-size:12px}
 .conditional[hidden]{display:none}
 .advanced{margin-top:18px;border:1px solid var(--line);border-radius:14px;background:#faf8f4}.advanced>summary{padding:13px 15px;cursor:pointer;font-weight:750;color:#555950}.advanced-body{border-top:1px solid var(--line);padding:2px 15px 16px}
+.summary-heading{display:flex;flex-direction:column;line-height:1.25}.summary-heading small{margin-top:3px;color:var(--muted);font-size:12px;font-weight:500}.summary-actions{display:flex;align-items:center;gap:13px}.activity-count{padding:5px 9px;border-radius:999px;background:var(--brand-soft);color:var(--brand);font-size:11px;font-weight:800;white-space:nowrap}.activity-body{border-top:1px solid var(--line);padding:8px 24px 20px}.request-list{list-style:none;margin:0;padding:0}.request-item{display:grid;grid-template-columns:38px minmax(150px,1fr) minmax(110px,.65fr) auto;align-items:center;gap:13px;padding:14px 2px}.request-item+.request-item{border-top:1px solid var(--line)}.request-result-icon{display:grid;place-items:center;width:36px;height:36px;border-radius:12px;background:var(--brand-soft);color:var(--brand)}.request-result-icon.failure{background:var(--danger-soft);color:var(--danger)}.request-result-icon svg{width:18px;height:18px;stroke-width:2.2}.request-client{min-width:0}.request-client strong{display:block;overflow:hidden;font:700 13px/1.4 ui-monospace,SFMono-Regular,Consolas,monospace;text-overflow:ellipsis;white-space:nowrap}.request-client span,.request-time{color:var(--muted);font-size:12px}.request-status{min-width:100px;text-align:right}.request-status strong{display:block;color:var(--brand);font-size:13px}.request-status.failure strong{color:var(--danger)}.request-status span{display:block;color:var(--muted);font-size:11px}.activity-empty{display:flex;align-items:center;gap:13px;padding:18px 2px 8px;color:var(--muted)}.activity-empty svg{width:28px;height:28px;color:#9b9b91}.activity-empty strong{display:block;color:var(--ink)}.activity-empty span{font-size:13px}
 .settings-footer{position:sticky;bottom:10px;display:flex;align-items:center;justify-content:space-between;gap:16px;margin-top:12px;padding:12px 14px;border:1px solid var(--line);border-radius:15px;background:rgba(255,253,250,.92);box-shadow:0 12px 35px rgba(42,40,34,.12);backdrop-filter:blur(12px)}.settings-footer span{color:var(--muted);font-size:12px}
 .footer{padding:30px 0 0;text-align:center;color:var(--muted);font-size:12px}
 .preview-dialog{width:min(1100px,calc(100% - 32px));max-height:calc(100dvh - 32px);overflow:auto;border:1px solid var(--line);border-radius:22px;padding:0;background:var(--surface);color:var(--ink);box-shadow:0 28px 90px rgba(24,27,23,.3)}
@@ -85,7 +86,7 @@ textarea.code{min-height:210px;font:12px/1.5 ui-monospace,SFMono-Regular,Consola
 .preview-grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:18px}.preview-grid.single{grid-template-columns:minmax(0,1fr)}.preview-panel{min-width:0;margin:0}.preview-panel>a{display:grid;place-items:center;min-height:260px;max-height:70dvh;overflow:hidden;border-radius:14px;background:#e8e5de;cursor:zoom-in}.preview-panel img{display:block;width:100%;height:100%;max-height:70dvh;object-fit:contain}.preview-panel figcaption{display:flex;align-items:baseline;justify-content:space-between;gap:12px;padding:9px 2px 0}.preview-panel figcaption strong{font-size:14px}.preview-panel figcaption span{color:var(--muted);font-size:12px}
 .sr-only{position:absolute!important;width:1px!important;height:1px!important;padding:0!important;margin:-1px!important;overflow:hidden!important;clip:rect(0,0,0,0)!important;white-space:nowrap!important;border:0!important}
 @media(max-width:900px){.dashboard{grid-template-columns:1fr}.status-panel{grid-template-columns:repeat(4,1fr);gap:12px}.status-item{display:block;padding:4px 8px}.status-item+.status-item{border-top:0;border-left:1px solid var(--line)}.status-icon{margin-bottom:8px}.queue{grid-template-columns:repeat(3,minmax(0,1fr))}}
-@media(max-width:680px){.shell{padding:0 14px calc(46px + env(safe-area-inset-bottom))}.app-header{padding:16px 2px}.brand-text span{display:none}.connection{padding:7px 10px}.welcome{padding:23px 20px}.welcome-copy{font-size:14px}.status-panel{grid-template-columns:1fr;padding:10px 18px}.status-item{display:grid;padding:10px 0}.status-item+.status-item{border-left:0;border-top:1px solid var(--line)}.status-icon{margin:0}.section{margin-top:27px}.section-heading{align-items:start}.section-heading h2{font-size:24px}.section-heading p{font-size:13px}.queue{grid-template-columns:repeat(2,minmax(0,1fr));gap:11px}.photo-body{padding:10px}.photo-source{margin-bottom:7px}.upload-panel{align-items:stretch;flex-direction:column}.upload-controls{align-items:stretch;flex-direction:column}.upload-controls .btn{width:100%}.settings-card>summary{padding:17px}.settings-form{padding:5px 17px 17px}.settings-grid{grid-template-columns:1fr;gap:0}.setting-group.full{grid-column:auto}.setting-group{padding:18px 0}.settings-footer{align-items:stretch;flex-direction:column}.settings-footer .btn{width:100%}.settings-footer span{text-align:center}.preview-dialog{width:calc(100% - 18px);max-height:calc(100dvh - 18px)}.preview-shell{padding:14px}.preview-header h2{font-size:21px}.preview-grid{grid-template-columns:1fr}.preview-panel>a{min-height:190px;max-height:60dvh}.preview-panel img{max-height:60dvh}}
+@media(max-width:680px){.shell{padding:0 14px calc(46px + env(safe-area-inset-bottom))}.app-header{padding:16px 2px}.brand-text span{display:none}.connection{padding:7px 10px}.welcome{padding:23px 20px}.welcome-copy{font-size:14px}.status-panel{grid-template-columns:1fr;padding:10px 18px}.status-item{display:grid;padding:10px 0}.status-item+.status-item{border-left:0;border-top:1px solid var(--line)}.status-icon{margin:0}.section{margin-top:27px}.section-heading{align-items:start}.section-heading h2{font-size:24px}.section-heading p{font-size:13px}.queue{grid-template-columns:repeat(2,minmax(0,1fr));gap:11px}.photo-body{padding:10px}.photo-source{margin-bottom:7px}.upload-panel{align-items:stretch;flex-direction:column}.upload-controls{align-items:stretch;flex-direction:column}.upload-controls .btn{width:100%}.settings-card>summary{padding:17px}.summary-heading small{display:none}.activity-count{display:none}.activity-body{padding:4px 17px 13px}.request-item{grid-template-columns:36px minmax(0,1fr) auto;gap:11px}.request-time{grid-column:2}.request-status{grid-column:3;grid-row:1/3}.settings-form{padding:5px 17px 17px}.settings-grid{grid-template-columns:1fr;gap:0}.setting-group.full{grid-column:auto}.setting-group{padding:18px 0}.settings-footer{align-items:stretch;flex-direction:column}.settings-footer .btn{width:100%}.settings-footer span{text-align:center}.preview-dialog{width:calc(100% - 18px);max-height:calc(100dvh - 18px)}.preview-shell{padding:14px}.preview-header h2{font-size:21px}.preview-grid{grid-template-columns:1fr}.preview-panel>a{min-height:190px;max-height:60dvh}.preview-panel img{max-height:60dvh}}
 @media(max-width:390px){.queue{grid-template-columns:1fr}.photo-link{aspect-ratio:16/10}.primary-actions{align-items:stretch;flex-direction:column}.primary-actions form,.primary-actions .btn{width:100%}.secondary-actions{justify-content:center}.section-heading{display:block}.queue-actions{margin-top:10px}}
 @media(prefers-reduced-motion:reduce){*{scroll-behavior:auto!important;transition:none!important}}
 </style>
@@ -124,6 +125,31 @@ textarea.code{min-height:210px;font:12px/1.5 ui-monospace,SFMono-Regular,Consola
     <div class="status-item"><span class="status-icon"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor"><path d="M20 11a8 8 0 1 0-2.3 5.7"/><path d="M20 4v7h-7"/></svg></span><div class="status-copy"><span>Library</span><strong>{{ refill_status }}</strong></div></div>
     <div class="status-item"><span class="status-icon"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor"><circle cx="12" cy="12" r="9"/><path d="M12 7v5l3 2"/></svg></span><div class="status-copy"><span>Last contact</span><strong>{{ last_request }}</strong></div></div>
   </aside>
+</section>
+
+<section class="section" aria-label="Frame activity">
+<details class="settings-card activity-card">
+  <summary>
+    <span class="summary-title"><span class="summary-icon"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor"><path d="M4 12a8 8 0 1 0 3-6.2"/><path d="M4 4v5h5"/><path d="M12 8v4l2.5 1.5"/></svg></span><span class="summary-heading">Recent frame requests<small>See who contacted the current image URL in the past two hours</small></span></span>
+    <span class="summary-actions"><span class="activity-count">{{ image_requests.len() }} in last 2 hours</span><svg class="chevron" viewBox="0 0 24 24" fill="none" stroke="currentColor"><path d="m6 9 6 6 6-6"/></svg></span>
+  </summary>
+  <div class="activity-body">
+    {% if image_requests.is_empty() %}
+    <div class="activity-empty"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor"><circle cx="12" cy="12" r="9"/><path d="M12 8v4m0 4h.01"/></svg><div><strong>No recent requests</strong><span>Requests to the current image will appear here for two hours.</span></div></div>
+    {% else %}
+    <ol class="request-list">
+      {% for request in image_requests %}
+      <li class="request-item">
+        <span class="request-result-icon{% if !request.successful %} failure{% endif %}" aria-hidden="true">{% if request.successful %}<svg viewBox="0 0 24 24" fill="none" stroke="currentColor"><path d="m6 12 4 4 8-9"/></svg>{% else %}<svg viewBox="0 0 24 24" fill="none" stroke="currentColor"><path d="m7 7 10 10M17 7 7 17"/></svg>{% endif %}</span>
+        <div class="request-client"><strong title="{{ request.client_ip }}">{{ request.client_ip }}</strong><span>Direct client address</span></div>
+        <time class="request-time" datetime="{{ request.requested_at }}" data-request-time="{{ request.requested_at_unix }}">{{ request.relative_time }}</time>
+        <div class="request-status{% if !request.successful %} failure{% endif %}"><strong>{{ request.status_label }}</strong><span>HTTP {{ request.status_code }}</span></div>
+      </li>
+      {% endfor %}
+    </ol>
+    {% endif %}
+  </div>
+</details>
 </section>
 
 <section class="section" aria-labelledby="queue-title">
@@ -287,6 +313,20 @@ textarea.code{min-height:210px;font:12px/1.5 ui-monospace,SFMono-Regular,Consola
   if('serviceWorker' in navigator){
     window.addEventListener('load',()=>navigator.serviceWorker.register('/sw.js').catch(error=>console.warn('Service worker registration failed',error)));
   }
+
+  function relativeAge(seconds){
+    if(seconds<10)return 'Just now';
+    if(seconds<60)return seconds+' seconds ago';
+    if(seconds<120)return '1 minute ago';
+    if(seconds<3600)return Math.floor(seconds/60)+' minutes ago';
+    if(seconds<7200)return '1 hour ago';
+    return Math.floor(seconds/3600)+' hours ago';
+  }
+  function updateRequestTimes(){
+    const now=Math.floor(Date.now()/1000);
+    document.querySelectorAll('[data-request-time]').forEach(time=>{time.textContent=relativeAge(Math.max(0,now-Number(time.dataset.requestTime)));});
+  }
+  updateRequestTimes();setInterval(updateRequestTimes,30000);
 
   const policy=document.getElementById('advancement_type');
   const source=document.getElementById('supplier_type');

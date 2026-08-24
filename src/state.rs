@@ -1,4 +1,4 @@
-use std::{net::IpAddr, sync::Arc};
+use std::{collections::VecDeque, net::IpAddr, sync::Arc};
 
 use anyhow::{Context, Result, bail};
 use axum::http::StatusCode;
@@ -32,7 +32,7 @@ pub struct AppState {
     pub queue: Arc<QueueStore>,
     registry: RwLock<Arc<SupplierRegistry>>,
     refill_status: RwLock<RefillStatus>,
-    last_image_request: RwLock<Option<ImageRequest>>,
+    image_requests: RwLock<VecDeque<ImageRequest>>,
     runtime_trigger: watch::Sender<u64>,
     pub frame_serialization: Arc<Mutex<()>>,
     pub render_serialization: Arc<Semaphore>,
@@ -83,7 +83,7 @@ impl AppState {
             queue,
             registry: RwLock::new(registry),
             refill_status: RwLock::new(RefillStatus::default()),
-            last_image_request: RwLock::new(None),
+            image_requests: RwLock::new(VecDeque::new()),
             runtime_trigger,
             frame_serialization: Arc::new(Mutex::new(())),
             render_serialization: Arc::new(Semaphore::new(1)),
@@ -118,11 +118,15 @@ impl AppState {
         self.runtime_trigger.subscribe()
     }
 
-    pub async fn last_image_request(&self) -> Option<ImageRequest> {
-        self.last_image_request.read().await.clone()
+    pub async fn image_requests(&self) -> Vec<ImageRequest> {
+        let mut requests = self.image_requests.write().await;
+        prune_image_requests(&mut requests, Utc::now());
+        requests.iter().rev().cloned().collect()
     }
     pub async fn record_image_request(&self, request: ImageRequest) {
-        *self.last_image_request.write().await = Some(request);
+        let mut requests = self.image_requests.write().await;
+        prune_image_requests(&mut requests, Utc::now());
+        requests.push_back(request);
     }
     pub async fn refill_status(&self) -> RefillStatus {
         self.refill_status.read().await.clone()
@@ -142,6 +146,11 @@ impl AppState {
             Err(error) => status.last_error = Some(error.to_string()),
         }
     }
+}
+
+fn prune_image_requests(requests: &mut VecDeque<ImageRequest>, now: DateTime<Utc>) {
+    let cutoff = now - chrono::Duration::hours(2);
+    requests.retain(|request| request.requested_at >= cutoff);
 }
 
 fn validate_settings_separation(config: &Config, settings: &Settings) -> Result<()> {
