@@ -29,7 +29,7 @@ use crate::{
         QueueAdvanceBehavior, QueueSettings, RenderingSettings, ReplaceSettingsError, Settings,
         SupplierKind, SupplierSettings,
     },
-    queue::{PreparedImage, QueueEntry, QueueEventReason},
+    queue::{PreparedImage, QueueEntry, QueueEventReason, QueueInsertPosition},
     renderer::{FrameTarget, OutputMode},
     state::{AppState, ImageRequest},
 };
@@ -669,6 +669,7 @@ async fn upload_queue(State(state): State<Arc<AppState>>, mut multipart: Multipa
     let settings = state.settings.snapshot().await.settings;
     let mut csrf = None;
     let mut generation = None;
+    let mut position = None;
     let mut uploads = Vec::new();
     let mut total = 0_u64;
     loop {
@@ -684,6 +685,10 @@ async fn upload_queue(State(state): State<Arc<AppState>>, mut multipart: Multipa
             },
             "queue_generation" => match field.text().await {
                 Ok(value) => generation = Some(value),
+                Err(error) => return plain(StatusCode::BAD_REQUEST, &error.to_string()),
+            },
+            "position" => match field.text().await {
+                Ok(value) => position = Some(value),
                 Err(error) => return plain(StatusCode::BAD_REQUEST, &error.to_string()),
             },
             "images" => {
@@ -718,6 +723,16 @@ async fn upload_queue(State(state): State<Arc<AppState>>, mut multipart: Multipa
             "Select at least one image",
         );
     }
+    let position = match position.as_deref() {
+        Some("front") => QueueInsertPosition::Front,
+        Some("back") => QueueInsertPosition::Back,
+        _ => {
+            return plain(
+                StatusCode::UNPROCESSABLE_ENTITY,
+                "Choose whether to add photos to the front or back",
+            );
+        }
+    };
     let rendering = settings.rendering;
     let _render_permit = match state.render_serialization.clone().acquire_owned().await {
         Ok(permit) => permit,
@@ -758,7 +773,7 @@ async fn upload_queue(State(state): State<Arc<AppState>>, mut multipart: Multipa
     };
     match state
         .queue
-        .enqueue_rendered_batch(Some(generation), None, requests)
+        .enqueue_rendered_batch_at(Some(generation), None, position, requests)
         .await
     {
         Ok(_) => Redirect::to("/settings").into_response(),
@@ -1466,6 +1481,10 @@ mod tests {
             .unwrap();
         let html = String::from_utf8(bytes(response).await).unwrap();
         assert!(html.contains("Your photo queue"));
+        assert!(html.contains(">Active</span>"));
+        assert!(html.contains(">Add to front</button>"));
+        assert!(html.contains(">Add to back</button>"));
+        assert!(!html.contains("On frame now"));
         assert!(html.contains("a.jpg"));
         assert_eq!(
             fs::read(directory.path().join("source/a.jpg")).unwrap(),
@@ -2069,7 +2088,7 @@ mod tests {
         let generation = state.queue.snapshot().await.generation;
         let boundary = "queue-upload-boundary";
         let mut body = format!(
-            "--{boundary}\r\nContent-Disposition: form-data; name=\"csrf_token\"\r\n\r\n{}\r\n--{boundary}\r\nContent-Disposition: form-data; name=\"queue_generation\"\r\n\r\n{generation}\r\n--{boundary}\r\nContent-Disposition: form-data; name=\"images\"; filename=\"direct.png\"\r\nContent-Type: image/png\r\n\r\n",
+            "--{boundary}\r\nContent-Disposition: form-data; name=\"csrf_token\"\r\n\r\n{}\r\n--{boundary}\r\nContent-Disposition: form-data; name=\"queue_generation\"\r\n\r\n{generation}\r\n--{boundary}\r\nContent-Disposition: form-data; name=\"position\"\r\n\r\nfront\r\n--{boundary}\r\nContent-Disposition: form-data; name=\"images\"; filename=\"direct.png\"\r\nContent-Type: image/png\r\n\r\n",
             state.csrf_token()
         ).into_bytes();
         body.extend_from_slice(&tiny_png());
@@ -2087,6 +2106,17 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::SEE_OTHER);
+        assert_eq!(
+            state
+                .queue
+                .current()
+                .await
+                .unwrap()
+                .unwrap()
+                .entry
+                .display_name,
+            "direct.png"
+        );
         assert!(state.queue.snapshot().await.entries.iter().any(|entry| {
             entry.display_name == "direct.png"
                 && entry.supplier_id.is_none()

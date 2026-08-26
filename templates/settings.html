@@ -63,7 +63,7 @@ h1{margin:0;font-family:ui-serif,Georgia,serif;font-size:clamp(29px,4vw,44px);fo
 .photo-card:hover{transform:translateY(-2px);box-shadow:0 15px 32px rgba(54,51,43,.1)}.photo-card.dragging{opacity:.45;transform:scale(.98)}.photo-card.current{border-color:#82a18a;box-shadow:0 0 0 2px rgba(73,107,85,.12),0 15px 35px rgba(54,72,58,.12)}
 .photo-link{position:relative;display:block;width:100%;aspect-ratio:4/3;overflow:hidden;border:0;padding:0;background:#e8e5de;color:inherit;text-align:left;cursor:zoom-in}
 .photo-link img{display:block;width:100%;height:100%;object-fit:cover;transition:transform .3s}.photo-card:hover .photo-link img{transform:scale(1.025)}
-.now-badge{position:absolute;left:10px;top:10px;display:flex;align-items:center;gap:6px;padding:6px 9px;border-radius:999px;background:rgba(35,53,40,.88);color:#fff;font-size:11px;font-weight:800;letter-spacing:.03em;backdrop-filter:blur(8px)}.now-badge:before{content:"";width:6px;height:6px;border-radius:50%;background:#a8d5b0}
+.active-badge{position:absolute;left:10px;top:10px;display:flex;align-items:center;gap:6px;padding:6px 9px;border-radius:999px;background:rgba(35,53,40,.88);color:#fff;font-size:11px;font-weight:800;letter-spacing:.03em;backdrop-filter:blur(8px)}.active-badge:before{content:"";width:6px;height:6px;border-radius:50%;background:#a8d5b0}
 .photo-body{padding:12px}.photo-name{overflow:hidden;margin:0;font-weight:750;text-overflow:ellipsis;white-space:nowrap}.photo-source{margin:2px 0 10px;color:var(--muted);font-size:12px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
 .orientation-form{display:flex;align-items:center;gap:6px;margin:8px 0}.orientation-form select{min-height:36px;padding:6px 8px}.orientation-form .btn{min-height:36px;padding:7px 9px}.card-actions{display:flex;align-items:center;justify-content:space-between;gap:4px;border-top:1px solid var(--line);padding-top:9px}.move-actions{display:flex;gap:2px}.card-actions form{margin:0}
 .icon-btn{display:grid;place-items:center;width:36px;height:36px;border:0;border-radius:10px;background:transparent;color:var(--muted);cursor:pointer}.icon-btn:hover{background:#efede7;color:var(--ink)}.icon-btn.remove:hover{background:var(--danger-soft);color:var(--danger)}
@@ -154,7 +154,7 @@ textarea.code{min-height:210px;font:12px/1.5 ui-monospace,SFMono-Regular,Consola
 
 <section class="section" aria-labelledby="queue-title">
   <div class="section-heading">
-    <div><h2 id="queue-title">Your photo queue</h2><p>The first photo is on the frame. Use the arrows to change the order.</p></div>
+    <div><h2 id="queue-title">Your photo queue</h2><p>The first photo is active. Use the arrows to change the order.</p></div>
     <div class="queue-actions">
       <form id="order-form" class="save-order" method="post" action="/queue/reorder">
         <input type="hidden" name="csrf_token" value="{{ csrf_token }}"><input type="hidden" name="queue_generation" value="{{ queue_generation }}">
@@ -172,7 +172,7 @@ textarea.code{min-height:210px;font:12px/1.5 ui-monospace,SFMono-Regular,Consola
     <li class="photo-card{% if image.is_current %} current{% endif %}" draggable="true" data-id="{{ image.id }}" data-name="{{ image.display_name }}">
       <button class="photo-link" type="button" data-preview-trigger data-id="{{ image.id }}" data-name="{{ image.display_name }}" data-dithered="{% if image.is_dithered %}true{% else %}false{% endif %}" aria-label="Preview {{ image.display_name }}">
         <img src="/queue/thumbnail/{{ image.id }}" alt="" loading="lazy">
-        {% if image.is_current %}<span class="now-badge">On frame now</span>{% endif %}
+        {% if image.is_current %}<span class="active-badge">Active</span>{% endif %}
       </button>
       <div class="photo-body">
         <p class="photo-name" title="{{ image.display_name }}">{{ image.display_name }}</p>
@@ -200,7 +200,7 @@ textarea.code{min-height:210px;font:12px/1.5 ui-monospace,SFMono-Regular,Consola
   <form class="upload-panel" method="post" action="/queue/upload" enctype="multipart/form-data">
     <input type="hidden" name="csrf_token" value="{{ csrf_token }}"><input type="hidden" name="queue_generation" value="{{ queue_generation }}">
     <div class="upload-copy"><span class="upload-icon"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor"><path d="M12 16V4m-5 5 5-5 5 5M5 14v5h14v-5"/></svg></span><div><strong>Add your own photos</strong><span id="file-label">Choose one or more images</span></div></div>
-    <div class="upload-controls"><label class="btn btn-secondary" for="images">Choose photos</label><input class="file-input" id="images" name="images" type="file" accept="image/*,.qoi,.tga,.tiff,.pnm,.ppm,.pgm,.dds,.hdr,.ff" multiple required><button class="btn btn-primary" type="submit">Add to queue</button></div>
+    <div class="upload-controls"><label class="btn btn-secondary" for="images">Choose photos</label><input class="file-input" id="images" name="images" type="file" accept="image/*,.qoi,.tga,.tiff,.pnm,.ppm,.pgm,.dds,.hdr,.ff" multiple required><button class="btn btn-primary" type="submit" name="position" value="front">Add to front</button><button class="btn btn-secondary" type="submit" name="position" value="back">Add to back</button></div>
   </form>
 
   <div class="secondary-actions" style="margin-top:12px">
@@ -373,9 +373,9 @@ textarea.code{min-height:210px;font:12px/1.5 ui-monospace,SFMono-Regular,Consola
     order.value=Array.from(list.children).map(card=>card.dataset.id+'\t'+card.dataset.name).join('\n');
     orderForm.classList.add('changed');
     list.querySelectorAll('.photo-card').forEach((card,index)=>card.classList.toggle('current',index===0));
-    list.querySelectorAll('.now-badge').forEach(badge=>badge.remove());
+    list.querySelectorAll('.active-badge').forEach(badge=>badge.remove());
     const first=list.querySelector('.photo-card .photo-link');
-    if(first){const badge=document.createElement('span');badge.className='now-badge';badge.textContent='On frame after save';first.appendChild(badge);}
+    if(first){const badge=document.createElement('span');badge.className='active-badge';badge.textContent='Active after save';first.appendChild(badge);}
   }
   list.addEventListener('click',event=>{
     const button=event.target.closest('[data-move]');if(!button)return;

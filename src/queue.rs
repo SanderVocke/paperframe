@@ -90,6 +90,12 @@ pub struct EnqueueRequest {
     pub source_key: Option<String>,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum QueueInsertPosition {
+    Front,
+    Back,
+}
+
 #[derive(Clone, Debug)]
 pub struct RenderedEnqueueRequest {
     pub display_name: String,
@@ -342,6 +348,22 @@ impl QueueStore {
         &self,
         expected_generation: Option<u64>,
         maximum_length: Option<usize>,
+        requests: Vec<RenderedEnqueueRequest>,
+    ) -> Result<Vec<QueueEntry>> {
+        self.enqueue_rendered_batch_at(
+            expected_generation,
+            maximum_length,
+            QueueInsertPosition::Back,
+            requests,
+        )
+        .await
+    }
+
+    pub async fn enqueue_rendered_batch_at(
+        &self,
+        expected_generation: Option<u64>,
+        maximum_length: Option<usize>,
+        position: QueueInsertPosition,
         mut requests: Vec<RenderedEnqueueRequest>,
     ) -> Result<Vec<QueueEntry>> {
         for request in &requests {
@@ -400,13 +422,19 @@ impl QueueStore {
         next.version = STATE_VERSION;
         next.generation = next.generation.saturating_add(1);
         for entry in &entries {
-            next.entries.push(entry.clone());
             if let (Some(supplier), Some(source)) = (&entry.supplier_id, &entry.source_key) {
                 next.seen
                     .entry(supplier.clone())
                     .or_default()
                     .insert(source.clone());
             }
+        }
+        match position {
+            QueueInsertPosition::Front => {
+                let existing = std::mem::take(&mut next.entries);
+                next.entries = entries.iter().cloned().chain(existing).collect();
+            }
+            QueueInsertPosition::Back => next.entries.extend(entries.iter().cloned()),
         }
         let root = self.root.clone();
         let objects = self.objects.clone();
@@ -1321,6 +1349,77 @@ mod tests {
     use tempfile::tempdir;
     const A: &[u8] = include_bytes!("../tests/fixtures/images/a.jpg");
     const B: &[u8] = include_bytes!("../tests/fixtures/images/b.jpg");
+
+    fn rendered_request(display_name: &str, bytes: &[u8]) -> RenderedEnqueueRequest {
+        let decoded = crate::renderer::decode_source(bytes).unwrap();
+        let rendered = crate::renderer::render(
+            &decoded,
+            FrameTarget::Paper7,
+            crate::renderer::OutputMode::DirectJpeg,
+            decoded.orientation,
+        )
+        .unwrap();
+        RenderedEnqueueRequest {
+            display_name: display_name.into(),
+            source_bytes: bytes.to_vec(),
+            derivative_bytes: rendered.bytes,
+            media_type: rendered.media_type.into(),
+            source_width: decoded.pixels.width(),
+            source_height: decoded.pixels.height(),
+            orientation: decoded.orientation,
+            frame_target: FrameTarget::Paper7,
+            supplier_id: None,
+            source_key: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn rendered_batches_can_be_added_to_the_front_or_back() {
+        let dir = tempdir().unwrap();
+        let queue = QueueStore::new(dir.path(), false).await.unwrap();
+        queue
+            .enqueue("existing.jpg".into(), A.to_vec(), None, None)
+            .await
+            .unwrap();
+
+        queue
+            .enqueue_rendered_batch_at(
+                None,
+                None,
+                QueueInsertPosition::Front,
+                vec![
+                    rendered_request("front-a.jpg", A),
+                    rendered_request("front-b.jpg", B),
+                ],
+            )
+            .await
+            .unwrap();
+        queue
+            .enqueue_rendered_batch_at(
+                None,
+                None,
+                QueueInsertPosition::Back,
+                vec![rendered_request("back.jpg", A)],
+            )
+            .await
+            .unwrap();
+
+        let names = queue
+            .snapshot()
+            .await
+            .entries
+            .into_iter()
+            .map(|entry| entry.display_name)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            names,
+            vec!["front-a.jpg", "front-b.jpg", "existing.jpg", "back.jpg"]
+        );
+        assert_eq!(
+            queue.current().await.unwrap().unwrap().entry.display_name,
+            "front-a.jpg"
+        );
+    }
 
     #[tokio::test]
     async fn rendered_enqueue_preserves_source_serves_bmp_and_rerenders_orientation() {
