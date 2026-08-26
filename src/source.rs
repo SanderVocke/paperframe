@@ -49,8 +49,8 @@ impl SourceStore {
             .find(|mapping| mapping.database_root == candidate.root_path)
             .with_context(|| {
                 format!(
-                    "candidate {} uses an unmapped DigiKam root",
-                    candidate.image_id
+                    "candidate {} uses an unmapped DigiKam root_path {:?}; database_root must exactly match this value",
+                    candidate.image_id, candidate.root_path
                 )
             })?;
         let album = safe_relative_album(&candidate.album_path)?;
@@ -204,7 +204,9 @@ mod tests {
         assert!(store.open(&candidate("../", "outside.jpg")).is_err());
         let mut unmapped = candidate("/", "outside.jpg");
         unmapped.root_path = PathBuf::from("/other");
-        assert!(store.open(&unmapped).is_err());
+        let error = store.open(&unmapped).err().unwrap().to_string();
+        assert!(error.contains("unmapped DigiKam root_path"));
+        assert!(error.contains("/other"));
         assert!(SourceStore::new(&configured, &photos).is_err());
     }
 
