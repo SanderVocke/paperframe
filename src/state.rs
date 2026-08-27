@@ -53,17 +53,24 @@ impl AppState {
             SupplierKind::DigikamSqlite(_)
         );
         let queue = QueueStore::new(&config.queue_dir, migrate_current).await?;
-        let expected_media = match snapshot.settings.rendering.output_mode {
-            crate::renderer::OutputMode::ServerDitherBmp => "image/bmp",
-            crate::renderer::OutputMode::DirectJpeg => "image/jpeg",
-        };
         let queue_snapshot = queue.snapshot().await;
         let needs_rerender = queue_snapshot.entries.iter().any(|entry| {
+            let effective_mode = if entry.text_overlay.is_some() {
+                crate::renderer::OutputMode::ServerDitherBmp
+            } else {
+                snapshot.settings.rendering.output_mode
+            };
+            let expected_media = match effective_mode {
+                crate::renderer::OutputMode::ServerDitherBmp => "image/bmp",
+                crate::renderer::OutputMode::DirectJpeg => "image/jpeg",
+            };
             entry.media_type != expected_media
-                || (snapshot.settings.rendering.output_mode
-                    == crate::renderer::OutputMode::ServerDitherBmp
+                || (effective_mode == crate::renderer::OutputMode::ServerDitherBmp
                     && (entry.frame_target != snapshot.settings.rendering.target
-                        || entry.renderer_profile != crate::renderer::RENDER_PROFILE_VERSION))
+                        || entry.renderer_profile != crate::renderer::RENDER_PROFILE_VERSION
+                        || (entry.text_overlay.is_some()
+                            && entry.text_renderer_profile
+                                != crate::renderer::TEXT_RENDER_PROFILE_VERSION)))
         });
         if needs_rerender {
             queue

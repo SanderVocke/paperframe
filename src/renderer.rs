@@ -1,5 +1,6 @@
 use std::io::Cursor;
 
+use ab_glyph::{Font, FontArc, GlyphId, PxScale, ScaleFont, point};
 use anyhow::{Context, Result, bail};
 use image::{
     DynamicImage, ImageDecoder, ImageFormat, ImageReader, Limits, RgbaImage,
@@ -12,15 +13,18 @@ use serde::{Deserialize, Serialize};
 use crate::{
     dither::{IndexedImage, Rgb},
     epd_auto::resolve_auto_options,
-    epd_pipeline::process_canvas,
+    epd_pipeline::{adjust_canvas, process_adjusted_canvas, process_canvas},
     epd_profile::{DitherProfile, PlacementMode, ResizePolicy},
 };
 
 pub const RENDER_PROFILE_VERSION: u32 = 2;
+pub const TEXT_RENDER_PROFILE_VERSION: u32 = 2;
 pub const MAX_ENCODED_BYTES: u64 = 100 * 1024 * 1024;
 pub const MAX_SOURCE_DIMENSION: u32 = 20_000;
 pub const MAX_DECODED_BYTES: u64 = 256 * 1024 * 1024;
 pub const JPEG_QUALITY: u8 = 90;
+pub const MAX_TEXT_CHARACTERS: usize = 2_000;
+pub const TEXT_FONT_BYTES: &[u8] = include_bytes!("../assets/fonts/InterVariable.ttf");
 pub const THUMBNAIL_MAX_DIMENSION: u32 = 960;
 pub const PREVIEW_MAX_DIMENSION: u32 = 1600;
 const THUMBNAIL_JPEG_QUALITY: u8 = 80;
@@ -98,6 +102,152 @@ pub enum OrientationSource {
     Override,
 }
 
+#[derive(Clone, Copy, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum TextBackground {
+    #[default]
+    Black,
+    White,
+    Blue,
+    Green,
+    Red,
+    Yellow,
+}
+
+#[derive(Clone, Copy, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum HorizontalTextPosition {
+    Left,
+    #[default]
+    Middle,
+    Right,
+}
+
+#[derive(Clone, Copy, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum VerticalTextPosition {
+    Top,
+    Middle,
+    #[default]
+    Bottom,
+}
+
+#[derive(Clone, Copy, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum TextSize {
+    Small,
+    Medium,
+    #[default]
+    Large,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+pub struct TextOverlay {
+    pub body: String,
+    #[serde(default)]
+    pub horizontal: HorizontalTextPosition,
+    #[serde(default)]
+    pub vertical: VerticalTextPosition,
+    #[serde(default)]
+    pub background: TextBackground,
+    #[serde(default)]
+    pub size: TextSize,
+    // Version-3 recipes used a manually sized rectangle. Retain these only long
+    // enough to map old descriptors to the nearest enumerated position.
+    #[serde(default, rename = "x", skip_serializing)]
+    pub legacy_x: Option<u16>,
+    #[serde(default, rename = "y", skip_serializing)]
+    pub legacy_y: Option<u16>,
+    #[serde(default, rename = "width", skip_serializing)]
+    pub legacy_width: Option<u16>,
+    #[serde(default, rename = "height", skip_serializing)]
+    pub legacy_height: Option<u16>,
+}
+
+impl TextOverlay {
+    pub fn new(
+        body: String,
+        horizontal: HorizontalTextPosition,
+        vertical: VerticalTextPosition,
+        background: TextBackground,
+    ) -> Self {
+        Self::with_size(body, horizontal, vertical, background, TextSize::Large)
+    }
+
+    pub fn with_size(
+        body: String,
+        horizontal: HorizontalTextPosition,
+        vertical: VerticalTextPosition,
+        background: TextBackground,
+        size: TextSize,
+    ) -> Self {
+        Self {
+            body,
+            horizontal,
+            vertical,
+            background,
+            size,
+            legacy_x: None,
+            legacy_y: None,
+            legacy_width: None,
+            legacy_height: None,
+        }
+    }
+
+    pub fn migrate_legacy_position(&mut self) {
+        if let (Some(x), Some(width)) = (self.legacy_x, self.legacy_width) {
+            self.horizontal = horizontal_position(u32::from(x) + u32::from(width) / 2);
+        }
+        if let (Some(y), Some(height)) = (self.legacy_y, self.legacy_height) {
+            self.vertical = vertical_position(u32::from(y) + u32::from(height) / 2);
+        }
+        self.legacy_x = None;
+        self.legacy_y = None;
+        self.legacy_width = None;
+        self.legacy_height = None;
+    }
+
+    pub fn validate(&self) -> Result<()> {
+        let characters = self.body.chars().count();
+        if self.body.trim().is_empty() {
+            bail!("text message must not be empty");
+        }
+        if characters > MAX_TEXT_CHARACTERS {
+            bail!("text message exceeds the {MAX_TEXT_CHARACTERS}-character limit");
+        }
+        if self
+            .body
+            .chars()
+            .any(|character| character.is_control() && character != '\n' && character != '\r')
+        {
+            bail!("text message contains unsupported control characters");
+        }
+        let font = text_font()?;
+        if let Some(character) = self.body.chars().find(|&character| {
+            character != '\n' && character != '\r' && font.glyph_id(character).0 == 0
+        }) {
+            bail!("the bundled font does not support character {character:?}");
+        }
+        Ok(())
+    }
+}
+
+fn horizontal_position(center: u32) -> HorizontalTextPosition {
+    match center {
+        0..=3_333 => HorizontalTextPosition::Left,
+        3_334..=6_666 => HorizontalTextPosition::Middle,
+        _ => HorizontalTextPosition::Right,
+    }
+}
+
+fn vertical_position(center: u32) -> VerticalTextPosition {
+    match center {
+        0..=3_333 => VerticalTextPosition::Top,
+        3_334..=6_666 => VerticalTextPosition::Middle,
+        _ => VerticalTextPosition::Bottom,
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct DecodedImage {
     pub pixels: RgbaImage,
@@ -168,6 +318,29 @@ pub fn render_with_original(
     mode: OutputMode,
     orientation: ImageOrientation,
 ) -> Result<RenderedImage> {
+    render_composed_with_original(source, original, target, mode, orientation, None)
+}
+
+/// Renders an immutable source and optional editable text recipe. Text-bearing
+/// entries always become server-dithered BMPs, even when ordinary photos use
+/// direct JPEG mode.
+pub fn render_composed_with_original(
+    source: &DecodedImage,
+    original: &[u8],
+    target: FrameTarget,
+    mode: OutputMode,
+    orientation: ImageOrientation,
+    text: Option<&TextOverlay>,
+) -> Result<RenderedImage> {
+    if let Some(text) = text {
+        text.validate()?;
+        let indexed = generate_picture_dither_with_text(&source.pixels, target, orientation, text)?;
+        return Ok(RenderedImage {
+            bytes: encode_bmp4(&indexed)?,
+            media_type: "image/bmp",
+            extension: "bmp",
+        });
+    }
     if mode == OutputMode::DirectJpeg && source.format == ImageFormat::Jpeg {
         return Ok(RenderedImage {
             bytes: original.to_vec(),
@@ -176,6 +349,15 @@ pub fn render_with_original(
         });
     }
     render(source, target, mode, orientation)
+}
+
+pub fn blank_message_source() -> Result<Vec<u8>> {
+    let image = RgbaImage::from_pixel(1, 1, image::Rgba([255, 255, 255, 255]));
+    let mut bytes = Vec::new();
+    PngEncoder::new(&mut bytes)
+        .write_image(image.as_raw(), 1, 1, image::ExtendedColorType::Rgba8)
+        .context("failed to encode message canvas")?;
+    Ok(bytes)
 }
 
 pub fn render(
@@ -303,6 +485,298 @@ fn generate_picture_dither(
     let (_, options) = resolve_auto_options(&analysis, &profile);
     let framebuffer = prepare_profile_canvas(source, target, orientation, false, &profile);
     process_canvas(&framebuffer, &profile, &options)
+}
+
+fn generate_picture_dither_with_text(
+    source: &RgbaImage,
+    target: FrameTarget,
+    orientation: ImageOrientation,
+    text: &TextOverlay,
+) -> Result<IndexedImage> {
+    let profile = DitherProfile::generate_picture_auto_v2();
+    let analysis = prepare_profile_canvas(
+        source,
+        target,
+        orientation,
+        target == FrameTarget::PaperL,
+        &profile,
+    );
+    let (_, options) = resolve_auto_options(&analysis, &profile);
+    let mut framebuffer = prepare_profile_canvas(source, target, orientation, false, &profile);
+    adjust_canvas(&mut framebuffer, &profile, &options)?;
+
+    let physical = target.physical_dimensions();
+    let logical_dimensions = target.logical_dimensions(orientation);
+    if logical_dimensions == physical {
+        draw_text_layer(&mut framebuffer, text, &profile)?;
+    } else {
+        // prepare_profile_canvas applies a 270-degree logical-to-physical
+        // transform. Compose in user-facing logical coordinates, then apply the
+        // same transform to the completed layer.
+        let mut logical = imageops::rotate90(&framebuffer);
+        draw_text_layer(&mut logical, text, &profile)?;
+        framebuffer = imageops::rotate270(&logical);
+    }
+    process_adjusted_canvas(&framebuffer, &profile, &options)
+}
+
+fn text_font() -> Result<FontArc> {
+    FontArc::try_from_slice(TEXT_FONT_BYTES).context("bundled text font is invalid")
+}
+
+fn draw_text_layer(
+    canvas: &mut RgbaImage,
+    text: &TextOverlay,
+    profile: &DitherProfile,
+) -> Result<()> {
+    text.validate()?;
+    let font = text_font()?;
+    let (scale, lines, padding, box_width, box_height) = fit_text_box(
+        &font,
+        &text.body,
+        text.size,
+        canvas.width(),
+        canvas.height(),
+    )
+    .context("text does not fit on the frame; shorten the message")?;
+    let margin_x = ((canvas.width() as f32 * 0.075).round() as u32).max(1);
+    let margin_y = ((canvas.height() as f32 * 0.05).round() as u32).max(1);
+    let left = match text.horizontal {
+        HorizontalTextPosition::Left => margin_x,
+        HorizontalTextPosition::Middle => (canvas.width() - box_width) / 2,
+        HorizontalTextPosition::Right => canvas.width() - margin_x - box_width,
+    };
+    let top = match text.vertical {
+        VerticalTextPosition::Top => margin_y,
+        VerticalTextPosition::Middle => (canvas.height() - box_height) / 2,
+        VerticalTextPosition::Bottom => canvas.height() - margin_y - box_height,
+    };
+    let right = left + box_width;
+    let bottom = top + box_height;
+    let radius = ((box_width.min(box_height) as f32 * 0.14).round() as u32)
+        .clamp(4, box_width.min(box_height) / 2);
+    let background = palette_color(profile, text.background);
+    for y in top..bottom {
+        for x in left..right {
+            if inside_rounded_rectangle(x, y, left, top, right, bottom, radius) {
+                canvas.put_pixel(
+                    x,
+                    y,
+                    image::Rgba([background.r, background.g, background.b, 255]),
+                );
+            }
+        }
+    }
+
+    let scaled = font.as_scaled(scale);
+    let line_height = scaled.ascent() - scaled.descent() + scaled.line_gap();
+    let foreground = contrasting_color(profile, background);
+    let mut baseline = top as f32 + padding as f32 + scaled.ascent();
+    for line in lines {
+        let line_width = measure_line(&font, scale, &line);
+        let mut cursor = left as f32 + (box_width as f32 - line_width) / 2.0;
+        let mut previous = None;
+        for character in line.chars() {
+            let id = font.glyph_id(character);
+            if let Some(previous) = previous {
+                cursor += scaled.kern(previous, id);
+            }
+            let glyph = id.with_scale_and_position(scale, point(cursor, baseline));
+            if let Some(outlined) = font.outline_glyph(glyph) {
+                let bounds = outlined.px_bounds();
+                outlined.draw(|x, y, coverage| {
+                    let px = bounds.min.x.floor() as i32 + x as i32;
+                    let py = bounds.min.y.floor() as i32 + y as i32;
+                    if px < left as i32
+                        || py < top as i32
+                        || px >= right as i32
+                        || py >= bottom as i32
+                    {
+                        return;
+                    }
+                    let pixel = canvas.get_pixel_mut(px as u32, py as u32);
+                    for channel in 0..3 {
+                        let source = [foreground.r, foreground.g, foreground.b][channel] as f32;
+                        pixel[channel] = (source * coverage
+                            + pixel[channel] as f32 * (1.0 - coverage))
+                            .round() as u8;
+                    }
+                    pixel[3] = 255;
+                });
+            }
+            cursor += scaled.h_advance(id);
+            previous = Some(id);
+        }
+        baseline += line_height;
+    }
+    Ok(())
+}
+
+fn inside_rounded_rectangle(
+    x: u32,
+    y: u32,
+    left: u32,
+    top: u32,
+    right: u32,
+    bottom: u32,
+    radius: u32,
+) -> bool {
+    let near_left = x < left + radius;
+    let near_right = x >= right - radius;
+    let near_top = y < top + radius;
+    let near_bottom = y >= bottom - radius;
+    if !(near_left || near_right) || !(near_top || near_bottom) {
+        return true;
+    }
+    let center_x = if near_left {
+        left + radius
+    } else {
+        right - radius - 1
+    };
+    let center_y = if near_top {
+        top + radius
+    } else {
+        bottom - radius - 1
+    };
+    let dx = i64::from(x) - i64::from(center_x);
+    let dy = i64::from(y) - i64::from(center_y);
+    dx * dx + dy * dy <= i64::from(radius) * i64::from(radius)
+}
+
+fn palette_color(profile: &DitherProfile, background: TextBackground) -> Rgb {
+    let device_index = match background {
+        TextBackground::Black => 0,
+        TextBackground::Blue => 1,
+        TextBackground::Green => 2,
+        TextBackground::Red => 3,
+        TextBackground::Yellow => 5,
+        TextBackground::White => 6,
+    };
+    profile
+        .palette
+        .iter()
+        .find(|entry| entry.device_index == device_index)
+        .map(|entry| entry.color)
+        .unwrap_or_else(|| {
+            if device_index == 0 {
+                Rgb::new(0, 0, 0)
+            } else {
+                Rgb::new(255, 255, 255)
+            }
+        })
+}
+
+fn contrasting_color(profile: &DitherProfile, background: Rgb) -> Rgb {
+    let luminance = 0.2126 * f64::from(background.r)
+        + 0.7152 * f64::from(background.g)
+        + 0.0722 * f64::from(background.b);
+    palette_color(
+        profile,
+        if luminance > 135.0 {
+            TextBackground::Black
+        } else {
+            TextBackground::White
+        },
+    )
+}
+
+fn fit_text_box(
+    font: &FontArc,
+    body: &str,
+    text_size: TextSize,
+    canvas_width: u32,
+    canvas_height: u32,
+) -> Option<(PxScale, Vec<String>, u32, u32, u32)> {
+    let short_edge = canvas_width.min(canvas_height) as f32;
+    let scale_factor = match text_size {
+        TextSize::Small => 0.045,
+        TextSize::Medium => 0.065,
+        TextSize::Large => 0.09,
+    };
+    let minimum = (short_edge * 0.025).max(12.0).ceil();
+    let mut size = (short_edge * scale_factor).max(minimum).floor();
+    let maximum_box_width = canvas_width as f32 * 0.9;
+    let maximum_box_height = canvas_height as f32 * 0.9;
+    while size >= minimum {
+        let scale = PxScale::from(size);
+        let padding = (size * 0.48).round().max(6.0);
+        let maximum_line_width = maximum_box_width - padding * 2.0;
+        let lines = wrap_text(font, scale, body, maximum_line_width);
+        let scaled = font.as_scaled(scale);
+        let line_height = scaled.ascent() - scaled.descent() + scaled.line_gap();
+        let widest_line = lines
+            .iter()
+            .map(|line| measure_line(font, scale, line))
+            .fold(0.0_f32, f32::max);
+        let box_width = (widest_line + padding * 2.0).ceil();
+        let box_height = (line_height * lines.len() as f32 + padding * 2.0).ceil();
+        if !lines.is_empty()
+            && widest_line <= maximum_line_width + 0.5
+            && box_width <= maximum_box_width
+            && box_height <= maximum_box_height
+        {
+            return Some((
+                scale,
+                lines,
+                padding as u32,
+                box_width as u32,
+                box_height as u32,
+            ));
+        }
+        size -= 1.0;
+    }
+    None
+}
+
+fn wrap_text(font: &FontArc, scale: PxScale, body: &str, maximum_width: f32) -> Vec<String> {
+    let mut lines = Vec::new();
+    for paragraph in body.replace("\r\n", "\n").replace('\r', "\n").split('\n') {
+        if paragraph.is_empty() {
+            lines.push(String::new());
+            continue;
+        }
+        let mut current = String::new();
+        for word in paragraph.split_whitespace() {
+            let candidate = if current.is_empty() {
+                word.to_owned()
+            } else {
+                format!("{current} {word}")
+            };
+            if measure_line(font, scale, &candidate) <= maximum_width {
+                current = candidate;
+                continue;
+            }
+            if !current.is_empty() {
+                lines.push(std::mem::take(&mut current));
+            }
+            for character in word.chars() {
+                let candidate = format!("{current}{character}");
+                if !current.is_empty() && measure_line(font, scale, &candidate) > maximum_width {
+                    lines.push(std::mem::take(&mut current));
+                }
+                current.push(character);
+            }
+        }
+        if !current.is_empty() {
+            lines.push(current);
+        }
+    }
+    lines
+}
+
+fn measure_line(font: &FontArc, scale: PxScale, line: &str) -> f32 {
+    let scaled = font.as_scaled(scale);
+    let mut width = 0.0;
+    let mut previous: Option<GlyphId> = None;
+    for character in line.chars() {
+        let id = font.glyph_id(character);
+        if let Some(previous) = previous {
+            width += scaled.kern(previous, id);
+        }
+        width += scaled.h_advance(id);
+        previous = Some(id);
+    }
+    width
 }
 
 pub fn encode_bmp4(image: &IndexedImage) -> Result<Vec<u8>> {
@@ -499,6 +973,80 @@ mod tests {
     fn orientation_inference_treats_square_as_landscape() {
         assert_eq!(ImageOrientation::infer(10, 11), ImageOrientation::Portrait);
         assert_eq!(ImageOrientation::infer(10, 10), ImageOrientation::Landscape);
+    }
+
+    #[test]
+    fn text_overlay_is_server_dithered_with_an_opaque_background() {
+        let source_bytes = blank_message_source().unwrap();
+        let decoded = decode_source_named(&source_bytes, Some("message.png")).unwrap();
+        let text = TextOverlay::new(
+            "Dinner at seven".into(),
+            HorizontalTextPosition::Left,
+            VerticalTextPosition::Top,
+            TextBackground::Black,
+        );
+        let rendered = render_composed_with_original(
+            &decoded,
+            &source_bytes,
+            FrameTarget::Paper7,
+            OutputMode::DirectJpeg,
+            ImageOrientation::Landscape,
+            Some(&text),
+        )
+        .unwrap();
+        assert_eq!(rendered.media_type, "image/bmp");
+        validate_bmp4(&rendered.bytes, FrameTarget::Paper7).unwrap();
+        let pixels = image::load_from_memory(&rendered.bytes)
+            .unwrap()
+            .into_rgb8();
+        assert!(
+            pixels
+                .enumerate_pixels()
+                .any(|(_, y, pixel)| y < 240 && pixel.0 == [0, 0, 0])
+        );
+        assert!(pixels.pixels().any(|pixel| pixel.0 == [255, 255, 255]));
+        assert!(!inside_rounded_rectangle(0, 0, 0, 0, 100, 50, 10));
+        assert!(inside_rounded_rectangle(10, 0, 0, 0, 100, 50, 10));
+    }
+
+    #[test]
+    fn text_overlay_validation_rejects_empty_text_and_migrates_legacy_positions() {
+        let mut text = TextOverlay::new(
+            " ".into(),
+            HorizontalTextPosition::Middle,
+            VerticalTextPosition::Bottom,
+            TextBackground::Black,
+        );
+        assert!(text.validate().is_err());
+        text.body = "hello".into();
+        text.legacy_x = Some(0);
+        text.legacy_width = Some(2_000);
+        text.legacy_y = Some(4_000);
+        text.legacy_height = Some(2_000);
+        text.migrate_legacy_position();
+        assert_eq!(text.horizontal, HorizontalTextPosition::Left);
+        assert_eq!(text.vertical, VerticalTextPosition::Middle);
+        assert!(text.validate().is_ok());
+    }
+
+    #[test]
+    fn text_sizes_are_distinct_and_wrapping_respects_explicit_newlines() {
+        let font = text_font().unwrap();
+        let small = fit_text_box(&font, "Short message", TextSize::Small, 800, 480).unwrap();
+        let medium = fit_text_box(&font, "Short message", TextSize::Medium, 800, 480).unwrap();
+        let large = fit_text_box(&font, "Short message", TextSize::Large, 800, 480).unwrap();
+        assert!(small.0.x < medium.0.x && medium.0.x < large.0.x);
+
+        let wrapped = fit_text_box(
+            &font,
+            "First line\nThis deliberately long second line wraps before it can cross the frame",
+            TextSize::Medium,
+            800,
+            480,
+        )
+        .unwrap();
+        assert!(wrapped.1.len() >= 3);
+        assert!(wrapped.3 <= 720);
     }
 
     #[test]

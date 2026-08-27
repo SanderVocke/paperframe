@@ -30,7 +30,10 @@ use crate::{
         SupplierKind, SupplierSettings,
     },
     queue::{PreparedImage, QueueEntry, QueueEventReason, QueueInsertPosition},
-    renderer::{FrameTarget, OutputMode},
+    renderer::{
+        FrameTarget, HorizontalTextPosition, OutputMode, TextBackground, TextOverlay, TextSize,
+        VerticalTextPosition,
+    },
     state::{AppState, ImageRequest},
 };
 
@@ -50,10 +53,15 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/pwa/icon-192.png", get(icon_192))
         .route("/pwa/icon-512.png", get(icon_512))
         .route("/pwa/icon-maskable-512.png", get(icon_maskable_512))
+        .route("/pwa/inter-variable.ttf", get(inter_font))
         .route("/settings", get(settings_page).post(update_settings))
         .route("/queue/reorder", post(reorder_queue))
         .route("/queue/remove", post(remove_queue_entry))
         .route("/queue/advance", post(advance_queue))
+        .route("/queue/message", post(create_text_message))
+        .route("/queue/edit", post(edit_queue_entry))
+        .route("/queue/text", post(update_queue_text))
+        .route("/queue/text/remove", post(remove_queue_text))
         .route(
             "/queue/upload",
             post(upload_queue).layer(DefaultBodyLimit::max(UPLOAD_LIMIT)),
@@ -121,6 +129,17 @@ async fn icon_maskable_512() -> Response {
     pwa_icon(ICON_MASKABLE_512)
 }
 
+async fn inter_font() -> Response {
+    (
+        [
+            (header::CONTENT_TYPE, "font/ttf"),
+            (header::CACHE_CONTROL, "public, max-age=31536000, immutable"),
+        ],
+        Bytes::from_static(crate::renderer::TEXT_FONT_BYTES),
+    )
+        .into_response()
+}
+
 fn pwa_icon(bytes: &'static [u8]) -> Response {
     (
         [
@@ -152,6 +171,14 @@ struct QueueView {
     orientation_label: String,
     portrait: bool,
     is_dithered: bool,
+    has_text: bool,
+    dedicated_text: bool,
+    text_body: String,
+    text_horizontal: String,
+    text_vertical: String,
+    text_background: String,
+    text_size: String,
+    thumbnail_version: String,
     order_line: String,
 }
 
@@ -241,6 +268,41 @@ struct OrientationForm {
     queue_generation: String,
     id: String,
     orientation: String,
+}
+#[derive(Deserialize)]
+struct TextForm {
+    csrf_token: String,
+    queue_generation: String,
+    id: String,
+    body: String,
+    horizontal: String,
+    vertical: String,
+    background: String,
+    size: String,
+}
+#[derive(Deserialize)]
+struct EditEntryForm {
+    csrf_token: String,
+    queue_generation: String,
+    id: String,
+    body: String,
+    horizontal: String,
+    vertical: String,
+    background: String,
+    size: String,
+    orientation: String,
+}
+#[derive(Deserialize)]
+struct MessageForm {
+    csrf_token: String,
+    queue_generation: String,
+    body: String,
+    horizontal: String,
+    vertical: String,
+    background: String,
+    size: String,
+    orientation: String,
+    position: String,
 }
 
 async fn settings_page(State(state): State<Arc<AppState>>) -> Response {
@@ -533,11 +595,14 @@ fn relative_time(requested_at: chrono::DateTime<Utc>, now: chrono::DateTime<Utc>
 }
 
 fn queue_view(index: usize, entry: &QueueEntry) -> QueueView {
-    let provenance = if entry.supplier_id.is_some() {
+    let provenance = if entry.dedicated_text {
+        "text message".into()
+    } else if entry.supplier_id.is_some() {
         "photo library".into()
     } else {
         "your uploads".into()
     };
+    let text = entry.text_overlay.as_ref();
     QueueView {
         id: entry.id.clone(),
         display_name: entry.display_name.clone(),
@@ -549,7 +614,9 @@ fn queue_view(index: usize, entry: &QueueEntry) -> QueueView {
                 crate::renderer::ImageOrientation::Portrait => "Portrait",
                 crate::renderer::ImageOrientation::Landscape => "Landscape",
             },
-            if entry.orientation_source == crate::renderer::OrientationSource::Inferred {
+            if entry.orientation_source == crate::renderer::OrientationSource::Inferred
+                && !entry.dedicated_text
+            {
                 " (inferred)"
             } else {
                 ""
@@ -557,7 +624,58 @@ fn queue_view(index: usize, entry: &QueueEntry) -> QueueView {
         ),
         portrait: entry.orientation == crate::renderer::ImageOrientation::Portrait,
         is_dithered: entry.media_type == "image/bmp",
+        has_text: text.is_some(),
+        dedicated_text: entry.dedicated_text,
+        text_body: text.map(|text| text.body.clone()).unwrap_or_default(),
+        text_horizontal: text
+            .map(|text| horizontal_text_position_name(text.horizontal).to_owned())
+            .unwrap_or_else(|| "middle".into()),
+        text_vertical: text
+            .map(|text| vertical_text_position_name(text.vertical).to_owned())
+            .unwrap_or_else(|| "bottom".into()),
+        text_background: text
+            .map(|text| text_background_name(text.background).to_owned())
+            .unwrap_or_else(|| "black".into()),
+        text_size: text
+            .map(|text| text_size_name(text.size).to_owned())
+            .unwrap_or_else(|| "large".into()),
+        thumbnail_version: entry.digest.chars().take(12).collect(),
         order_line: format!("{}\t{}", entry.id, entry.display_name),
+    }
+}
+
+fn horizontal_text_position_name(position: HorizontalTextPosition) -> &'static str {
+    match position {
+        HorizontalTextPosition::Left => "left",
+        HorizontalTextPosition::Middle => "middle",
+        HorizontalTextPosition::Right => "right",
+    }
+}
+
+fn vertical_text_position_name(position: VerticalTextPosition) -> &'static str {
+    match position {
+        VerticalTextPosition::Top => "top",
+        VerticalTextPosition::Middle => "middle",
+        VerticalTextPosition::Bottom => "bottom",
+    }
+}
+
+fn text_size_name(size: TextSize) -> &'static str {
+    match size {
+        TextSize::Small => "small",
+        TextSize::Medium => "medium",
+        TextSize::Large => "large",
+    }
+}
+
+fn text_background_name(background: TextBackground) -> &'static str {
+    match background {
+        TextBackground::Black => "black",
+        TextBackground::White => "white",
+        TextBackground::Blue => "blue",
+        TextBackground::Green => "green",
+        TextBackground::Red => "red",
+        TextBackground::Yellow => "yellow",
     }
 }
 
@@ -761,6 +879,8 @@ async fn upload_queue(State(state): State<Arc<AppState>>, mut multipart: Multipa
                     source_height: decoded.pixels.height(),
                     orientation: decoded.orientation,
                     frame_target: rendering.target,
+                    text_overlay: None,
+                    dedicated_text: false,
                     supplier_id: None,
                     source_key: None,
                 })
@@ -782,6 +902,259 @@ async fn upload_queue(State(state): State<Arc<AppState>>, mut multipart: Multipa
         Err(error) => plain(StatusCode::UNPROCESSABLE_ENTITY, &error.to_string()),
     }
 }
+async fn create_text_message(
+    State(state): State<Arc<AppState>>,
+    Form(form): Form<MessageForm>,
+) -> Response {
+    let generation = match validate_action(&state, &form.csrf_token, &form.queue_generation) {
+        Ok(value) => value,
+        Err((status, message)) => return plain(status, &message),
+    };
+    let text = match text_overlay_from_fields(
+        form.body,
+        &form.horizontal,
+        &form.vertical,
+        &form.background,
+        &form.size,
+    ) {
+        Ok(text) => text,
+        Err(message) => return plain(StatusCode::UNPROCESSABLE_ENTITY, &message),
+    };
+    let orientation = match parse_orientation(&form.orientation) {
+        Ok(orientation) => orientation,
+        Err(message) => return plain(StatusCode::UNPROCESSABLE_ENTITY, message),
+    };
+    let position = match form.position.as_str() {
+        "front" => QueueInsertPosition::Front,
+        "back" => QueueInsertPosition::Back,
+        _ => return plain(StatusCode::UNPROCESSABLE_ENTITY, "Unknown queue position"),
+    };
+    let rendering = state.settings.snapshot().await.settings.rendering;
+    let _render_permit = match state.render_serialization.clone().acquire_owned().await {
+        Ok(permit) => permit,
+        Err(error) => return plain(StatusCode::SERVICE_UNAVAILABLE, &error.to_string()),
+    };
+    let body_for_name = text.body.clone();
+    let request = tokio::task::spawn_blocking(move || -> anyhow::Result<_> {
+        let source = crate::renderer::blank_message_source()?;
+        let decoded = crate::renderer::decode_source_named(&source, Some("message.png"))?;
+        let rendered = crate::renderer::render_composed_with_original(
+            &decoded,
+            &source,
+            rendering.target,
+            rendering.output_mode,
+            orientation,
+            Some(&text),
+        )?;
+        let rendered_decoded =
+            crate::renderer::decode_source_named(&rendered.bytes, Some("message.bmp"))?;
+        let thumbnail = crate::renderer::thumbnail_jpeg(&rendered_decoded)?;
+        Ok(crate::queue::RenderedEnqueueRequest {
+            display_name: message_display_name(&body_for_name),
+            source_bytes: source,
+            derivative_bytes: rendered.bytes,
+            thumbnail_bytes: thumbnail,
+            media_type: rendered.media_type.into(),
+            source_width: decoded.pixels.width(),
+            source_height: decoded.pixels.height(),
+            orientation,
+            frame_target: rendering.target,
+            text_overlay: Some(text),
+            dedicated_text: true,
+            supplier_id: None,
+            source_key: None,
+        })
+    })
+    .await;
+    let request = match request {
+        Ok(Ok(request)) => request,
+        Ok(Err(error)) => return plain(StatusCode::UNPROCESSABLE_ENTITY, &error.to_string()),
+        Err(error) => return plain(StatusCode::INTERNAL_SERVER_ERROR, &error.to_string()),
+    };
+    match state
+        .queue
+        .enqueue_rendered_batch_at(Some(generation), None, position, vec![request])
+        .await
+    {
+        Ok(_) => Redirect::to("/settings").into_response(),
+        Err(error) => plain(StatusCode::CONFLICT, &error.to_string()),
+    }
+}
+
+async fn edit_queue_entry(
+    State(state): State<Arc<AppState>>,
+    Form(form): Form<EditEntryForm>,
+) -> Response {
+    let generation = match validate_action(&state, &form.csrf_token, &form.queue_generation) {
+        Ok(value) => value,
+        Err((status, message)) => return plain(status, &message),
+    };
+    let text = if form.body.trim().is_empty() {
+        None
+    } else {
+        match text_overlay_from_fields(
+            form.body,
+            &form.horizontal,
+            &form.vertical,
+            &form.background,
+            &form.size,
+        ) {
+            Ok(text) => Some(text),
+            Err(message) => return plain(StatusCode::UNPROCESSABLE_ENTITY, &message),
+        }
+    };
+    let orientation = match parse_orientation(&form.orientation) {
+        Ok(orientation) => orientation,
+        Err(message) => return plain(StatusCode::UNPROCESSABLE_ENTITY, message),
+    };
+    let rendering = state.settings.snapshot().await.settings.rendering;
+    let _render_permit = match state.render_serialization.clone().acquire_owned().await {
+        Ok(permit) => permit,
+        Err(error) => return plain(StatusCode::SERVICE_UNAVAILABLE, &error.to_string()),
+    };
+    match state
+        .queue
+        .edit_entry(
+            generation,
+            &form.id,
+            orientation,
+            text,
+            rendering.target,
+            rendering.output_mode,
+        )
+        .await
+    {
+        Ok(_) => Redirect::to("/settings").into_response(),
+        Err(error) => plain(StatusCode::CONFLICT, &error.to_string()),
+    }
+}
+
+async fn update_queue_text(
+    State(state): State<Arc<AppState>>,
+    Form(form): Form<TextForm>,
+) -> Response {
+    let generation = match validate_action(&state, &form.csrf_token, &form.queue_generation) {
+        Ok(value) => value,
+        Err((status, message)) => return plain(status, &message),
+    };
+    let text = match text_overlay_from_fields(
+        form.body,
+        &form.horizontal,
+        &form.vertical,
+        &form.background,
+        &form.size,
+    ) {
+        Ok(text) => text,
+        Err(message) => return plain(StatusCode::UNPROCESSABLE_ENTITY, &message),
+    };
+    let rendering = state.settings.snapshot().await.settings.rendering;
+    let _render_permit = match state.render_serialization.clone().acquire_owned().await {
+        Ok(permit) => permit,
+        Err(error) => return plain(StatusCode::SERVICE_UNAVAILABLE, &error.to_string()),
+    };
+    match state
+        .queue
+        .set_text(
+            generation,
+            &form.id,
+            Some(text),
+            rendering.target,
+            rendering.output_mode,
+        )
+        .await
+    {
+        Ok(_) => Redirect::to("/settings").into_response(),
+        Err(error) => plain(StatusCode::CONFLICT, &error.to_string()),
+    }
+}
+
+async fn remove_queue_text(
+    State(state): State<Arc<AppState>>,
+    Form(form): Form<RemoveForm>,
+) -> Response {
+    let generation = match validate_action(&state, &form.csrf_token, &form.queue_generation) {
+        Ok(value) => value,
+        Err((status, message)) => return plain(status, &message),
+    };
+    let rendering = state.settings.snapshot().await.settings.rendering;
+    let _render_permit = match state.render_serialization.clone().acquire_owned().await {
+        Ok(permit) => permit,
+        Err(error) => return plain(StatusCode::SERVICE_UNAVAILABLE, &error.to_string()),
+    };
+    match state
+        .queue
+        .set_text(
+            generation,
+            &form.id,
+            None,
+            rendering.target,
+            rendering.output_mode,
+        )
+        .await
+    {
+        Ok(_) => Redirect::to("/settings").into_response(),
+        Err(error) => plain(StatusCode::CONFLICT, &error.to_string()),
+    }
+}
+
+fn text_overlay_from_fields(
+    body: String,
+    horizontal: &str,
+    vertical: &str,
+    background: &str,
+    size: &str,
+) -> Result<TextOverlay, String> {
+    let horizontal = match horizontal {
+        "left" => HorizontalTextPosition::Left,
+        "middle" => HorizontalTextPosition::Middle,
+        "right" => HorizontalTextPosition::Right,
+        _ => return Err("Unknown horizontal text position".into()),
+    };
+    let vertical = match vertical {
+        "top" => VerticalTextPosition::Top,
+        "middle" => VerticalTextPosition::Middle,
+        "bottom" => VerticalTextPosition::Bottom,
+        _ => return Err("Unknown vertical text position".into()),
+    };
+    let size = match size {
+        "small" => TextSize::Small,
+        "medium" => TextSize::Medium,
+        "large" => TextSize::Large,
+        _ => return Err("Unknown text size".into()),
+    };
+    let background = match background {
+        "black" => TextBackground::Black,
+        "white" => TextBackground::White,
+        "blue" => TextBackground::Blue,
+        "green" => TextBackground::Green,
+        "red" => TextBackground::Red,
+        "yellow" => TextBackground::Yellow,
+        _ => return Err("Unknown text background color".into()),
+    };
+    let text = TextOverlay::with_size(body, horizontal, vertical, background, size);
+    text.validate().map_err(|error| error.to_string())?;
+    Ok(text)
+}
+
+fn parse_orientation(value: &str) -> Result<crate::renderer::ImageOrientation, &'static str> {
+    match value {
+        "portrait" => Ok(crate::renderer::ImageOrientation::Portrait),
+        "landscape" => Ok(crate::renderer::ImageOrientation::Landscape),
+        _ => Err("Unknown image orientation"),
+    }
+}
+
+fn message_display_name(body: &str) -> String {
+    let summary = body
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .chars()
+        .take(48)
+        .collect::<String>();
+    format!("Message: {summary}")
+}
+
 fn safe_display_name(name: &str) -> String {
     std::path::Path::new(name)
         .file_name()
@@ -815,9 +1188,17 @@ async fn queue_thumbnail(
         Ok(source) => source,
         Err(error) => return plain(StatusCode::NOT_FOUND, &error.to_string()),
     };
+    let (thumbnail_source, thumbnail_name) = if source.entry.text_overlay.is_some() {
+        match state.queue.prepare(&id).await {
+            Ok(rendered) => (rendered.bytes, rendered.entry.object_name),
+            Err(error) => return plain(StatusCode::NOT_FOUND, &error.to_string()),
+        }
+    } else {
+        (source.bytes, source.entry.display_name)
+    };
     let rendered = tokio::task::spawn_blocking(move || -> anyhow::Result<Vec<u8>> {
         let decoded =
-            crate::renderer::decode_source_named(&source.bytes, Some(&source.entry.display_name))?;
+            crate::renderer::decode_source_named(&thumbnail_source, Some(&thumbnail_name))?;
         crate::renderer::thumbnail_jpeg(&decoded)
     })
     .await;
@@ -947,6 +1328,20 @@ async fn queue_dithered_preview(
         Ok(source) => source,
         Err(error) => return plain(StatusCode::NOT_FOUND, &error.to_string()),
     };
+    if source.entry.text_overlay.is_some() {
+        let rendered = match state.queue.prepare(&id).await {
+            Ok(rendered) => rendered,
+            Err(error) => return plain(StatusCode::NOT_FOUND, &error.to_string()),
+        };
+        return image_response(
+            StatusCode::OK,
+            Body::from(rendered.bytes.clone()),
+            rendered.bytes.len(),
+            &rendered.entry.media_type,
+            None,
+            Some("private, no-store"),
+        );
+    }
     let target = state.settings.snapshot().await.settings.rendering.target;
     let orientation = source.entry.orientation;
     let _render_permit = match state.render_serialization.clone().acquire_owned().await {
@@ -1539,6 +1934,105 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn text_routes_create_edit_and_nondestructively_remove_compositions() {
+        let (_directory, state) = manual_state(AdvancementSettings::Manual).await;
+        let app = router(state.clone());
+        let initial = state.queue.snapshot().await;
+        let photo = initial.entries[0].clone();
+        let source_before = state.queue.prepare_source(&photo.id).await.unwrap().bytes;
+        let form = serde_urlencoded::to_string([
+            ("csrf_token", state.csrf_token()),
+            ("queue_generation", &initial.generation.to_string()),
+            ("id", &photo.id),
+            ("body", "Caption from the route"),
+            ("horizontal", "right"),
+            ("vertical", "bottom"),
+            ("background", "black"),
+            ("size", "medium"),
+            ("orientation", "portrait"),
+        ])
+        .unwrap();
+        let response = app
+            .clone()
+            .oneshot(
+                Request::post("/queue/edit")
+                    .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
+                    .body(Body::from(form))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::SEE_OTHER);
+        let with_text = state.queue.snapshot().await;
+        assert!(with_text.entries[0].text_overlay.is_some());
+        assert_eq!(with_text.entries[0].media_type, "image/bmp");
+        assert_eq!(
+            with_text.entries[0].orientation,
+            crate::renderer::ImageOrientation::Portrait
+        );
+        assert_eq!(
+            state.queue.prepare_source(&photo.id).await.unwrap().bytes,
+            source_before
+        );
+
+        let remove = serde_urlencoded::to_string([
+            ("csrf_token", state.csrf_token()),
+            ("queue_generation", &with_text.generation.to_string()),
+            ("id", &photo.id),
+            ("body", ""),
+            ("horizontal", "right"),
+            ("vertical", "bottom"),
+            ("background", "black"),
+            ("size", "medium"),
+            ("orientation", "portrait"),
+        ])
+        .unwrap();
+        let response = app
+            .clone()
+            .oneshot(
+                Request::post("/queue/edit")
+                    .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
+                    .body(Body::from(remove))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::SEE_OTHER);
+        let restored = state.queue.snapshot().await;
+        assert!(restored.entries[0].text_overlay.is_none());
+        assert_eq!(restored.entries[0].media_type, "image/jpeg");
+        assert_eq!(state.queue.prepare(&photo.id).await.unwrap().bytes, A);
+
+        let create = serde_urlencoded::to_string([
+            ("csrf_token", state.csrf_token()),
+            ("queue_generation", &restored.generation.to_string()),
+            ("body", "A standalone message"),
+            ("horizontal", "middle"),
+            ("vertical", "middle"),
+            ("background", "blue"),
+            ("size", "small"),
+            ("orientation", "landscape"),
+            ("position", "front"),
+        ])
+        .unwrap();
+        let response = app
+            .oneshot(
+                Request::post("/queue/message")
+                    .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
+                    .body(Body::from(create))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::SEE_OTHER);
+        let message = state.queue.snapshot().await.entries.remove(0);
+        assert!(message.dedicated_text);
+        assert!(message.text_overlay.is_some());
+        assert_eq!(message.media_type, "image/bmp");
+        assert!(message.display_name.starts_with("Message:"));
+    }
+
+    #[tokio::test]
     async fn recent_frame_requests_show_clients_results_and_expire_after_two_hours() {
         let (_directory, state) = manual_state(AdvancementSettings::Manual).await;
         let app = router(state.clone());
@@ -1627,6 +2121,11 @@ mod tests {
                 .unwrap()
                 .contains("self.addEventListener(\"fetch\"")
         );
+
+        let font = inter_font().await;
+        assert_eq!(font.status(), StatusCode::OK);
+        assert_eq!(font.headers()[header::CONTENT_TYPE], "font/ttf");
+        assert_eq!(bytes(font).await, crate::renderer::TEXT_FONT_BYTES);
 
         for (icon, size) in [
             (icon_192().await, 192_u32),

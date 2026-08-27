@@ -12,17 +12,44 @@ pub fn process_canvas(
     profile: &DitherProfile,
     options: &ResolvedDitherOptions,
 ) -> Result<IndexedImage> {
+    let mut adjusted = canvas.clone();
+    adjust_canvas(&mut adjusted, profile, options)?;
+    process_adjusted_canvas(&adjusted, profile, options)
+}
+
+/// Applies profile adjustments without quantizing. Composition layers that must
+/// retain exact palette colors, such as text, are added after this stage.
+pub fn adjust_canvas(
+    canvas: &mut RgbaImage,
+    profile: &DitherProfile,
+    options: &ResolvedDitherOptions,
+) -> Result<()> {
     profile.validate()?;
     let palette = profile
         .palette
         .iter()
         .map(|entry| entry.color)
         .collect::<Vec<_>>();
-    let mut adjusted = canvas.clone();
-    apply_adjustments(&mut adjusted, options, &palette);
+    apply_adjustments(canvas, options, &palette);
+    Ok(())
+}
+
+/// Quantizes an already-adjusted canvas. This keeps high-contrast composition
+/// layers out of the photo analysis and tone-adjustment stages.
+pub fn process_adjusted_canvas(
+    canvas: &RgbaImage,
+    profile: &DitherProfile,
+    options: &ResolvedDitherOptions,
+) -> Result<IndexedImage> {
+    profile.validate()?;
+    let palette = profile
+        .palette
+        .iter()
+        .map(|entry| entry.color)
+        .collect::<Vec<_>>();
     let positions = match options.mode {
-        DitheringMode::QuantizationOnly => quantize(&adjusted, &palette, options.color_matching),
-        DitheringMode::ErrorDiffusion => diffuse(&adjusted, &palette, options),
+        DitheringMode::QuantizationOnly => quantize(canvas, &palette, options.color_matching),
+        DitheringMode::ErrorDiffusion => diffuse(canvas, &palette, options),
     };
     let indices = positions
         .into_iter()

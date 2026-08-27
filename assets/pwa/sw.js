@@ -1,9 +1,10 @@
-const CACHE_NAME = "paper-frame-static-v1";
+const CACHE_NAME = "paper-frame-static-v2";
 const CACHEABLE_PATHS = new Set([
   "/manifest.webmanifest",
   "/pwa/icon-192.png",
   "/pwa/icon-512.png",
   "/pwa/icon-maskable-512.png",
+  "/pwa/inter-variable.ttf",
 ]);
 
 self.addEventListener("activate", (event) => {

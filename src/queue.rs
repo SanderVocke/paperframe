@@ -17,10 +17,13 @@ use tokio::sync::{Mutex, RwLock, watch};
 
 use crate::{
     config::QueueAdvanceBehavior,
-    renderer::{FrameTarget, ImageOrientation, OrientationSource, RENDER_PROFILE_VERSION},
+    renderer::{
+        FrameTarget, ImageOrientation, OrientationSource, RENDER_PROFILE_VERSION,
+        TEXT_RENDER_PROFILE_VERSION, TextOverlay,
+    },
 };
 
-const STATE_VERSION: u32 = 2;
+const STATE_VERSION: u32 = 4;
 const STATE_FILE: &str = "queue-state.toml";
 const OBJECTS_DIR: &str = "objects";
 const THUMBNAILS_DIR: &str = "thumbnails";
@@ -54,6 +57,12 @@ pub struct QueueEntry {
     pub frame_target: FrameTarget,
     #[serde(default)]
     pub renderer_profile: u32,
+    #[serde(default)]
+    pub text_overlay: Option<TextOverlay>,
+    #[serde(default)]
+    pub text_renderer_profile: u32,
+    #[serde(default)]
+    pub dedicated_text: bool,
     pub supplier_id: Option<String>,
     pub source_key: Option<String>,
 }
@@ -108,6 +117,8 @@ pub struct RenderedEnqueueRequest {
     pub source_height: u32,
     pub orientation: ImageOrientation,
     pub frame_target: FrameTarget,
+    pub text_overlay: Option<TextOverlay>,
+    pub dedicated_text: bool,
     pub supplier_id: Option<String>,
     pub source_key: Option<String>,
 }
@@ -315,6 +326,9 @@ impl QueueStore {
                     orientation_source: OrientationSource::Inferred,
                     frame_target: FrameTarget::Paper7,
                     renderer_profile: 0,
+                    text_overlay: None,
+                    text_renderer_profile: 0,
+                    dedicated_text: false,
                     supplier_id: request.supplier_id.clone(),
                     source_key: request.source_key.clone(),
                 }
@@ -387,6 +401,15 @@ impl QueueStore {
                 request.frame_target,
             )?;
             validate_jpeg(&request.thumbnail_bytes)?;
+            if request.dedicated_text && request.text_overlay.is_none() {
+                bail!("a dedicated text item must contain a text recipe");
+            }
+            if let Some(text) = &request.text_overlay {
+                text.validate()?;
+                if request.media_type != "image/bmp" {
+                    bail!("text-bearing queue entries must use a server-dithered BMP");
+                }
+            }
         }
         let _guard = self.mutation.lock().await;
         let current = self.descriptor.read().await.clone();
@@ -424,6 +447,13 @@ impl QueueStore {
                     orientation_source: OrientationSource::Inferred,
                     frame_target: request.frame_target,
                     renderer_profile: RENDER_PROFILE_VERSION,
+                    text_overlay: request.text_overlay.clone(),
+                    text_renderer_profile: if request.text_overlay.is_some() {
+                        TEXT_RENDER_PROFILE_VERSION
+                    } else {
+                        0
+                    },
+                    dedicated_text: request.dedicated_text,
                     supplier_id: request.supplier_id.clone(),
                     source_key: request.source_key.clone(),
                 }
@@ -698,12 +728,13 @@ impl QueueStore {
                         .context("failed to read queue source for rerender")?;
                     let decoded =
                         crate::renderer::decode_source_named(&source, Some(&entry.display_name))?;
-                    let output = crate::renderer::render_with_original(
+                    let output = crate::renderer::render_composed_with_original(
                         &decoded,
                         &source,
                         target,
                         output_mode,
                         entry.orientation,
+                        entry.text_overlay.as_ref(),
                     )?;
                     Ok((entry.id, output))
                 })
@@ -740,6 +771,12 @@ impl QueueStore {
             next.entries[index].media_type = output.media_type.into();
             next.entries[index].frame_target = target;
             next.entries[index].renderer_profile = RENDER_PROFILE_VERSION;
+            next.entries[index].text_renderer_profile =
+                if next.entries[index].text_overlay.is_some() {
+                    TEXT_RENDER_PROFILE_VERSION
+                } else {
+                    0
+                };
             replacements.push((old_name, name, output.bytes));
         }
         let objects = self.objects.clone();
@@ -751,6 +788,18 @@ impl QueueStore {
         .await
         .context("queue rerender publication worker stopped")??;
         *self.descriptor.write().await = next.clone();
+        let stale_thumbnails = next
+            .entries
+            .iter()
+            .filter(|entry| entry.text_overlay.is_some())
+            .map(|entry| self.thumbnails.join(thumbnail_name(&entry.id)))
+            .collect::<Vec<_>>();
+        let _ = tokio::task::spawn_blocking(move || {
+            for path in stale_thumbnails {
+                let _ = fs::remove_file(path);
+            }
+        })
+        .await;
         self.notify(QueueEventReason::Settings, next.generation);
         Ok(snapshot_of(&next))
     }
@@ -779,15 +828,18 @@ impl QueueStore {
         let source_path = self.objects.join(source_name);
         let id = entry.id.clone();
         let display_name = entry.display_name;
+        let text_overlay = entry.text_overlay;
+        let has_text = text_overlay.is_some();
         let rendered = tokio::task::spawn_blocking(move || -> Result<_> {
             let source = fs::read(source_path).context("failed to read queue source")?;
             let decoded = crate::renderer::decode_source_named(&source, Some(&display_name))?;
-            crate::renderer::render_with_original(
+            crate::renderer::render_composed_with_original(
                 &decoded,
                 &source,
                 target,
                 output_mode,
                 orientation,
+                text_overlay.as_ref(),
             )
         })
         .await
@@ -815,6 +867,11 @@ impl QueueStore {
         next.entries[index].orientation_source = OrientationSource::Override;
         next.entries[index].frame_target = target;
         next.entries[index].renderer_profile = RENDER_PROFILE_VERSION;
+        next.entries[index].text_renderer_profile = if has_text {
+            TEXT_RENDER_PROFILE_VERSION
+        } else {
+            0
+        };
         let objects = self.objects.clone();
         let state_path = self.state_path.clone();
         let disk = next.clone();
@@ -831,6 +888,214 @@ impl QueueStore {
         .await
         .context("orientation publication worker stopped")??;
         *self.descriptor.write().await = next.clone();
+        if has_text {
+            let thumbnail = self.thumbnails.join(thumbnail_name(&id));
+            let _ = tokio::task::spawn_blocking(move || fs::remove_file(thumbnail)).await;
+        }
+        self.notify(QueueEventReason::Settings, next.generation);
+        Ok(snapshot_of(&next))
+    }
+
+    pub async fn set_text(
+        &self,
+        expected: u64,
+        id: &str,
+        text_overlay: Option<TextOverlay>,
+        target: FrameTarget,
+        output_mode: crate::renderer::OutputMode,
+    ) -> Result<QueueSnapshot> {
+        if let Some(text) = &text_overlay {
+            text.validate()?;
+        }
+        let base = self.descriptor.read().await.clone();
+        require_generation(&base, expected)?;
+        let entry = base
+            .entries
+            .iter()
+            .find(|entry| entry.id == id)
+            .cloned()
+            .context("queue entry not found")?;
+        if entry.dedicated_text && text_overlay.is_none() {
+            bail!("remove the dedicated message from the queue instead");
+        }
+        if entry.text_overlay == text_overlay {
+            return Ok(snapshot_of(&base));
+        }
+        let source_name = entry
+            .source_object_name
+            .clone()
+            .unwrap_or_else(|| entry.object_name.clone());
+        let source_path = self.objects.join(source_name);
+        let id = entry.id.clone();
+        let display_name = entry.display_name;
+        let orientation = entry.orientation;
+        let text_for_render = text_overlay.clone();
+        let rendered = tokio::task::spawn_blocking(move || -> Result<_> {
+            let source = fs::read(source_path).context("failed to read queue source")?;
+            let decoded = crate::renderer::decode_source_named(&source, Some(&display_name))?;
+            crate::renderer::render_composed_with_original(
+                &decoded,
+                &source,
+                target,
+                output_mode,
+                orientation,
+                text_for_render.as_ref(),
+            )
+        })
+        .await
+        .context("text composition worker stopped")??;
+
+        let _guard = self.mutation.lock().await;
+        let current = self.descriptor.read().await.clone();
+        require_generation(&current, expected)?;
+        let index = current
+            .entries
+            .iter()
+            .position(|entry| entry.id == id)
+            .context("queue entry not found")?;
+        let mut next = current;
+        next.version = STATE_VERSION;
+        next.generation = next.generation.saturating_add(1);
+        let new_name = format!("{}.text-{}.{}", id, next.generation, rendered.extension);
+        let old_name = next.entries[index].object_name.clone();
+        next.entries[index].object_name = new_name.clone();
+        next.entries[index].digest = digest(&rendered.bytes);
+        next.entries[index].content_length = rendered.bytes.len() as u64;
+        next.entries[index].media_type = rendered.media_type.into();
+        if next.entries[index].dedicated_text
+            && let Some(text) = &text_overlay
+        {
+            next.entries[index].display_name = text_message_display_name(&text.body);
+        }
+        next.entries[index].text_renderer_profile = if text_overlay.is_some() {
+            TEXT_RENDER_PROFILE_VERSION
+        } else {
+            0
+        };
+        next.entries[index].text_overlay = text_overlay;
+        next.entries[index].frame_target = target;
+        next.entries[index].renderer_profile = RENDER_PROFILE_VERSION;
+        let objects = self.objects.clone();
+        let state_path = self.state_path.clone();
+        let disk = next.clone();
+        tokio::task::spawn_blocking(move || {
+            replace_derivative(
+                &objects,
+                &state_path,
+                &old_name,
+                &new_name,
+                &rendered.bytes,
+                &disk,
+            )
+        })
+        .await
+        .context("text composition publication worker stopped")??;
+        *self.descriptor.write().await = next.clone();
+        let thumbnail = self.thumbnails.join(thumbnail_name(&id));
+        let _ = tokio::task::spawn_blocking(move || fs::remove_file(thumbnail)).await;
+        self.notify(QueueEventReason::Settings, next.generation);
+        Ok(snapshot_of(&next))
+    }
+
+    pub async fn edit_entry(
+        &self,
+        expected: u64,
+        id: &str,
+        orientation: ImageOrientation,
+        text_overlay: Option<TextOverlay>,
+        target: FrameTarget,
+        output_mode: crate::renderer::OutputMode,
+    ) -> Result<QueueSnapshot> {
+        if let Some(text) = &text_overlay {
+            text.validate()?;
+        }
+        let base = self.descriptor.read().await.clone();
+        require_generation(&base, expected)?;
+        let entry = base
+            .entries
+            .iter()
+            .find(|entry| entry.id == id)
+            .cloned()
+            .context("queue entry not found")?;
+        if entry.dedicated_text && text_overlay.is_none() {
+            bail!("a dedicated message must contain text");
+        }
+        if entry.orientation == orientation && entry.text_overlay == text_overlay {
+            return Ok(snapshot_of(&base));
+        }
+        let source_name = entry
+            .source_object_name
+            .clone()
+            .unwrap_or_else(|| entry.object_name.clone());
+        let source_path = self.objects.join(source_name);
+        let id = entry.id.clone();
+        let display_name = entry.display_name;
+        let text_for_render = text_overlay.clone();
+        let rendered = tokio::task::spawn_blocking(move || -> Result<_> {
+            let source = fs::read(source_path).context("failed to read queue source")?;
+            let decoded = crate::renderer::decode_source_named(&source, Some(&display_name))?;
+            crate::renderer::render_composed_with_original(
+                &decoded,
+                &source,
+                target,
+                output_mode,
+                orientation,
+                text_for_render.as_ref(),
+            )
+        })
+        .await
+        .context("queue edit render worker stopped")??;
+
+        let _guard = self.mutation.lock().await;
+        let current = self.descriptor.read().await.clone();
+        require_generation(&current, expected)?;
+        let index = current
+            .entries
+            .iter()
+            .position(|entry| entry.id == id)
+            .context("queue entry not found")?;
+        let mut next = current;
+        next.version = STATE_VERSION;
+        next.generation = next.generation.saturating_add(1);
+        let new_name = format!("{}.edit-{}.{}", id, next.generation, rendered.extension);
+        let old_name = next.entries[index].object_name.clone();
+        next.entries[index].object_name = new_name.clone();
+        next.entries[index].digest = digest(&rendered.bytes);
+        next.entries[index].content_length = rendered.bytes.len() as u64;
+        next.entries[index].media_type = rendered.media_type.into();
+        next.entries[index].orientation = orientation;
+        next.entries[index].orientation_source = OrientationSource::Override;
+        if next.entries[index].dedicated_text
+            && let Some(text) = &text_overlay
+        {
+            next.entries[index].display_name = text_message_display_name(&text.body);
+        }
+        next.entries[index].text_renderer_profile = if text_overlay.is_some() {
+            TEXT_RENDER_PROFILE_VERSION
+        } else {
+            0
+        };
+        next.entries[index].text_overlay = text_overlay;
+        next.entries[index].frame_target = target;
+        next.entries[index].renderer_profile = RENDER_PROFILE_VERSION;
+        let objects = self.objects.clone();
+        let state_path = self.state_path.clone();
+        let disk = next.clone();
+        tokio::task::spawn_blocking(move || {
+            replace_derivative(
+                &objects,
+                &state_path,
+                &old_name,
+                &new_name,
+                &rendered.bytes,
+                &disk,
+            )
+        })
+        .await
+        .context("queue edit publication worker stopped")??;
+        *self.descriptor.write().await = next.clone();
+        let thumbnail = self.thumbnails.join(thumbnail_name(&id));
+        let _ = tokio::task::spawn_blocking(move || fs::remove_file(thumbnail)).await;
         self.notify(QueueEventReason::Settings, next.generation);
         Ok(snapshot_of(&next))
     }
@@ -1055,9 +1320,15 @@ fn initialize(configured: &Path) -> Result<(PathBuf, PathBuf, PathBuf, Descripto
         if let Some(source) = &entry.source_object_name {
             validate_object_name(source)?;
         }
+        if entry.dedicated_text && entry.text_overlay.is_none() {
+            bail!("dedicated text queue entry has no text recipe");
+        }
+        if let Some(text) = &entry.text_overlay {
+            text.validate()?;
+        }
     }
     if descriptor.version < STATE_VERSION {
-        migrate_v1_descriptor(&objects, &mut descriptor)?;
+        migrate_descriptor(&objects, &mut descriptor)?;
         persist_descriptor(&state_path, &descriptor)?;
     }
     let expected = descriptor
@@ -1122,34 +1393,46 @@ fn validate_object_name(name: &str) -> Result<()> {
     }
 }
 
-fn migrate_v1_descriptor(objects: &Path, descriptor: &mut Descriptor) -> Result<()> {
-    let mut created = Vec::new();
-    let result = (|| -> Result<()> {
+fn migrate_descriptor(objects: &Path, descriptor: &mut Descriptor) -> Result<()> {
+    // Version 1 stored only a JPEG derivative. Version 2 already has immutable
+    // sources, and serde defaults its new text fields to an ordinary photo.
+    if descriptor.version == 1 {
+        let mut created = Vec::new();
+        let result = (|| -> Result<()> {
+            for entry in &mut descriptor.entries {
+                let derivative = objects.join(&entry.object_name);
+                let source_name = format!("{}.source", entry.id);
+                let source = objects.join(&source_name);
+                fs::copy(&derivative, &source).context("failed to preserve legacy queue source")?;
+                created.push(source);
+                let bytes = fs::read(&derivative)?;
+                let decoded =
+                    crate::renderer::decode_source_named(&bytes, Some(&entry.display_name))
+                        .context("legacy queue image is not a decodable raster source")?;
+                entry.source_object_name = Some(source_name);
+                entry.source_digest = Some(digest(&bytes));
+                entry.source_content_length = Some(bytes.len() as u64);
+                entry.source_width = decoded.pixels.width();
+                entry.source_height = decoded.pixels.height();
+                entry.orientation = decoded.orientation;
+                entry.orientation_source = OrientationSource::Inferred;
+                entry.media_type = "image/jpeg".into();
+            }
+            sync_directory(objects)
+        })();
+        if result.is_err() {
+            for path in created {
+                let _ = fs::remove_file(path);
+            }
+            return result;
+        }
+    }
+    if descriptor.version == 3 {
         for entry in &mut descriptor.entries {
-            let derivative = objects.join(&entry.object_name);
-            let source_name = format!("{}.source", entry.id);
-            let source = objects.join(&source_name);
-            fs::copy(&derivative, &source).context("failed to preserve legacy queue source")?;
-            created.push(source);
-            let bytes = fs::read(&derivative)?;
-            let decoded = crate::renderer::decode_source_named(&bytes, Some(&entry.display_name))
-                .context("legacy queue image is not a decodable raster source")?;
-            entry.source_object_name = Some(source_name);
-            entry.source_digest = Some(digest(&bytes));
-            entry.source_content_length = Some(bytes.len() as u64);
-            entry.source_width = decoded.pixels.width();
-            entry.source_height = decoded.pixels.height();
-            entry.orientation = decoded.orientation;
-            entry.orientation_source = OrientationSource::Inferred;
-            entry.media_type = "image/jpeg".into();
+            if let Some(text) = &mut entry.text_overlay {
+                text.migrate_legacy_position();
+            }
         }
-        sync_directory(objects)
-    })();
-    if result.is_err() {
-        for path in created {
-            let _ = fs::remove_file(path);
-        }
-        return result;
     }
     descriptor.version = STATE_VERSION;
     Ok(())
@@ -1369,6 +1652,17 @@ fn replace_derivative(
     result
 }
 
+fn text_message_display_name(body: &str) -> String {
+    let summary = body
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .chars()
+        .take(48)
+        .collect::<String>();
+    format!("Message: {summary}")
+}
+
 fn thumbnail_name(id: &str) -> String {
     format!("{id}.jpg")
 }
@@ -1509,6 +1803,8 @@ mod tests {
             source_height: decoded.pixels.height(),
             orientation: decoded.orientation,
             frame_target: FrameTarget::Paper7,
+            text_overlay: None,
+            dedicated_text: false,
             supplier_id: None,
             source_key: None,
         }
@@ -1592,6 +1888,62 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn adding_and_removing_text_rebuilds_from_the_immutable_photo() {
+        let dir = tempdir().unwrap();
+        let queue = QueueStore::new(dir.path(), false).await.unwrap();
+        let entry = queue
+            .enqueue_rendered_batch(None, None, vec![rendered_request("a.jpg", A)])
+            .await
+            .unwrap()
+            .remove(0);
+        let original_source = queue.prepare_source(&entry.id).await.unwrap().bytes;
+        let text = TextOverlay::new(
+            "A reversible caption".into(),
+            crate::renderer::HorizontalTextPosition::Middle,
+            crate::renderer::VerticalTextPosition::Bottom,
+            crate::renderer::TextBackground::Black,
+        );
+        let generation = queue.snapshot().await.generation;
+        queue
+            .set_text(
+                generation,
+                &entry.id,
+                Some(text),
+                FrameTarget::Paper7,
+                crate::renderer::OutputMode::DirectJpeg,
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            queue.prepare(&entry.id).await.unwrap().entry.media_type,
+            "image/bmp"
+        );
+        assert_eq!(
+            queue.prepare_source(&entry.id).await.unwrap().bytes,
+            original_source
+        );
+
+        let generation = queue.snapshot().await.generation;
+        queue
+            .set_text(
+                generation,
+                &entry.id,
+                None,
+                FrameTarget::Paper7,
+                crate::renderer::OutputMode::DirectJpeg,
+            )
+            .await
+            .unwrap();
+        let restored = queue.prepare(&entry.id).await.unwrap();
+        assert_eq!(restored.entry.media_type, "image/jpeg");
+        assert_eq!(restored.bytes, A);
+        assert_eq!(
+            queue.prepare_source(&entry.id).await.unwrap().bytes,
+            original_source
+        );
+    }
+
+    #[tokio::test]
     async fn rendered_enqueue_preserves_source_serves_bmp_and_rerenders_orientation() {
         let dir = tempdir().unwrap();
         let queue = QueueStore::new(dir.path(), false).await.unwrap();
@@ -1617,6 +1969,8 @@ mod tests {
                     source_height: decoded.pixels.height(),
                     orientation: decoded.orientation,
                     frame_target: FrameTarget::Paper7,
+                    text_overlay: None,
+                    dedicated_text: false,
                     supplier_id: Some("s".into()),
                     source_key: Some("a".into()),
                 }],
@@ -1834,6 +2188,39 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn version_two_descriptor_migrates_to_photo_without_recopying_source() {
+        let dir = tempdir().unwrap();
+        let queue = QueueStore::new(dir.path(), false).await.unwrap();
+        let entry = queue
+            .enqueue_rendered_batch(None, None, vec![rendered_request("a.jpg", A)])
+            .await
+            .unwrap()
+            .remove(0);
+        let source_name = entry.source_object_name.clone().unwrap();
+        drop(queue);
+        let state_path = dir.path().join(STATE_FILE);
+        let state =
+            fs::read_to_string(&state_path)
+                .unwrap()
+                .replacen("version = 4", "version = 2", 1);
+        fs::write(&state_path, state).unwrap();
+
+        let reopened = QueueStore::new(dir.path(), false).await.unwrap();
+        let migrated = reopened.snapshot().await.entries.remove(0);
+        assert_eq!(
+            migrated.source_object_name.as_deref(),
+            Some(source_name.as_str())
+        );
+        assert!(migrated.text_overlay.is_none());
+        assert!(!migrated.dedicated_text);
+        assert!(
+            fs::read_to_string(state_path)
+                .unwrap()
+                .contains("version = 4")
+        );
+    }
+
+    #[tokio::test]
     async fn version_one_descriptor_migration_preserves_a_source_copy() {
         let dir = tempdir().unwrap();
         let objects = dir.path().join(OBJECTS_DIR);
@@ -1853,7 +2240,7 @@ mod tests {
         assert_eq!(entry.source_object_name.as_deref(), Some("legacy.source"));
         assert_eq!(queue.prepare_source(&entry.id).await.unwrap().bytes, A);
         let persisted = fs::read_to_string(dir.path().join(STATE_FILE)).unwrap();
-        assert!(persisted.contains("version = 2"));
+        assert!(persisted.contains("version = 4"));
     }
 
     #[tokio::test]
@@ -2033,6 +2420,8 @@ mod tests {
                     source_height: decoded.pixels.height(),
                     orientation: decoded.orientation,
                     frame_target: FrameTarget::Paper7,
+                    text_overlay: None,
+                    dedicated_text: false,
                     supplier_id: None,
                     source_key: None,
                 }],

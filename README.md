@@ -80,6 +80,12 @@ Orientation is inferred after metadata orientation: taller images are portrait a
 
 Dither parameters are intentionally not user-editable yet. Profile version 2 uses the web editor's `spectra6Custom` calibrated palette, per-image natural auto optimization, RGB or LAB matching selected by that analysis, the editor's reachable tone/range/paper adjustments, its default Floyd–Steinberg selection, and serpentine scanning. The internal typed profile leaves room for future palette and exposure/contrast/saturation controls. Each queue card links to the original and to a non-advancing lossless dithered preview.
 
+### Text messages
+
+The control page can add a dedicated text message as a queue item or add editable text to an existing photo. A queue card's single **Edit** action opens a larger composition preview with orientation and text controls. Text is laid out with the same bundled Inter font used by the control page in a rounded, opaque color box; black or white foreground is selected automatically for contrast. Choose small, medium, or large text and left/middle/right plus top/middle/bottom placement. The box sizes itself to the text, preserves explicit newlines, and wraps long lines before exceeding 90% of the frame width.
+
+A text edit is a non-destructive recipe change. The server retains the original photo, applies photo adjustments, composites the text, dithers the complete image once, and atomically publishes a stored BMP. Frame requests only read that BMP. Removing text rerenders once from the retained original. Text-bearing entries are always server-dithered BMPs even when ordinary photos use Direct JPEG; `/frame/current.jpg` continues to work because the firmware recognizes the BMP body.
+
 ### Install the control page as an app
 
 Paper Frame is a progressive web app. On a supported Android browser, open the control page and use **Install app** when the button appears. The installed app opens `/settings` in a standalone window. A valid HTTPS public origin is required for installation; plain HTTP works only on loopback addresses such as `localhost` during development.
@@ -101,6 +107,7 @@ The first queue entry is always the current image.
 - **Advance now** moves to the next entry.
 - **Remove** deletes that managed copy. Removing the current entry promotes the next one.
 - **Upload photos** accepts any enabled raster format and adds independent source/derived copies to the queue.
+- **Add a dedicated text message** creates a normal, reorderable queue entry. Use each photo card's **Add text** or **Edit text** section for overlays; **Remove text** restores the photo-only composition without modifying its retained source.
 - **Save order** applies the complete current-first order shown in the text box. Move whole lines and do not alter their opaque IDs.
 - **Non-advancing preview** opens an in-page comparison: the undithered original is always shown, and a server-dithered entry also shows its exact six-color result. Each side links to the retained full source or stored frame derivative.
 
@@ -250,7 +257,7 @@ queue/
 
 Do not manually edit, reorder, or remove these files while the server is running. Use the control page. To preserve queue order and supplier history, stop the server and back up the whole queue directory together.
 
-The queue descriptor and settings are atomically replaced. Queue objects use opaque names and immutable metadata. Thumbnails are bounded, derived cache files; missing thumbnails are regenerated on demand. Startup reconciles safe temporary/orphan files and refuses to serve a descriptor that points to a missing, unsafe, or corrupt object.
+The queue descriptor and settings are atomically replaced. Queue objects use opaque names and immutable metadata. Text recipes are stored in the descriptor; a dedicated message also owns a minimal immutable canvas source so the same transactional source/derivative machinery applies. Thumbnails are bounded, derived cache files; missing thumbnails are regenerated from the immutable source or, for text-bearing entries, the already-dithered derivative. Startup reconciles safe temporary/orphan files and refuses to serve a descriptor that points to a missing, unsafe, or corrupt object.
 
 Use three separate storage locations:
 
@@ -335,6 +342,9 @@ Most users only need `/settings` and the stable `/frame/current.jpg` endpoint. T
 | `POST` | `/queue/reorder` | Save complete current-first order |
 | `POST` | `/queue/remove` | Remove any queue entry |
 | `POST` | `/queue/upload` | Decode/render and append uploaded images |
+| `POST` | `/queue/message` | Create and render a dedicated text queue item |
+| `POST` | `/queue/text` | Add or edit a queue entry's text recipe and stored derivative |
+| `POST` | `/queue/text/remove` | Remove a photo's text recipe and rebuild it from its retained source |
 | `POST` | `/queue/orientation` | Override and rerender one entry's orientation |
 | `POST` | `/queue/advance` | Advance when a successor exists |
 | `POST` | `/supplier/refresh` | Scan/refill now |

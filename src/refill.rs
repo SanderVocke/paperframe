@@ -101,6 +101,8 @@ pub async fn refill_once(state: &AppState) -> Result<usize> {
                         source_height: decoded.pixels.height(),
                         orientation: decoded.orientation,
                         frame_target: rendering.target,
+                        text_overlay: None,
+                        dedicated_text: false,
                         supplier_id: Some(supplier_id.clone()),
                         source_key: Some(candidate.source_key),
                     })

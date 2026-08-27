@@ -5,6 +5,7 @@ edition = "2024"
 publish = false
 
 [dependencies]
+ab_glyph = "0.2"
 anyhow = "1.0"
 askama = "0.14"
 axum = { version = "0.8", features = ["multipart"] }
