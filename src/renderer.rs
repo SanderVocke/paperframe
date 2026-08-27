@@ -21,6 +21,10 @@ pub const MAX_ENCODED_BYTES: u64 = 100 * 1024 * 1024;
 pub const MAX_SOURCE_DIMENSION: u32 = 20_000;
 pub const MAX_DECODED_BYTES: u64 = 256 * 1024 * 1024;
 pub const JPEG_QUALITY: u8 = 90;
+pub const THUMBNAIL_MAX_DIMENSION: u32 = 960;
+pub const PREVIEW_MAX_DIMENSION: u32 = 1600;
+const THUMBNAIL_JPEG_QUALITY: u8 = 80;
+const PREVIEW_JPEG_QUALITY: u8 = 85;
 
 pub const DEVICE_PALETTE: [(u8, Rgb); 6] = [
     (0, Rgb::new(0, 0, 0)),
@@ -378,8 +382,36 @@ pub fn validate_bmp4(bytes: &[u8], target: FrameTarget) -> Result<()> {
 }
 
 pub fn encode_jpeg(image: &RgbaImage) -> Result<Vec<u8>> {
+    encode_jpeg_quality(image, JPEG_QUALITY)
+}
+
+pub fn thumbnail_jpeg(source: &DecodedImage) -> Result<Vec<u8>> {
+    resized_jpeg(
+        &source.pixels,
+        THUMBNAIL_MAX_DIMENSION,
+        THUMBNAIL_JPEG_QUALITY,
+    )
+}
+
+pub fn preview_jpeg(source: &DecodedImage) -> Result<Vec<u8>> {
+    resized_jpeg(&source.pixels, PREVIEW_MAX_DIMENSION, PREVIEW_JPEG_QUALITY)
+}
+
+fn resized_jpeg(image: &RgbaImage, maximum_dimension: u32, quality: u8) -> Result<Vec<u8>> {
+    let longest = image.width().max(image.height());
+    if longest <= maximum_dimension {
+        return encode_jpeg_quality(image, quality);
+    }
+    let scale = maximum_dimension as f64 / longest as f64;
+    let width = ((image.width() as f64 * scale).round() as u32).max(1);
+    let height = ((image.height() as f64 * scale).round() as u32).max(1);
+    let resized = imageops::resize(image, width, height, imageops::FilterType::Lanczos3);
+    encode_jpeg_quality(&resized, quality)
+}
+
+fn encode_jpeg_quality(image: &RgbaImage, quality: u8) -> Result<Vec<u8>> {
     let mut output = Vec::new();
-    JpegEncoder::new_with_quality(&mut output, JPEG_QUALITY)
+    JpegEncoder::new_with_quality(&mut output, quality)
         .encode_image(&DynamicImage::ImageRgba8(image.clone()))
         .context("failed to encode JPEG")?;
     Ok(output)
@@ -667,6 +699,27 @@ mod tests {
             .unwrap()
             .into_rgb8();
         assert_eq!(bmp_pixels, preview_pixels);
+    }
+
+    #[test]
+    fn thumbnail_and_preview_jpegs_are_bounded_without_upscaling() {
+        let large = DecodedImage {
+            pixels: source(2000, 1000),
+            format: ImageFormat::Png,
+            orientation: ImageOrientation::Landscape,
+        };
+        let thumbnail = image::load_from_memory(&thumbnail_jpeg(&large).unwrap()).unwrap();
+        let preview = image::load_from_memory(&preview_jpeg(&large).unwrap()).unwrap();
+        assert_eq!((thumbnail.width(), thumbnail.height()), (960, 480));
+        assert_eq!((preview.width(), preview.height()), (1600, 800));
+
+        let small = DecodedImage {
+            pixels: source(40, 20),
+            format: ImageFormat::Png,
+            orientation: ImageOrientation::Landscape,
+        };
+        let thumbnail = image::load_from_memory(&thumbnail_jpeg(&small).unwrap()).unwrap();
+        assert_eq!((thumbnail.width(), thumbnail.height()), (40, 20));
     }
 
     #[test]

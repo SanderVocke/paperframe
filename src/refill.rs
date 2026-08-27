@@ -71,6 +71,13 @@ pub async fn refill_once(state: &AppState) -> Result<usize> {
                             return None;
                         }
                     };
+                    let thumbnail = match crate::renderer::thumbnail_jpeg(&decoded) {
+                        Ok(thumbnail) => thumbnail,
+                        Err(error) => {
+                            tracing::warn!(image = %candidate.display_name, %error, "supplier image thumbnail could not be generated");
+                            return None;
+                        }
+                    };
                     let rendered = match crate::renderer::render_with_original(
                         &decoded,
                         &candidate.bytes,
@@ -88,6 +95,7 @@ pub async fn refill_once(state: &AppState) -> Result<usize> {
                         display_name: candidate.display_name,
                         source_bytes: candidate.bytes,
                         derivative_bytes: rendered.bytes,
+                        thumbnail_bytes: thumbnail,
                         media_type: rendered.media_type.into(),
                         source_width: decoded.pixels.width(),
                         source_height: decoded.pixels.height(),

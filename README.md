@@ -244,11 +244,13 @@ queue/
   objects/
     <opaque-id>.source
     <opaque-id>.<bmp-or-jpg>
+  thumbnails/
+    <opaque-id>.jpg
 ```
 
 Do not manually edit, reorder, or remove these files while the server is running. Use the control page. To preserve queue order and supplier history, stop the server and back up the whole queue directory together.
 
-The queue descriptor and settings are atomically replaced. Queue objects use opaque names and immutable metadata. Startup reconciles safe temporary/orphan files and refuses to serve a descriptor that points to a missing, unsafe, or corrupt object.
+The queue descriptor and settings are atomically replaced. Queue objects use opaque names and immutable metadata. Thumbnails are bounded, derived cache files; missing thumbnails are regenerated on demand. Startup reconciles safe temporary/orphan files and refuses to serve a descriptor that points to a missing, unsafe, or corrupt object.
 
 Use three separate storage locations:
 

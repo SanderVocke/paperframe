@@ -743,6 +743,7 @@ async fn upload_queue(State(state): State<Arc<AppState>>, mut multipart: Multipa
             .into_iter()
             .map(|(display_name, bytes)| {
                 let decoded = crate::renderer::decode_source_named(&bytes, Some(&display_name))?;
+                let thumbnail = crate::renderer::thumbnail_jpeg(&decoded)?;
                 let rendered = crate::renderer::render_with_original(
                     &decoded,
                     &bytes,
@@ -754,6 +755,7 @@ async fn upload_queue(State(state): State<Arc<AppState>>, mut multipart: Multipa
                     display_name,
                     source_bytes: bytes,
                     derivative_bytes: rendered.bytes,
+                    thumbnail_bytes: thumbnail,
                     media_type: rendered.media_type.into(),
                     source_width: decoded.pixels.width(),
                     source_height: decoded.pixels.height(),
@@ -794,7 +796,51 @@ async fn queue_thumbnail(
     State(state): State<Arc<AppState>>,
     AxumPath(id): AxumPath<String>,
 ) -> Response {
-    original_preview_response(&state, state.queue.prepare_source(&id).await).await
+    match state.queue.prepare_thumbnail(&id).await {
+        Ok(Some(thumbnail)) => return thumbnail_response(thumbnail),
+        Ok(None) => {}
+        Err(error) => return plain(StatusCode::NOT_FOUND, &error.to_string()),
+    }
+    let _render_permit = match state.render_serialization.clone().acquire_owned().await {
+        Ok(permit) => permit,
+        Err(error) => return plain(StatusCode::SERVICE_UNAVAILABLE, &error.to_string()),
+    };
+    // Another request may have populated the cache while this one waited for the permit.
+    match state.queue.prepare_thumbnail(&id).await {
+        Ok(Some(thumbnail)) => return thumbnail_response(thumbnail),
+        Ok(None) => {}
+        Err(error) => return plain(StatusCode::NOT_FOUND, &error.to_string()),
+    }
+    let source = match state.queue.prepare_source(&id).await {
+        Ok(source) => source,
+        Err(error) => return plain(StatusCode::NOT_FOUND, &error.to_string()),
+    };
+    let rendered = tokio::task::spawn_blocking(move || -> anyhow::Result<Vec<u8>> {
+        let decoded =
+            crate::renderer::decode_source_named(&source.bytes, Some(&source.entry.display_name))?;
+        crate::renderer::thumbnail_jpeg(&decoded)
+    })
+    .await;
+    let bytes = match rendered {
+        Ok(Ok(bytes)) => bytes,
+        Ok(Err(error)) => return plain(StatusCode::UNPROCESSABLE_ENTITY, &error.to_string()),
+        Err(error) => return plain(StatusCode::INTERNAL_SERVER_ERROR, &error.to_string()),
+    };
+    match state.queue.store_thumbnail(&id, bytes).await {
+        Ok(thumbnail) => thumbnail_response(thumbnail),
+        Err(error) => plain(StatusCode::INTERNAL_SERVER_ERROR, &error.to_string()),
+    }
+}
+fn thumbnail_response(thumbnail: crate::queue::PreparedThumbnail) -> Response {
+    let modified = httpdate::fmt_http_date(thumbnail.modified);
+    image_response(
+        StatusCode::OK,
+        Body::from(thumbnail.bytes.clone()),
+        thumbnail.bytes.len(),
+        "image/jpeg",
+        Some(&modified),
+        Some("private, max-age=31536000, immutable"),
+    )
 }
 async fn queue_preview(
     State(state): State<Arc<AppState>>,
@@ -877,7 +923,7 @@ async fn original_preview_response(
     let rendered = tokio::task::spawn_blocking(move || -> anyhow::Result<Vec<u8>> {
         let decoded =
             crate::renderer::decode_source_named(&source.bytes, Some(&source.entry.display_name))?;
-        crate::renderer::encode_jpeg(&decoded.pixels)
+        crate::renderer::preview_jpeg(&decoded)
     })
     .await;
     match rendered {
@@ -887,7 +933,7 @@ async fn original_preview_response(
             bytes.len(),
             "image/jpeg",
             None,
-            Some("private, no-store"),
+            Some("private, max-age=31536000, immutable"),
         ),
         Ok(Err(error)) => plain(StatusCode::UNPROCESSABLE_ENTITY, &error.to_string()),
         Err(error) => plain(StatusCode::INTERNAL_SERVER_ERROR, &error.to_string()),
@@ -2005,6 +2051,25 @@ mod tests {
         let (directory, state) = manual_state(AdvancementSettings::Manual).await;
         let app = router(state.clone());
         let before = state.queue.snapshot().await;
+        let thumbnail_path = directory
+            .path()
+            .join("queue")
+            .join("thumbnails")
+            .join(format!("{}.jpg", before.entries[0].id));
+        assert!(
+            thumbnail_path.is_file(),
+            "refill should eagerly cache thumbnails"
+        );
+        fs::remove_file(&thumbnail_path).unwrap();
+        assert!(
+            state
+                .queue
+                .prepare_thumbnail(&before.entries[0].id)
+                .await
+                .unwrap()
+                .is_none(),
+            "an existing queue without a cached thumbnail should remain usable"
+        );
         let thumbnail = app
             .clone()
             .oneshot(
@@ -2014,7 +2079,28 @@ mod tests {
             )
             .await
             .unwrap();
-        assert_eq!(bytes(thumbnail).await, A);
+        assert_eq!(thumbnail.headers()[header::CONTENT_TYPE], "image/jpeg");
+        assert_eq!(
+            thumbnail.headers()[header::CACHE_CONTROL],
+            "private, max-age=31536000, immutable"
+        );
+        let thumbnail_bytes = bytes(thumbnail).await;
+        let decoded_thumbnail = image::load_from_memory(&thumbnail_bytes).unwrap();
+        assert!(
+            decoded_thumbnail.width() <= crate::renderer::THUMBNAIL_MAX_DIMENSION
+                && decoded_thumbnail.height() <= crate::renderer::THUMBNAIL_MAX_DIMENSION
+        );
+        assert_eq!(
+            state
+                .queue
+                .prepare_thumbnail(&before.entries[0].id)
+                .await
+                .unwrap()
+                .unwrap()
+                .bytes,
+            thumbnail_bytes,
+            "a lazily generated thumbnail should be persisted"
+        );
         let original = app
             .clone()
             .oneshot(

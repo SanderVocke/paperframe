@@ -23,6 +23,7 @@ use crate::{
 const STATE_VERSION: u32 = 2;
 const STATE_FILE: &str = "queue-state.toml";
 const OBJECTS_DIR: &str = "objects";
+const THUMBNAILS_DIR: &str = "thumbnails";
 static TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
@@ -101,6 +102,7 @@ pub struct RenderedEnqueueRequest {
     pub display_name: String,
     pub source_bytes: Vec<u8>,
     pub derivative_bytes: Vec<u8>,
+    pub thumbnail_bytes: Vec<u8>,
     pub media_type: String,
     pub source_width: u32,
     pub source_height: u32,
@@ -121,6 +123,12 @@ pub struct PreparedImage {
 pub struct PreparedSource {
     pub entry: QueueEntry,
     pub bytes: Vec<u8>,
+}
+
+#[derive(Clone, Debug)]
+pub struct PreparedThumbnail {
+    pub bytes: Vec<u8>,
+    pub modified: SystemTime,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -152,6 +160,7 @@ struct RerenderTestHook {
 pub struct QueueStore {
     root: PathBuf,
     objects: PathBuf,
+    thumbnails: PathBuf,
     state_path: PathBuf,
     descriptor: RwLock<Descriptor>,
     mutation: Mutex<()>,
@@ -164,7 +173,7 @@ pub struct QueueStore {
 impl QueueStore {
     pub async fn new(path: &Path, migrate_current: bool) -> Result<Arc<Self>> {
         let configured = path.to_path_buf();
-        let (root, objects, descriptor) =
+        let (root, objects, thumbnails, descriptor) =
             tokio::task::spawn_blocking(move || initialize(&configured))
                 .await
                 .context("queue initialization worker stopped")??;
@@ -177,6 +186,7 @@ impl QueueStore {
             state_path: root.join(STATE_FILE),
             root,
             objects,
+            thumbnails,
             descriptor: RwLock::new(descriptor),
             mutation: Mutex::new(()),
             events,
@@ -376,6 +386,7 @@ impl QueueStore {
                 &request.media_type,
                 request.frame_target,
             )?;
+            validate_jpeg(&request.thumbnail_bytes)?;
         }
         let _guard = self.mutation.lock().await;
         let current = self.descriptor.read().await.clone();
@@ -438,17 +449,25 @@ impl QueueStore {
         }
         let root = self.root.clone();
         let objects = self.objects.clone();
+        let thumbnails = self.thumbnails.clone();
         let state_path = self.state_path.clone();
         let disk_entries = entries.clone();
         let payloads = requests
             .into_iter()
-            .map(|request| (request.source_bytes, request.derivative_bytes))
+            .map(|request| {
+                (
+                    request.source_bytes,
+                    request.derivative_bytes,
+                    request.thumbnail_bytes,
+                )
+            })
             .collect();
         let next_for_disk = next.clone();
         tokio::task::spawn_blocking(move || {
             publish_rendered_batch(
                 &root,
                 &objects,
+                &thumbnails,
                 &state_path,
                 &disk_entries,
                 payloads,
@@ -558,11 +577,13 @@ impl QueueStore {
         let source = removed
             .source_object_name
             .map(|name| self.objects.join(name));
+        let thumbnail = self.thumbnails.join(thumbnail_name(&removed.id));
         let _ = tokio::task::spawn_blocking(move || {
             let _ = fs::remove_file(object);
             if let Some(source) = source {
                 let _ = fs::remove_file(source);
             }
+            let _ = fs::remove_file(thumbnail);
         })
         .await;
         self.notify(QueueEventReason::Remove, next.generation);
@@ -626,11 +647,13 @@ impl QueueStore {
             let source = removed
                 .source_object_name
                 .map(|name| self.objects.join(name));
+            let thumbnail = self.thumbnails.join(thumbnail_name(&removed.id));
             let _ = tokio::task::spawn_blocking(move || {
                 let _ = fs::remove_file(object);
                 if let Some(source) = source {
                     let _ = fs::remove_file(source);
                 }
+                let _ = fs::remove_file(thumbnail);
             })
             .await;
         }
@@ -891,14 +914,12 @@ impl QueueStore {
             .clone()
             .unwrap_or_else(|| entry.digest.clone());
         let path = self.objects.join(name);
-        let display_name = entry.display_name.clone();
         let bytes = tokio::task::spawn_blocking(move || -> Result<_> {
             let metadata = fs::symlink_metadata(&path).context("failed to inspect queue source")?;
             if metadata.file_type().is_symlink() || !metadata.is_file() {
                 bail!("queue source is not a regular file");
             }
             let bytes = fs::read(path).context("failed to read queue source")?;
-            crate::renderer::decode_source_named(&bytes, Some(&display_name))?;
             if digest(&bytes) != expected {
                 bail!("queue source digest does not match descriptor");
             }
@@ -907,6 +928,67 @@ impl QueueStore {
         .await
         .context("queue source worker stopped")??;
         Ok(PreparedSource { entry, bytes })
+    }
+
+    pub async fn prepare_thumbnail(&self, id: &str) -> Result<Option<PreparedThumbnail>> {
+        let entry = self
+            .descriptor
+            .read()
+            .await
+            .entries
+            .iter()
+            .find(|entry| entry.id == id)
+            .cloned()
+            .context("queue entry not found")?;
+        let path = self.thumbnails.join(thumbnail_name(&entry.id));
+        tokio::task::spawn_blocking(move || -> Result<Option<PreparedThumbnail>> {
+            let metadata = match fs::symlink_metadata(&path) {
+                Ok(metadata) => metadata,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+                Err(error) => return Err(error).context("failed to inspect queue thumbnail"),
+            };
+            if metadata.file_type().is_symlink() || !metadata.is_file() {
+                bail!("queue thumbnail is not a regular file");
+            }
+            let bytes = fs::read(&path).context("failed to read queue thumbnail")?;
+            if validate_jpeg(&bytes).is_err() {
+                let _ = fs::remove_file(path);
+                return Ok(None);
+            }
+            Ok(Some(PreparedThumbnail {
+                bytes,
+                modified: metadata
+                    .modified()
+                    .context("queue thumbnail has no modification time")?,
+            }))
+        })
+        .await
+        .context("queue thumbnail worker stopped")?
+    }
+
+    pub async fn store_thumbnail(&self, id: &str, bytes: Vec<u8>) -> Result<PreparedThumbnail> {
+        validate_jpeg(&bytes)?;
+        let _guard = self.mutation.lock().await;
+        let entry = self
+            .descriptor
+            .read()
+            .await
+            .entries
+            .iter()
+            .find(|entry| entry.id == id)
+            .cloned()
+            .context("queue entry not found")?;
+        let directory = self.thumbnails.clone();
+        let path = directory.join(thumbnail_name(&entry.id));
+        tokio::task::spawn_blocking(move || -> Result<PreparedThumbnail> {
+            write_cached_thumbnail(&directory, &path, &bytes)?;
+            let modified = fs::metadata(&path)?
+                .modified()
+                .context("queue thumbnail has no modification time")?;
+            Ok(PreparedThumbnail { bytes, modified })
+        })
+        .await
+        .context("queue thumbnail publication worker stopped")?
     }
 
     async fn commit_descriptor(&self, next: Descriptor) -> Result<()> {
@@ -932,12 +1014,14 @@ impl QueueStore {
     }
 }
 
-fn initialize(configured: &Path) -> Result<(PathBuf, PathBuf, Descriptor)> {
+fn initialize(configured: &Path) -> Result<(PathBuf, PathBuf, PathBuf, Descriptor)> {
     fs::create_dir_all(configured)
         .with_context(|| format!("failed to create queue root {}", configured.display()))?;
     let root = fs::canonicalize(configured).context("failed to canonicalize queue root")?;
     let objects = root.join(OBJECTS_DIR);
     fs::create_dir_all(&objects).context("failed to create queue objects directory")?;
+    let thumbnails = root.join(THUMBNAILS_DIR);
+    fs::create_dir_all(&thumbnails).context("failed to create queue thumbnails directory")?;
     for entry in fs::read_dir(&root).context("failed to inspect queue root")? {
         let entry = entry?;
         let name = entry.file_name();
@@ -1006,7 +1090,24 @@ fn initialize(configured: &Path) -> Result<(PathBuf, PathBuf, Descriptor)> {
             fs::remove_file(entry.path()).context("failed to remove orphan queue object")?;
         }
     }
-    Ok((root, objects, descriptor))
+    let expected_thumbnails = descriptor
+        .entries
+        .iter()
+        .map(|entry| thumbnail_name(&entry.id))
+        .collect::<HashSet<_>>();
+    for entry in fs::read_dir(&thumbnails).context("failed to inspect queue thumbnails")? {
+        let entry = entry?;
+        let name = entry.file_name().to_string_lossy().to_string();
+        let metadata = fs::symlink_metadata(entry.path())?;
+        if metadata.file_type().is_symlink()
+            || !metadata.is_file()
+            || name.starts_with(".thumbnail.") && name.ends_with(".tmp")
+            || !expected_thumbnails.contains(&name)
+        {
+            fs::remove_file(entry.path()).context("failed to remove orphan queue thumbnail")?;
+        }
+    }
+    Ok((root, objects, thumbnails, descriptor))
 }
 
 fn validate_object_name(name: &str) -> Result<()> {
@@ -1105,15 +1206,16 @@ fn publish_enqueue_batch(
 fn publish_rendered_batch(
     root: &Path,
     objects: &Path,
+    thumbnails: &Path,
     state_path: &Path,
     entries: &[QueueEntry],
-    payloads: Vec<(Vec<u8>, Vec<u8>)>,
+    payloads: Vec<(Vec<u8>, Vec<u8>, Vec<u8>)>,
     descriptor: &Descriptor,
 ) -> Result<()> {
     let mut temporaries = Vec::new();
     let mut published = Vec::new();
     let result = (|| -> Result<()> {
-        for (entry, (source, derivative)) in entries.iter().zip(payloads) {
+        for (entry, (source, derivative, thumbnail)) in entries.iter().zip(payloads) {
             let source_name = entry
                 .source_object_name
                 .as_ref()
@@ -1121,6 +1223,11 @@ fn publish_rendered_batch(
             for (suffix, destination, bytes) in [
                 ("source", objects.join(source_name), source),
                 ("derivative", objects.join(&entry.object_name), derivative),
+                (
+                    "thumbnail",
+                    thumbnails.join(thumbnail_name(&entry.id)),
+                    thumbnail,
+                ),
             ] {
                 let temporary = objects.join(format!(
                     ".object.{}.{}.{}.tmp",
@@ -1146,6 +1253,7 @@ fn publish_rendered_batch(
             published.push(destination.clone());
         }
         sync_directory(objects)?;
+        sync_directory(thumbnails)?;
         persist_descriptor(state_path, descriptor)?;
         let _ = sync_directory(root);
         Ok(())
@@ -1158,6 +1266,7 @@ fn publish_rendered_batch(
             let _ = fs::remove_file(destination);
         }
         let _ = sync_directory(objects);
+        let _ = sync_directory(thumbnails);
     }
     result
 }
@@ -1256,6 +1365,37 @@ fn replace_derivative(
             let _ = fs::rename(&backup, &old_path);
         }
         let _ = sync_directory(objects);
+    }
+    result
+}
+
+fn thumbnail_name(id: &str) -> String {
+    format!("{id}.jpg")
+}
+
+fn write_cached_thumbnail(directory: &Path, destination: &Path, bytes: &[u8]) -> Result<()> {
+    if destination.exists() {
+        return Ok(());
+    }
+    let temporary = directory.join(format!(
+        ".thumbnail.{}.{}.tmp",
+        std::process::id(),
+        TEMP_COUNTER.fetch_add(1, Ordering::Relaxed)
+    ));
+    let result = (|| -> Result<()> {
+        let mut file = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&temporary)
+            .context("failed to create queue thumbnail temporary")?;
+        file.write_all(bytes)
+            .context("failed to write queue thumbnail")?;
+        file.sync_all().context("failed to sync queue thumbnail")?;
+        fs::rename(&temporary, destination).context("failed to publish queue thumbnail")?;
+        sync_directory(directory)
+    })();
+    if result.is_err() {
+        let _ = fs::remove_file(temporary);
     }
     result
 }
@@ -1363,6 +1503,7 @@ mod tests {
             display_name: display_name.into(),
             source_bytes: bytes.to_vec(),
             derivative_bytes: rendered.bytes,
+            thumbnail_bytes: crate::renderer::thumbnail_jpeg(&decoded).unwrap(),
             media_type: rendered.media_type.into(),
             source_width: decoded.pixels.width(),
             source_height: decoded.pixels.height(),
@@ -1422,6 +1563,35 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn rendered_enqueue_persists_and_removal_cleans_thumbnail() {
+        let dir = tempdir().unwrap();
+        let queue = QueueStore::new(dir.path(), false).await.unwrap();
+        let entry = queue
+            .enqueue_rendered_batch(None, None, vec![rendered_request("a.jpg", A)])
+            .await
+            .unwrap()
+            .remove(0);
+        let expected =
+            crate::renderer::thumbnail_jpeg(&crate::renderer::decode_source(A).unwrap()).unwrap();
+        assert_eq!(
+            queue
+                .prepare_thumbnail(&entry.id)
+                .await
+                .unwrap()
+                .unwrap()
+                .bytes,
+            expected
+        );
+        let path = queue.thumbnails.join(thumbnail_name(&entry.id));
+        assert!(path.is_file());
+        queue
+            .remove(queue.snapshot().await.generation, &entry.id)
+            .await
+            .unwrap();
+        assert!(!path.exists());
+    }
+
+    #[tokio::test]
     async fn rendered_enqueue_preserves_source_serves_bmp_and_rerenders_orientation() {
         let dir = tempdir().unwrap();
         let queue = QueueStore::new(dir.path(), false).await.unwrap();
@@ -1441,6 +1611,7 @@ mod tests {
                     display_name: "a.jpg".into(),
                     source_bytes: A.to_vec(),
                     derivative_bytes: rendered.bytes,
+                    thumbnail_bytes: crate::renderer::thumbnail_jpeg(&decoded).unwrap(),
                     media_type: rendered.media_type.into(),
                     source_width: decoded.pixels.width(),
                     source_height: decoded.pixels.height(),
@@ -1856,6 +2027,7 @@ mod tests {
                     display_name: "a.jpg".into(),
                     source_bytes: A.to_vec(),
                     derivative_bytes: rendered.bytes,
+                    thumbnail_bytes: crate::renderer::thumbnail_jpeg(&decoded).unwrap(),
                     media_type: rendered.media_type.into(),
                     source_width: decoded.pixels.width(),
                     source_height: decoded.pixels.height(),
@@ -1897,8 +2069,10 @@ mod tests {
             .unwrap();
         assert!(queue.reorder(1, vec![a.id]).await.is_err());
         fs::write(dir.path().join(OBJECTS_DIR).join("orphan.jpg"), A).unwrap();
+        fs::write(dir.path().join(THUMBNAILS_DIR).join("orphan.jpg"), A).unwrap();
         drop(queue);
         QueueStore::new(dir.path(), false).await.unwrap();
         assert!(!dir.path().join(OBJECTS_DIR).join("orphan.jpg").exists());
+        assert!(!dir.path().join(THUMBNAILS_DIR).join("orphan.jpg").exists());
     }
 }
