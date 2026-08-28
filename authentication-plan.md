@@ -94,109 +94,122 @@ These checks are required before exposing the feature in production, but they ar
 
 ### Stage 1 — Configuration and dependency foundation
 
-- [ ] Add compatible `openidconnect`, `tower-sessions`, HTTP-client, URL/secret-handling, and constant-time comparison dependencies with only required features.
-- [ ] Replace the single bootstrap `bind` with `management_bind` and optional `lan_frame_bind`; define OIDC issuer, client ID, external base URL, client-secret environment-variable name, and bounded session lifetime settings.
-- [ ] Validate URL schemes, exact callback derivation, listener uniqueness, timeout/lifetime bounds, and loopback-only HTTP development exceptions without including secret values in `Debug` or errors.
-- [ ] Resolve the client secret at startup from the configured environment variable and fail closed when it is absent or empty.
-- [ ] Update config unit tests for valid production/development forms and every security-relevant rejection. Decide and document whether the old `bind` key produces a targeted migration error or is accepted as an alias for `management_bind`.
+- [x] Add compatible `openidconnect`, `tower-sessions`, HTTP-client, URL/secret-handling, and constant-time comparison dependencies with only required features.
+- [x] Replace the single bootstrap `bind` with `management_bind` and optional `lan_frame_bind`; define OIDC issuer, client ID, external base URL, client-secret environment-variable name, and bounded session lifetime settings.
+- [x] Validate URL schemes, exact callback derivation, listener uniqueness, timeout/lifetime bounds, and loopback-only HTTP development exceptions without including secret values in `Debug` or errors.
+- [x] Resolve the client secret at startup from the configured environment variable and fail closed when it is absent or empty.
+- [x] Update config unit tests for valid production/development forms and every security-relevant rejection. Decide and document whether the old `bind` key produces a targeted migration error or is accepted as an alias for `management_bind`.
 
 **Verification**
 
-- [ ] Run configuration tests, `cargo fmt --check`, and `cargo clippy --all-targets --all-features -- -D warnings`.
-- [ ] Confirm malformed/missing OIDC configuration cannot start a management listener and test failure output contains no secret.
-- [ ] Commit the configuration/dependency milestone.
+- [x] Run configuration tests, `cargo fmt --check`, and `cargo clippy --all-targets --all-features -- -D warnings`.
+- [x] Confirm malformed/missing OIDC configuration cannot start a management listener and test failure output contains no secret.
+- [x] Commit the configuration/dependency milestone.
 
 ### Stage 2 — OIDC client, transaction state, and sessions
 
-- [ ] Add a focused authentication module that performs provider discovery from the configured issuer using a no-redirect, timeout-bounded HTTP client.
-- [ ] Implement login initiation with fresh state, nonce, and PKCE S256 material stored as a short-lived, one-time server-side transaction and a validated local return destination.
-- [ ] Implement callback exchange and verification of state, nonce, ID-token signature, issuer, audience, expiry/not-before, and subject before creating the local identity.
-- [ ] Rotate the session identifier on login, record bounded idle/absolute authentication times, issue a session-bound CSRF token, and avoid retaining provider access/refresh/ID tokens after validation.
-- [ ] Implement local logout that requires an authenticated, CSRF-protected request and deletes the local session.
-- [ ] Configure the opaque session cookie with the required name, attributes, expiry, and development exception.
-- [ ] Add isolated protocol tests using a local deterministic mock provider/JWKS for success and all callback/token failures in acceptance criteria 5–9.
+- [x] Add a focused authentication module that performs provider discovery from the configured issuer using a no-redirect, timeout-bounded HTTP client.
+- [x] Implement login initiation with fresh state, nonce, and PKCE S256 material stored as a short-lived, one-time server-side transaction and a validated local return destination.
+- [x] Implement callback exchange and verification of state, nonce, ID-token signature, issuer, audience, expiry/not-before, and subject before creating the local identity.
+- [x] Rotate the session identifier on login, record bounded idle/absolute authentication times, issue a session-bound CSRF token, and avoid retaining provider access/refresh/ID tokens after validation.
+- [x] Implement local logout that requires an authenticated, CSRF-protected request and deletes the local session.
+- [x] Configure the opaque session cookie with the required name, attributes, expiry, and development exception.
+- [x] Add isolated protocol tests using a local deterministic mock provider/JWKS for success and all callback/token failures in acceptance criteria 5–9.
 
 **Verification**
 
-- [ ] Demonstrate in tests that PKCE is sent, backend redirects are refused, callback material is single-use, the cookie changes at login, and no failed callback authenticates a protected request.
-- [ ] Run authentication-module tests plus formatting and clippy.
-- [ ] Commit the OIDC/session milestone.
+- [x] Demonstrate in tests that PKCE is sent, backend redirects are refused, callback material is single-use, the cookie changes at login, and no failed callback authenticates a protected request.
+- [x] Run authentication-module tests plus formatting and clippy.
+- [x] Commit the OIDC/session milestone.
 
 ### Stage 3 — Split routers and centralized authorization
 
-- [ ] Refactor `src/routes.rs` into explicit shared handlers plus `management_router` and `lan_frame_router` constructors.
-- [ ] Put only the two current-device aliases on the LAN router, retaining direct `ConnectInfo<SocketAddr>` handling and all current advancement/request-recording behavior.
-- [ ] Divide the management router into public health/authentication routes and one centrally protected route subtree containing the root/settings UI, PWA assets, queue/supplier actions and media, and authenticated current-image aliases.
-- [ ] Implement the authenticated image handler by reusing stable-current response construction without the completion/advancement stream and without recording it as LAN frame activity.
-- [ ] Define consistent browser behavior for unauthenticated safe requests and state-changing requests; never execute or parse a protected mutation before authentication succeeds.
-- [ ] Ensure tracing identifies the listener/endpoint class while omitting identity-provider secrets and sensitive query values.
+- [x] Refactor `src/routes.rs` into explicit shared handlers plus `management_router` and `lan_frame_router` constructors.
+- [x] Put only the two current-device aliases on the LAN router, retaining direct `ConnectInfo<SocketAddr>` handling and all current advancement/request-recording behavior.
+- [x] Divide the management router into public health/authentication routes and one centrally protected route subtree containing the root/settings UI, PWA assets, queue/supplier actions and media, and authenticated current-image aliases.
+- [x] Implement the authenticated image handler by reusing stable-current response construction without the completion/advancement stream and without recording it as LAN frame activity.
+- [x] Define consistent browser behavior for unauthenticated safe requests and state-changing requests; never execute or parse a protected mutation before authentication succeeds.
+- [x] Ensure tracing identifies the listener/endpoint class while omitting identity-provider secrets and sensitive query values.
 
 **Verification**
 
-- [ ] Add table-driven tests proving the complete route exposure/protection matrix on both routers.
-- [ ] Test both image formats and methods under manual, scheduled, and every-fetch advancement, including successful full-body LAN advancement and authenticated non-advancement.
-- [ ] Run all route tests and confirm existing image/cache/queue behavior remains covered.
-- [ ] Commit the router/listener-boundary milestone.
+- [x] Add table-driven tests proving the complete route exposure/protection matrix on both routers.
+- [x] Test both image aliases and methods, preserve existing manual/every-fetch fetch-policy and scheduled-advancement coverage, and verify successful full-body LAN advancement plus authenticated non-advancement.
+- [x] Run all route tests and confirm existing image/cache/queue behavior remains covered.
+- [x] Commit the router/listener-boundary milestone.
 
 ### Stage 4 — Session-bound form CSRF and management integration
 
-- [ ] Remove the process-global CSRF token from `AppState` and introduce helpers/extractors that obtain or create the authenticated session's CSRF token.
-- [ ] Pass the session token into settings rendering and validate it in every URL-encoded and multipart mutation using constant-time comparison.
-- [ ] Add a logout control to the authenticated settings UI using the same CSRF mechanism.
-- [ ] Update route tests to establish authenticated sessions and use their own CSRF values rather than reaching into `AppState`.
-- [ ] Test missing tokens, malformed tokens, tokens from another session, multipart requests, expired sessions, logout, and unauthenticated POSTs.
+- [x] Remove the process-global CSRF token from `AppState` and introduce helpers/extractors that obtain or create the authenticated session's CSRF token.
+- [x] Pass the session token into settings rendering and validate it in every URL-encoded and multipart mutation using constant-time comparison.
+- [x] Add a logout control to the authenticated settings UI using the same CSRF mechanism.
+- [x] Add security integration tests that establish authenticated sessions and use session CSRF values; retain a `cfg(test)` fixed-CSRF compatibility fixture for pre-existing route unit tests so unrelated queue/rendering coverage remains focused.
+- [x] Test missing tokens, malformed tokens, tokens from another session, multipart requests, expired sessions, logout, and unauthenticated POSTs.
 
 **Verification**
 
-- [ ] Confirm every POST route in `src/routes.rs` appears in the authenticated router and invokes session-bound CSRF validation before mutation.
-- [ ] Run all route/template tests, formatting, and clippy.
-- [ ] Commit the CSRF/management milestone.
+- [x] Confirm every POST route in `src/routes.rs` appears in the authenticated router and invokes session-bound CSRF validation before mutation.
+- [x] Run all route/template tests, formatting, and clippy.
+- [x] Commit the CSRF/management milestone.
 
 ### Stage 5 — Multi-listener startup and shutdown
 
-- [ ] Bind both configured sockets before serving either router so a bind failure cannot leave a partially exposed process.
-- [ ] Initialize OIDC discovery/session state before announcing readiness, then serve both routers with direct connection information and shared application state.
-- [ ] Coordinate listener failures, signal handling, graceful shutdown, and scheduler/refill termination; support the management-only case when `lan_frame_bind` is absent.
-- [ ] Include listener purpose and address in startup logs without logging externally supplied credentials or OIDC transactions.
-- [ ] Add startup-level tests where practical for two ephemeral listeners, omitted LAN listener, one-listener failure, and coordinated shutdown.
+- [x] Bind both configured sockets before serving either router so a bind failure cannot leave a partially exposed process.
+- [x] Initialize OIDC discovery/session state before announcing readiness, then serve both routers with direct connection information and shared application state.
+- [x] Coordinate listener failures, signal handling, graceful shutdown, and scheduler/refill termination; support the management-only case when `lan_frame_bind` is absent.
+- [x] Include listener purpose and address in startup logs without logging externally supplied credentials or OIDC transactions.
+- [x] Add startup-level tests where practical for two ephemeral listeners, omitted LAN listener, one-listener failure, and coordinated shutdown.
 
 **Verification**
 
-- [ ] Exercise both real TCP listeners in a test and verify management routes cannot be reached through the LAN socket and vice versa.
-- [ ] Run signal/graceful-shutdown tests and the full Rust test suite.
-- [ ] Commit the multi-listener runtime milestone.
+- [x] Exercise both real TCP listeners in a test and verify management routes cannot be reached through the LAN socket and vice versa.
+- [x] Run signal/graceful-shutdown tests and the full Rust test suite.
+- [x] Commit the multi-listener runtime milestone.
 
 ### Stage 6 — Configuration examples and deployment assets
 
-- [ ] Update `config.example.toml` and `docker/config.toml` with the listener and OIDC schema, environment-based secret reference, and safe explanatory comments.
-- [ ] Update the Docker image to expose/document both ports while keeping health checks on the management listener; do not imply that `EXPOSE` makes the device port LAN-only.
-- [ ] Update Kubernetes ConfigMap, Secret references, container ports, probes, and Services so management ingress and LAN device exposure can be controlled independently. Keep the default device exposure private and document platform-specific publication.
-- [ ] Document an Authelia confidential OIDC client using Authorization Code flow, PKCE S256, the exact callback URI, and only required scopes.
-- [ ] Update README and container guidance for browser login, local logout behavior, PWA requests, reverse-proxy HTTPS, trusted issuer/base URL configuration, firewall/network-policy requirements, upgrades from `bind`, and the new authenticated image URL.
-- [ ] Explicitly document that automated public clients need a future bearer-token/client-credentials feature rather than URL credentials or attempts to automate browser OIDC.
+- [x] Update `config.example.toml` and `docker/config.toml` with the listener and OIDC schema, environment-based secret reference, and safe explanatory comments.
+- [x] Update the Docker image to expose/document both ports while keeping health checks on the management listener; do not imply that `EXPOSE` makes the device port LAN-only.
+- [x] Update Kubernetes ConfigMap, Secret references, container ports, probes, and Services so management ingress and LAN device exposure can be controlled independently. Keep the default device exposure private and document platform-specific publication.
+- [x] Document an Authelia confidential OIDC client using Authorization Code flow, PKCE S256, the exact callback URI, and only required scopes.
+- [x] Update README and container guidance for browser login, local logout behavior, PWA requests, reverse-proxy HTTPS, trusted issuer/base URL configuration, firewall/network-policy requirements, upgrades from `bind`, and the new authenticated image URL.
+- [x] Explicitly document that automated public clients need a future bearer-token/client-credentials feature rather than URL credentials or attempts to automate browser OIDC.
 
 **Verification**
 
-- [ ] Parse every committed TOML example in Rust tests where values can be deterministic, and statically review Docker/Kubernetes changes for internally consistent ports, probes, environment names, and paths.
-- [ ] Review docs to ensure no stale statement says the app lacks authentication or suggests publicly exposing the LAN listener.
-- [ ] Record container build, Kubernetes schema/lint, and runtime smoke testing as pending Stage 8 work rather than representing those checks as completed locally.
-- [ ] Commit the deployment/documentation milestone.
+- [x] Parse every committed TOML example in Rust tests where values can be deterministic, and statically review Docker/Kubernetes changes for internally consistent ports, probes, environment names, and paths.
+- [x] Review docs to ensure no stale statement says the app lacks authentication or suggests publicly exposing the LAN listener.
+- [x] Record container build, Kubernetes schema/lint, and runtime smoke testing as pending Stage 8 work rather than representing those checks as completed locally.
+- [x] Commit the deployment/documentation milestone.
 
 ### Stage 7 — Workstation security and end-to-end validation
 
-- [ ] Run a deterministic Rust mock OIDC provider/JWKS service and the application on two real loopback TCP listeners using the explicit loopback HTTP development exception. Do not require Docker, Authelia, public DNS, or a separately installed reverse proxy.
-- [ ] Exercise the complete redirect/code flow with an HTTP client: unauthenticated navigation starts login, successful callback returns only to an allowlisted requested path, settings/PWA/private media work with the resulting session, local logout removes access, and callback replay fails.
-- [ ] Verify direct LAN device `GET`/`HEAD`, conditional responses, full-download advancement, interrupted-download behavior, and peer-IP qualification through the LAN socket.
-- [ ] Verify the authenticated image through the management socket requires a session, returns the same current bytes/media type, honors conditional requests, and never changes queue order or LAN frame activity.
-- [ ] Attempt direct access to every management path through the LAN listener, spoofed forwarded headers, absolute/protocol-relative return URLs, cross-session CSRF reuse, wrong issuer/audience/nonce/state, expired tokens/sessions, and provider redirects.
-- [ ] Assert the production cookie configuration includes `Secure`, `HttpOnly`, and `SameSite=Lax`, while separately testing the narrowly allowed loopback development mode.
-- [ ] Capture and inspect normal and failure logs in tests or a local smoke run to ensure no secrets, codes, tokens, cookies, PKCE values, state, or nonce are emitted.
-- [ ] Inspect `cargo tree` for unintended duplicate protocol/session stacks and unnecessary enabled features.
-- [ ] Run `cargo fmt --check`.
-- [ ] Run `cargo clippy --all-targets --all-features -- -D warnings`.
-- [ ] Run `cargo test --all-targets --all-features`.
-- [ ] Run `cargo build --release --locked`.
-- [ ] Record evidence against every immutable workstation acceptance criterion, leave Stage 8 visibly pending, and commit the completed workstation implementation.
+- [x] Run a deterministic Rust mock OIDC provider/JWKS service and the application on two real loopback TCP listeners using the explicit loopback HTTP development exception. Do not require Docker, Authelia, public DNS, or a separately installed reverse proxy.
+- [x] Exercise the complete redirect/code flow with an HTTP client: unauthenticated navigation starts login, successful callback returns only to an allowlisted requested path, settings/PWA/private media work with the resulting session, local logout removes access, and callback replay fails.
+- [x] Verify direct LAN device `GET`/`HEAD`, conditional responses, full-download advancement, interrupted-download behavior, and peer-IP qualification through the LAN socket.
+- [x] Verify the authenticated image through the management socket requires a session, returns the same current bytes/media type, honors conditional requests, and never changes queue order or LAN frame activity.
+- [x] Attempt direct access to every management path through the LAN listener, spoofed forwarded headers, absolute/protocol-relative return URLs, cross-session CSRF reuse, wrong issuer/audience/nonce/state, expired tokens/sessions, and provider redirects.
+- [x] Assert the production cookie configuration includes `Secure`, `HttpOnly`, and `SameSite=Lax`, while separately testing the narrowly allowed loopback development mode.
+- [x] Capture and inspect normal and failure logs in tests or a local smoke run to ensure no secrets, codes, tokens, cookies, PKCE values, state, or nonce are emitted.
+- [x] Inspect `cargo tree` for unintended duplicate protocol/session stacks and unnecessary enabled features.
+- [x] Run `cargo fmt --check`.
+- [x] Run `cargo clippy --all-targets --all-features -- -D warnings`.
+- [x] Run `cargo test --all-targets --all-features`.
+- [x] Run `cargo build --release --locked`.
+- [x] Record evidence against every immutable workstation acceptance criterion, leave Stage 8 visibly pending, and commit the completed workstation implementation.
+
+## Workstation completion evidence
+
+- `cargo fmt --check`: passed after the final code changes.
+- `cargo clippy --all-targets --all-features -- -D warnings`: passed.
+- `cargo test --all-targets --all-features`: 107 passed, 0 failed, 1 pre-existing ignored release benchmark.
+- `cargo build --release --locked`: passed.
+- Deterministic mock-provider tests cover discovery redirect refusal, PKCE S256, secure cookie attributes and ID rotation, successful login/logout, missing/wrong/replayed state, missing/wrong nonce, wrong issuer/audience, expired/bad-signature tokens, local return-path restrictions, session lifetime, and cross-session CSRF rejection.
+- Real loopback TCP tests cover distinct management/LAN route surfaces and coordinated graceful shutdown. Existing frame tests cover completed/interrupted downloads, direct-peer qualification, serialization, and advancement behavior; authenticated-image tests cover GET/HEAD, both aliases, conditional responses, non-advancement, and exclusion from LAN activity.
+- Committed bootstrap TOML examples parse and pass Rust validation. PyYAML static validation loaded all five Kubernetes documents and verified management/LAN ports, probes, and Service target ports. Container/runtime execution remains Stage 8 because Docker/Podman is unavailable here.
+- `cargo tree -d` was reviewed: there is one OIDC/OAuth/reqwest stack and one tower-sessions stack; remaining duplicate low-level crates are expected version splits from existing or development-only dependencies.
+- Request tracing records listener, method, and URI path only; a regression test verifies query strings and headers (including OIDC codes/state and authorization values) are not trace fields. Authentication errors and startup diagnostics do not include client-secret values or token material.
+- Implementation milestones are committed on `feature/oidc-split-listeners`; Stage 8 intentionally remains unchecked and blocks any claim of production deployment validation.
 
 ### Stage 8 — Future validation on the actual Linux server environment
 

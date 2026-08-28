@@ -223,10 +223,6 @@ pub async fn callback(
         authenticated_at: chrono::Utc::now().timestamp(),
     };
     if session.insert(IDENTITY_KEY, identity).await.is_err()
-        || session
-            .insert("max_session_seconds", auth.max_session_seconds)
-            .await
-            .is_err()
         || session.insert(CSRF_KEY, random_token()).await.is_err()
     {
         let _ = session.flush().await;
@@ -236,11 +232,12 @@ pub async fn callback(
 }
 
 pub async fn require_auth(
+    Extension(auth): Extension<Arc<AuthService>>,
     session: Session,
     request: axum::extract::Request,
     next: Next,
 ) -> Response {
-    match active_identity(&session).await {
+    match active_identity(&session, auth.max_session_seconds).await {
         Ok(Some(_)) => next.run(request).await,
         Ok(None) if request.method() == Method::GET || request.method() == Method::HEAD => {
             let destination = safe_return_to(Some(&request.uri().to_string()));
@@ -261,20 +258,19 @@ pub async fn logout(session: Session) -> Response {
     }
 }
 
-pub async fn active_identity(session: &Session) -> Result<Option<Identity>, SessionError> {
+pub async fn active_identity(
+    session: &Session,
+    max_session_seconds: i64,
+) -> Result<Option<Identity>, SessionError> {
     let Some(identity) = session.get::<Identity>(IDENTITY_KEY).await? else {
         return Ok(None);
     };
-    // This bound is rechecked on every protected request; the store's inactivity
-    // expiry independently limits idle sessions.
-    let max = session
-        .get::<i64>("max_session_seconds")
-        .await?
-        .unwrap_or(i64::MAX);
+    // This configured bound is rechecked on every protected request; the
+    // store's inactivity expiry independently limits idle sessions.
     if chrono::Utc::now()
         .timestamp()
         .saturating_sub(identity.authenticated_at)
-        > max
+        > max_session_seconds
     {
         session.flush().await?;
         return Ok(None);
@@ -395,8 +391,7 @@ mod tests {
             )
             .await
             .unwrap();
-        session.insert("max_session_seconds", 1_i64).await.unwrap();
-        assert!(active_identity(&session).await.unwrap().is_none());
+        assert!(active_identity(&session, 1).await.unwrap().is_none());
     }
 
     #[tokio::test]

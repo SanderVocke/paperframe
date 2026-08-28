@@ -56,7 +56,11 @@ pub fn management_router(state: Arc<AppState>, auth_service: Arc<AuthService>) -
     let session_layer = SessionManagerLayer::new(MemoryStore::default())
         .with_name("paperframe_session")
         .with_http_only(true)
-        .with_secure(authentication.public_url.starts_with("https://"))
+        .with_secure(
+            url::Url::parse(&authentication.public_url)
+                .map(|url| url.scheme() == "https")
+                .unwrap_or(true),
+        )
         .with_same_site(SameSite::Lax)
         .with_expiry(Expiry::OnInactivity(TimeDuration::minutes(
             i64::try_from(authentication.session_idle_minutes).unwrap_or(i64::MAX),
@@ -69,7 +73,7 @@ pub fn management_router(state: Arc<AppState>, auth_service: Arc<AuthService>) -
         .route("/health/ready", get(health_ready))
         .merge(protected)
         .layer(DefaultBodyLimit::max(SETTINGS_LIMIT))
-        .layer(trace_layer())
+        .layer(trace_layer("management"))
         .layer(session_layer)
         .layer(axum::Extension(auth_service))
         .with_state(state)
@@ -79,7 +83,7 @@ pub fn lan_frame_router(state: Arc<AppState>) -> Router {
     Router::new()
         .route("/frame/current.jpg", get(get_image).head(head_image))
         .route("/frame/current.bmp", get(get_image).head(head_image))
-        .layer(trace_layer())
+        .layer(trace_layer("lan-frame"))
         .with_state(state)
 }
 
@@ -124,24 +128,29 @@ fn protected_routes() -> Router<Arc<AppState>> {
 }
 
 #[derive(Clone, Copy)]
-struct SafeMakeSpan;
+struct SafeMakeSpan {
+    listener: &'static str,
+}
 
 impl<B> MakeSpan<B> for SafeMakeSpan {
     fn make_span(&mut self, request: &Request<B>) -> tracing::Span {
         tracing::info_span!(
             "request",
+            listener = self.listener,
             method = %request.method(),
             path = %request.uri().path(),
         )
     }
 }
 
-fn trace_layer() -> TraceLayer<
+fn trace_layer(
+    listener: &'static str,
+) -> TraceLayer<
     tower_http::classify::SharedClassifier<tower_http::classify::ServerErrorsAsFailures>,
     SafeMakeSpan,
 > {
     TraceLayer::new_for_http()
-        .make_span_with(SafeMakeSpan)
+        .make_span_with(SafeMakeSpan { listener })
         .on_response(DefaultOnResponse::new().level(Level::INFO))
         .on_failure(DefaultOnFailure::new().level(Level::ERROR))
 }
@@ -156,7 +165,7 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/health/live", get(|| async { StatusCode::OK }))
         .route("/health/ready", get(health_ready))
         .layer(DefaultBodyLimit::max(SETTINGS_LIMIT))
-        .layer(trace_layer())
+        .layer(trace_layer("test"))
         .layer(SessionManagerLayer::new(MemoryStore::default()).with_secure(false))
         .with_state(state)
 }
@@ -1553,16 +1562,28 @@ async fn get_authenticated_image(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
 ) -> Response {
-    let _transition = state.rendering_transition.read().await;
-    stable_current_response(&state, &headers, true, false).await
+    authenticated_current_response(&state, &headers, true).await
 }
 
 async fn head_authenticated_image(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
 ) -> Response {
+    authenticated_current_response(&state, &headers, false).await
+}
+
+async fn authenticated_current_response(
+    state: &AppState,
+    headers: &HeaderMap,
+    include_body: bool,
+) -> Response {
     let _transition = state.rendering_transition.read().await;
-    stable_current_response(&state, &headers, false, false).await
+    let mut response = stable_current_response(state, headers, include_body, false).await;
+    response.headers_mut().insert(
+        header::CACHE_CONTROL,
+        header::HeaderValue::from_static("private, no-cache"),
+    );
+    response
 }
 
 async fn get_image(
@@ -3218,18 +3239,80 @@ mod tests {
         let management = management_router(state.clone(), auth_service);
         let lan = lan_frame_router(state.clone());
 
-        for path in ["/settings", "/frame/authenticated/current.jpg"] {
+        let protected_gets = [
+            "/",
+            "/manifest.webmanifest",
+            "/sw.js",
+            "/pwa/icon-192.png",
+            "/pwa/icon-512.png",
+            "/pwa/icon-maskable-512.png",
+            "/pwa/inter-variable.ttf",
+            "/settings",
+            "/queue/thumbnail/id",
+            "/queue/preview/id",
+            "/queue/original/id",
+            "/queue/rendered/id",
+            "/queue/dithered-preview/id",
+            "/frame/authenticated/current.jpg",
+            "/frame/authenticated/current.bmp",
+        ];
+        let protected_posts = [
+            "/settings",
+            "/queue/reorder",
+            "/queue/remove",
+            "/queue/advance",
+            "/queue/message",
+            "/queue/edit",
+            "/queue/text",
+            "/queue/text/remove",
+            "/queue/upload",
+            "/queue/orientation",
+            "/supplier/refresh",
+            "/supplier/reset-seen",
+            "/auth/logout",
+        ];
+        for path in protected_gets {
             let response = management
                 .clone()
                 .oneshot(Request::get(path).body(Body::empty()).unwrap())
                 .await
                 .unwrap();
-            assert_eq!(response.status(), StatusCode::SEE_OTHER);
+            assert_eq!(response.status(), StatusCode::SEE_OTHER, "GET {path}");
             assert!(
                 response.headers()[header::LOCATION]
                     .to_str()
                     .unwrap()
                     .starts_with("/auth/login?")
+            );
+            assert_eq!(
+                lan.clone()
+                    .oneshot(Request::get(path).body(Body::empty()).unwrap())
+                    .await
+                    .unwrap()
+                    .status(),
+                StatusCode::NOT_FOUND,
+                "LAN GET {path}"
+            );
+        }
+        for path in protected_posts {
+            assert_eq!(
+                management
+                    .clone()
+                    .oneshot(Request::post(path).body(Body::empty()).unwrap())
+                    .await
+                    .unwrap()
+                    .status(),
+                StatusCode::UNAUTHORIZED,
+                "POST {path}"
+            );
+            assert_eq!(
+                lan.clone()
+                    .oneshot(Request::post(path).body(Body::empty()).unwrap())
+                    .await
+                    .unwrap()
+                    .status(),
+                StatusCode::NOT_FOUND,
+                "LAN POST {path}"
             );
         }
         assert_eq!(
@@ -3254,20 +3337,11 @@ mod tests {
                 .status(),
             StatusCode::NOT_FOUND
         );
-        assert_eq!(
-            management
-                .clone()
-                .oneshot(Request::post("/queue/advance").body(Body::empty()).unwrap())
-                .await
-                .unwrap()
-                .status(),
-            StatusCode::UNAUTHORIZED
-        );
         for path in [
-            "/settings",
             "/auth/login",
+            "/auth/callback",
             "/health/live",
-            "/frame/authenticated/current.jpg",
+            "/health/ready",
         ] {
             assert_eq!(
                 lan.clone()
@@ -3357,6 +3431,17 @@ mod tests {
         );
         let authenticated_cookie = session_cookie(&callback);
         assert_ne!(initial_cookie, authenticated_cookie);
+        let fixed_session = management
+            .clone()
+            .oneshot(
+                Request::get("/settings")
+                    .header(header::COOKIE, &initial_cookie)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(fixed_session.status(), StatusCode::SEE_OTHER);
 
         let before = state.queue.snapshot().await;
         let image = management
@@ -3370,6 +3455,7 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(image.status(), StatusCode::OK);
+        assert_eq!(image.headers()[header::CACHE_CONTROL], "private, no-cache");
         let last_modified = image.headers()[header::LAST_MODIFIED].clone();
         let conditional = management
             .clone()
@@ -3400,6 +3486,28 @@ mod tests {
             before.entries[0].id
         );
         assert!(state.image_requests().await.is_empty());
+        let manifest = management
+            .clone()
+            .oneshot(
+                Request::get("/manifest.webmanifest")
+                    .header(header::COOKIE, &authenticated_cookie)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(manifest.status(), StatusCode::OK);
+        let thumbnail = management
+            .clone()
+            .oneshot(
+                Request::get(format!("/queue/thumbnail/{}", before.entries[0].id))
+                    .header(header::COOKIE, &authenticated_cookie)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(thumbnail.status(), StatusCode::OK);
 
         let replay = management
             .clone()
@@ -3430,6 +3538,32 @@ mod tests {
             .nth(1)
             .and_then(|value| value.split('"').next())
             .unwrap();
+        let queue_before_action = state.queue.snapshot().await;
+        let action = serde_urlencoded::to_string([
+            ("csrf_token", csrf.to_owned()),
+            (
+                "queue_generation",
+                queue_before_action.generation.to_string(),
+            ),
+        ])
+        .unwrap();
+        let advance = management
+            .clone()
+            .oneshot(
+                Request::post("/queue/advance")
+                    .header(header::COOKIE, &authenticated_cookie)
+                    .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
+                    .body(Body::from(action))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(advance.status(), StatusCode::SEE_OTHER);
+        assert_ne!(
+            state.queue.snapshot().await.entries[0].id,
+            queue_before_action.entries[0].id
+        );
+
         let logout = management
             .clone()
             .oneshot(
@@ -3444,6 +3578,17 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(logout.status(), StatusCode::SEE_OTHER);
+        let after_logout = management
+            .clone()
+            .oneshot(
+                Request::get("/settings")
+                    .header(header::COOKIE, &authenticated_cookie)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(after_logout.status(), StatusCode::SEE_OTHER);
 
         let lan_image = lan
             .oneshot(frame_request("HEAD", [127, 0, 0, 1]))
@@ -3662,12 +3807,40 @@ mod tests {
             .header(header::AUTHORIZATION, "Bearer secret")
             .body(())
             .unwrap();
-        let span = SafeMakeSpan.make_span(&request);
+        let span = SafeMakeSpan { listener: "test" }.make_span(&request);
         let fields = span.metadata().unwrap().fields();
+        assert!(fields.field("listener").is_some());
         assert!(fields.field("method").is_some());
         assert!(fields.field("path").is_some());
         assert!(fields.field("uri").is_none());
         assert!(fields.field("headers").is_none());
+    }
+
+    #[tokio::test]
+    async fn loopback_http_development_cookie_is_explicitly_non_secure() {
+        let provider = MockServer::start().await;
+        mount_oidc_metadata(&provider).await;
+        let authentication = AuthenticationConfig {
+            issuer: provider.uri(),
+            client_id: "paperframe-test".into(),
+            client_secret_env: "UNUSED_IN_TEST".into(),
+            public_url: "http://127.0.0.1:3000".into(),
+            session_idle_minutes: 60,
+            session_max_hours: 12,
+            allow_insecure_http: true,
+        };
+        let auth_service = AuthService::discover_with_secret(&authentication, "test-secret".into())
+            .await
+            .unwrap();
+        let (_directory, state) =
+            manual_state_with_auth(AdvancementSettings::Manual, authentication).await;
+        let login = management_router(state, auth_service)
+            .oneshot(Request::get("/auth/login").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        let cookie = login.headers()[header::SET_COOKIE].to_str().unwrap();
+        assert!(cookie.contains("HttpOnly"));
+        assert!(!cookie.contains("; Secure"));
     }
 
     #[tokio::test]
