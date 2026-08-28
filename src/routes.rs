@@ -3758,8 +3758,12 @@ mod tests {
         )
         .unwrap();
         if case == "signature" {
-            let last = token.pop().unwrap();
-            token.push(if last == 'A' { 'B' } else { 'A' });
+            let signature_start = token.rfind('.').unwrap() + 1;
+            let first = token.as_bytes()[signature_start];
+            token.replace_range(
+                signature_start..signature_start + 1,
+                if first == b'A' { "B" } else { "A" },
+            );
         }
         Mock::given(method("POST"))
             .and(path("/token"))
