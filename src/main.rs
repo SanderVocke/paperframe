@@ -1,3 +1,4 @@
+mod auth;
 pub mod catalog;
 pub mod config;
 pub mod dither;
@@ -39,31 +40,75 @@ async fn main() -> Result<()> {
         )
     })?;
     let settings = SettingsManager::load(config.settings_path.clone())?;
-    let listener = TcpListener::bind(config.bind)
-        .await
-        .with_context(|| format!("failed to bind server to {}", config.bind))?;
-    let address = listener
+    let (management_listener, lan_listener) =
+        bind_http_listeners(config.management_bind, config.lan_frame_bind).await?;
+    let management_address = management_listener
         .local_addr()
-        .context("failed to determine server address")?;
+        .context("failed to determine management server address")?;
+    let lan_address = lan_listener
+        .as_ref()
+        .map(TcpListener::local_addr)
+        .transpose()
+        .context("failed to determine LAN frame server address")?;
     let state = AppState::initialize(config, settings).await?;
-    info!(%address, queue_dir = %state.config.queue_dir.display(), settings_path = %state.config.settings_path.display(), "paper frame server listening");
+    let auth_service = auth::AuthService::discover(&state.config.authentication).await?;
+    info!(
+        %management_address,
+        lan_address = ?lan_address,
+        queue_dir = %state.config.queue_dir.display(),
+        settings_path = %state.config.settings_path.display(),
+        "paper frame server listening"
+    );
 
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
     let scheduler_task = tokio::spawn(scheduler::run(state.clone(), shutdown_rx.clone()));
     let refill_task = tokio::spawn(refill::run(state.clone(), shutdown_rx.clone()));
     let signal_task = tokio::spawn(signal_shutdown(shutdown_tx.clone()));
-    let server_result = axum::serve(
-        listener,
-        routes::router(state).into_make_service_with_connect_info::<SocketAddr>(),
+    let management_server = axum::serve(
+        management_listener,
+        routes::management_router(state.clone(), auth_service)
+            .into_make_service_with_connect_info::<SocketAddr>(),
     )
-    .with_graceful_shutdown(shutdown_requested(shutdown_rx))
-    .await
-    .context("HTTP server failed");
+    .with_graceful_shutdown(shutdown_requested(shutdown_rx.clone()));
+    let server_result = if let Some(listener) = lan_listener {
+        let lan_server = axum::serve(
+            listener,
+            routes::lan_frame_router(state.clone())
+                .into_make_service_with_connect_info::<SocketAddr>(),
+        )
+        .with_graceful_shutdown(shutdown_requested(shutdown_rx));
+        tokio::try_join!(management_server, lan_server)
+            .map(|_| ())
+            .context("HTTP server failed")
+    } else {
+        management_server
+            .await
+            .context("management HTTP server failed")
+    };
     let _ = shutdown_tx.send(true);
     scheduler_task.await.context("scheduler task failed")?;
     refill_task.await.context("refill task failed")?;
     signal_task.abort();
     server_result
+}
+
+async fn bind_http_listeners(
+    management_bind: SocketAddr,
+    lan_frame_bind: Option<SocketAddr>,
+) -> Result<(TcpListener, Option<TcpListener>)> {
+    let management = TcpListener::bind(management_bind)
+        .await
+        .with_context(|| format!("failed to bind management server to {management_bind}"))?;
+    let lan = if let Some(bind) = lan_frame_bind {
+        Some(
+            TcpListener::bind(bind)
+                .await
+                .with_context(|| format!("failed to bind LAN frame server to {bind}"))?,
+        )
+    } else {
+        None
+    };
+    Ok((management, lan))
 }
 
 fn init_tracing() {
@@ -98,4 +143,39 @@ async fn wait_for_shutdown_signal() -> Result<()> {
     tokio::signal::ctrl_c()
         .await
         .context("failed to listen for Ctrl-C")
+}
+
+#[cfg(test)]
+mod startup_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn listeners_bind_together_or_fail_before_serving() {
+        let (management, lan) = bind_http_listeners(
+            "127.0.0.1:0".parse().unwrap(),
+            Some("127.0.0.1:0".parse().unwrap()),
+        )
+        .await
+        .unwrap();
+        assert_ne!(
+            management.local_addr().unwrap(),
+            lan.unwrap().local_addr().unwrap()
+        );
+
+        let occupied = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let occupied_address = occupied.local_addr().unwrap();
+        assert!(
+            bind_http_listeners("127.0.0.1:0".parse().unwrap(), Some(occupied_address),)
+                .await
+                .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn lan_listener_can_be_disabled() {
+        let (_management, lan) = bind_http_listeners("127.0.0.1:0".parse().unwrap(), None)
+            .await
+            .unwrap();
+        assert!(lan.is_none());
+    }
 }

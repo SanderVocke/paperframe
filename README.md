@@ -10,13 +10,13 @@ You choose:
 The server copies selected images into its own managed queue. It never renames, removes, or modifies your source photos or DigiKam database. Once queued, an image is unaffected if its source is later edited or deleted.
 
 > [!IMPORTANT]
-> The service has no login or TLS. Run it only on a trusted LAN, or put it behind an authenticating HTTPS proxy.
+> The management listener authenticates browsers with OpenID Connect but does not terminate TLS. Put it behind an HTTPS reverse proxy. The optional device listener deliberately has no authentication and must be bound and firewalled so it is reachable only from the trusted LAN.
 
 ## Quick start with a folder
 
 ### 1. Prepare the files
 
-You need Rust 1.85 or newer and this repository. The server accepts common raster formats and converts them at enqueue time. From the repository root:
+You need Rust 1.88 or newer and this repository. The server accepts common raster formats and converts them at enqueue time. From the repository root:
 
 ```sh
 mkdir -p data/queue data/source-images
@@ -48,22 +48,56 @@ EOF
 
 Put supported raster images directly in `data/source-images`. Subfolders are not scanned.
 
-### 2. Start the server
+### 2. Configure OIDC and start the server
+
+Register a confidential OIDC client in Authelia with callback URI `https://paperframe.example.com/auth/callback`, Authorization Code flow, and required PKCE using `S256`. Edit `[authentication]` in `config.toml` so `issuer`, `client_id`, and `public_url` match that registration. Set the raw client secret only in the named environment variable:
 
 ```sh
+export PAPERFRAME_OIDC_CLIENT_SECRET='replace-with-the-raw-client-secret'
 cargo run --release -- config.toml
 ```
 
-The configuration path is optional and defaults to `config.toml`. To enable debug logging, set `RUST_LOG=debug` before the command.
+Authelia stores a digest of the client secret in its own client configuration; Paper Frame needs the corresponding raw value to authenticate at the token endpoint. The configuration path is optional and defaults to `config.toml`. To enable debug logging, set `RUST_LOG=debug` before the command.
 
 ### 3. Open the control page and connect the frame
 
-- Control page: `http://SERVER_IP:8080/settings`
-- Frame image (stable, backward-compatible URL): `http://SERVER_IP:8080/frame/current.jpg`
+- Authenticated control page: `https://paperframe.example.com/settings`
+- LAN-only frame image: `http://SERVER_LAN_IP:8081/frame/current.jpg`
+- Authenticated, non-advancing browser image: `https://paperframe.example.com/frame/authenticated/current.jpg`
 
-Replace `SERVER_IP` with the computer's LAN address. Configure the frame to fetch the frame-image URL. Despite the `.jpg` suffix, this endpoint serves the configured current representation: `image/bmp` in server-dither mode or `image/jpeg` in direct-JPEG mode. `/frame/current.bmp` is an alias for the same response. The control page shows readiness, refill errors, the current image, upcoming images, and all queue/settings controls.
+Configure the frame to fetch the LAN-only URL and do not publish port `8081` through the public reverse proxy. Despite the `.jpg` suffix, the endpoint serves the configured current representation: `image/bmp` in server-dither mode or `image/jpeg` in direct-JPEG mode. `/frame/current.bmp` and the corresponding authenticated `.bmp` path are aliases for the same representation. The control page shows readiness, refill errors, the current image, upcoming images, and all queue/settings controls.
 
 The quick-start policy is `manual`, so test downloads cannot unexpectedly move the queue. After confirming that the frame works, choose another policy on the control page if wanted.
+
+### Authelia OIDC client
+
+A representative Authelia client entry is shown below; follow the documentation for your installed Authelia version when generating the client-secret digest:
+
+```yaml
+identity_providers:
+  oidc:
+    clients:
+      - client_id: paperframe
+        client_name: Paper Frame
+        client_secret: '$pbkdf2-sha512$...digest-of-the-raw-secret...'
+        public: false
+        redirect_uris:
+          - https://paperframe.example.com/auth/callback
+        scopes:
+          - openid
+          - profile
+        grant_types:
+          - authorization_code
+        response_types:
+          - code
+        token_endpoint_auth_method: client_secret_basic
+        require_pkce: true
+        pkce_challenge_method: S256
+```
+
+Paper Frame discovers endpoints and signing keys from the configured issuer, refuses backend HTTP redirects, validates issuer/audience/signature/time/nonce, and does not retain provider tokens after login. Any identity allowed to authenticate for this OIDC client can administer the frame; apply the desired user/MFA policy in Authelia. Local logout deletes the Paper Frame session, but an existing Authelia SSO session can allow immediate login again.
+
+For native loopback-only development, both HTTP issuer/public URLs must resolve to loopback and `allow_insecure_http = true` must be explicit. Never enable that option for a LAN or public HTTP URL.
 
 ## Image processing and orientation
 
@@ -90,7 +124,7 @@ A text edit is a non-destructive recipe change. The server retains the original 
 
 Paper Frame is a progressive web app. On a supported Android browser, open the control page and use **Install app** when the button appears. The installed app opens `/settings` in a standalone window. A valid HTTPS public origin is required for installation; plain HTTP works only on loopback addresses such as `localhost` during development.
 
-An authenticating reverse proxy such as Authelia is compatible with installation. The installed app shares the browser's cookies and follows the normal login redirect when its session expires. Ensure authenticated requests for `/manifest.webmanifest`, `/sw.js`, and `/pwa/*` return the actual assets rather than a login page. These endpoints contain no private data and can optionally be exempted from authentication, while `/settings`, queue endpoints, previews, and frame images remain protected. The service worker caches only PWA metadata and icons, never authenticated application pages or photos.
+The installed app shares Paper Frame's OIDC session cookie and follows the normal Authelia login redirect when its session expires. `/manifest.webmanifest`, `/sw.js`, and `/pwa/*` are protected by the same application session as the settings page; configure the reverse proxy to pass these paths to Paper Frame rather than applying a second forward-auth flow. The service worker caches only PWA metadata and icons, never authenticated application pages or photos.
 
 ## Docker and Kubernetes
 
@@ -227,19 +261,30 @@ frame_client_ips = ["192.168.1.50"]
 
 A successful qualifying `GET` to either `/frame/current.jpg` or `/frame/current.bmp` advances after the server finishes the response body. `HEAD`, previews, health checks, and streams dropped before server-side completion do not advance.
 
-Set `frame_client_ips` to the frame's IP so browser requests do not advance the queue. An empty list means **every direct client IP qualifies**. Matching uses the direct TCP peer and deliberately ignores `Forwarded`, `X-Forwarded-For`, and `User-Agent`; when using a reverse proxy, the direct peer will normally be the proxy.
+Set `frame_client_ips` to the frame's IP when several LAN clients can reach the device listener. An empty list means **every direct client IP qualifies**. Matching uses the direct TCP peer and deliberately ignores `Forwarded`, `X-Forwarded-For`, and `User-Agent`. Browser inspection should use `/frame/authenticated/current.*` on the management listener, which never advances the queue.
 
 HTTP completion cannot prove that a device received, decoded, or displayed the image. It only means the server's response stream completed.
 
 ## Configuration files and storage
 
-The small bootstrap file selects the listening address and persistent paths:
+The bootstrap file selects the two listening addresses, persistent paths, and OIDC client:
 
 ```toml
-bind = "0.0.0.0:8080"
+management_bind = "0.0.0.0:8080"
+lan_frame_bind = "192.168.1.20:8081" # omit to disable unauthenticated fetching
 settings_path = "data/settings.toml"
 queue_dir = "data/queue"
+
+[authentication]
+issuer = "https://auth.example.com"
+client_id = "paperframe"
+client_secret_env = "PAPERFRAME_OIDC_CLIENT_SECRET"
+public_url = "https://paperframe.example.com"
+session_idle_minutes = 60
+session_max_hours = 12
 ```
+
+`public_url` is an exact externally visible origin; Paper Frame derives `/auth/callback` from it and never trusts forwarded host/protocol headers for redirects. HTTPS is mandatory except when `allow_insecure_http = true` is explicitly configured for loopback-only development URLs. The legacy `bind` key remains an alias for `management_bind`, but authentication configuration is required.
 
 See [`config.example.toml`](config.example.toml). Relative paths are resolved from the process working directory. The settings file, its parent directory, and the queue must be writable; source photos and the DigiKam catalog should be mounted read-only.
 
@@ -320,11 +365,11 @@ Reload `/settings` and retry. Another action changed the generation shown in you
 - `GET /health/ready` returns `200` only when the current managed derivative can be served.
 - Use persistent storage for the settings file and queue root.
 
-There is no authentication, authorization, or TLS. CSRF and stale-generation checks protect the control page from accidental/cross-site mutations but are not access control. Keep the service on a trusted network or use an authenticating TLS proxy.
+Management routes use OIDC Authorization Code flow with PKCE, an opaque server-side session, bounded lifetime, and session-bound CSRF tokens. The application still provides no TLS: expose only the management listener through an HTTPS reverse proxy. The separate `/frame/current.*` listener is intentionally unauthenticated and must be restricted to the trusted LAN with its bind address, container port publication, firewall, and/or network policy. Restarting the single server process logs browsers out because sessions are held in memory.
 
 ## HTTP reference
 
-Most users only need `/settings` and the stable `/frame/current.jpg` endpoint. The `.jpg` and `.bmp` frame paths are aliases; the configured output mode determines the response format.
+Most users need authenticated `/settings` on the management listener and `/frame/current.jpg` on the LAN listener. The `.jpg` and `.bmp` paths are aliases; the configured output mode determines the response format. All management paths below are authenticated except `/auth/login`, `/auth/callback`, and health checks.
 
 | Method | Path | Purpose |
 |---|---|---|
@@ -332,8 +377,13 @@ Most users only need `/settings` and the stable `/frame/current.jpg` endpoint. T
 | `GET` | `/manifest.webmanifest` | Progressive web app metadata |
 | `GET` | `/sw.js` | Static-assets-only service worker |
 | `GET` | `/pwa/*` | Progressive web app icons |
-| `GET` / `HEAD` | `/frame/current.jpg` | Stable backward-compatible endpoint; returns the configured JPEG or BMP representation |
-| `GET` / `HEAD` | `/frame/current.bmp` | Alias for the same configured representation |
+| `GET` / `HEAD` | `/frame/current.jpg` | LAN-listener device endpoint; returns the configured JPEG or BMP representation |
+| `GET` / `HEAD` | `/frame/current.bmp` | LAN-listener alias for the same configured representation |
+| `GET` / `HEAD` | `/frame/authenticated/current.jpg` | Authenticated, non-advancing management endpoint |
+| `GET` / `HEAD` | `/frame/authenticated/current.bmp` | Alias for the authenticated current representation |
+| `GET` | `/auth/login` | Begin OIDC Authorization Code + PKCE login |
+| `GET` | `/auth/callback` | Validate and complete the OIDC login transaction |
+| `POST` | `/auth/logout` | CSRF-protected local session logout |
 | `GET` | `/queue/thumbnail/{id}` | Non-advancing thumbnail |
 | `GET` | `/queue/preview/{id}` | Browser-compatible, undithered original preview |
 | `GET` | `/queue/original/{id}` | Retained original source bytes |

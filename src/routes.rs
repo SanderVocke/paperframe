@@ -12,7 +12,7 @@ use axum::{
     Router,
     body::{Body, Bytes},
     extract::{ConnectInfo, DefaultBodyLimit, Form, Multipart, Path as AxumPath, State},
-    http::{HeaderMap, StatusCode, header},
+    http::{HeaderMap, Request, StatusCode, header},
     response::{Html, IntoResponse, Redirect, Response},
     routing::{get, post},
 };
@@ -20,10 +20,12 @@ use chrono::Utc;
 use futures_util::Stream;
 use serde::{Deserialize, Serialize};
 use tokio::sync::OwnedMutexGuard;
-use tower_http::trace::{DefaultMakeSpan, DefaultOnFailure, DefaultOnResponse, TraceLayer};
+use tower_http::trace::{DefaultOnFailure, DefaultOnResponse, MakeSpan, TraceLayer};
+use tower_sessions::Session;
 use tracing::{Level, error, info};
 
 use crate::{
+    auth::{self, AuthService},
     config::{
         AdvancementSettings, DigikamSettings, ManualFolderSettings, PathMapping,
         QueueAdvanceBehavior, QueueSettings, RenderingSettings, ReplaceSettingsError, Settings,
@@ -45,7 +47,47 @@ const ICON_192: &[u8] = include_bytes!("../assets/pwa/icon-192.png");
 const ICON_512: &[u8] = include_bytes!("../assets/pwa/icon-512.png");
 const ICON_MASKABLE_512: &[u8] = include_bytes!("../assets/pwa/icon-maskable-512.png");
 
-pub fn router(state: Arc<AppState>) -> Router {
+pub fn management_router(state: Arc<AppState>, auth_service: Arc<AuthService>) -> Router {
+    use axum::middleware;
+    use time::Duration as TimeDuration;
+    use tower_sessions::{Expiry, MemoryStore, SessionManagerLayer, cookie::SameSite};
+
+    let authentication = &state.config.authentication;
+    let session_layer = SessionManagerLayer::new(MemoryStore::default())
+        .with_name("paperframe_session")
+        .with_http_only(true)
+        .with_secure(
+            url::Url::parse(&authentication.public_url)
+                .map(|url| url.scheme() == "https")
+                .unwrap_or(true),
+        )
+        .with_same_site(SameSite::Lax)
+        .with_expiry(Expiry::OnInactivity(TimeDuration::minutes(
+            i64::try_from(authentication.session_idle_minutes).unwrap_or(i64::MAX),
+        )));
+    let protected = protected_routes().route_layer(middleware::from_fn(auth::require_auth));
+    Router::new()
+        .route("/auth/login", get(auth::login))
+        .route("/auth/callback", get(auth::callback))
+        .route("/health/live", get(|| async { StatusCode::OK }))
+        .route("/health/ready", get(health_ready))
+        .merge(protected)
+        .layer(DefaultBodyLimit::max(SETTINGS_LIMIT))
+        .layer(trace_layer("management"))
+        .layer(session_layer)
+        .layer(axum::Extension(auth_service))
+        .with_state(state)
+}
+
+pub fn lan_frame_router(state: Arc<AppState>) -> Router {
+    Router::new()
+        .route("/frame/current.jpg", get(get_image).head(head_image))
+        .route("/frame/current.bmp", get(get_image).head(head_image))
+        .layer(trace_layer("lan-frame"))
+        .with_state(state)
+}
+
+fn protected_routes() -> Router<Arc<AppState>> {
     Router::new()
         .route("/", get(|| async { Redirect::to("/settings") }))
         .route("/manifest.webmanifest", get(web_app_manifest))
@@ -74,17 +116,57 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/queue/orientation", post(set_queue_orientation))
         .route("/supplier/refresh", post(refresh_supplier))
         .route("/supplier/reset-seen", post(reset_supplier_seen))
+        .route(
+            "/frame/authenticated/current.jpg",
+            get(get_authenticated_image).head(head_authenticated_image),
+        )
+        .route(
+            "/frame/authenticated/current.bmp",
+            get(get_authenticated_image).head(head_authenticated_image),
+        )
+        .route("/auth/logout", post(logout))
+}
+
+#[derive(Clone, Copy)]
+struct SafeMakeSpan {
+    listener: &'static str,
+}
+
+impl<B> MakeSpan<B> for SafeMakeSpan {
+    fn make_span(&mut self, request: &Request<B>) -> tracing::Span {
+        tracing::info_span!(
+            "request",
+            listener = self.listener,
+            method = %request.method(),
+            path = %request.uri().path(),
+        )
+    }
+}
+
+fn trace_layer(
+    listener: &'static str,
+) -> TraceLayer<
+    tower_http::classify::SharedClassifier<tower_http::classify::ServerErrorsAsFailures>,
+    SafeMakeSpan,
+> {
+    TraceLayer::new_for_http()
+        .make_span_with(SafeMakeSpan { listener })
+        .on_response(DefaultOnResponse::new().level(Level::INFO))
+        .on_failure(DefaultOnFailure::new().level(Level::ERROR))
+}
+
+#[cfg(test)]
+pub fn router(state: Arc<AppState>) -> Router {
+    use tower_sessions::{MemoryStore, SessionManagerLayer};
+
+    protected_routes()
         .route("/frame/current.jpg", get(get_image).head(head_image))
         .route("/frame/current.bmp", get(get_image).head(head_image))
         .route("/health/live", get(|| async { StatusCode::OK }))
         .route("/health/ready", get(health_ready))
         .layer(DefaultBodyLimit::max(SETTINGS_LIMIT))
-        .layer(
-            TraceLayer::new_for_http()
-                .make_span_with(DefaultMakeSpan::new().level(Level::INFO))
-                .on_response(DefaultOnResponse::new().level(Level::INFO))
-                .on_failure(DefaultOnFailure::new().level(Level::ERROR)),
-        )
+        .layer(trace_layer("test"))
+        .layer(SessionManagerLayer::new(MemoryStore::default()).with_secure(false))
         .with_state(state)
 }
 
@@ -251,6 +333,10 @@ struct QueueActionForm {
     queue_generation: String,
 }
 #[derive(Deserialize)]
+struct LogoutForm {
+    csrf_token: String,
+}
+#[derive(Deserialize)]
 struct RemoveForm {
     csrf_token: String,
     queue_generation: String,
@@ -305,12 +391,31 @@ struct MessageForm {
     position: String,
 }
 
-async fn settings_page(State(state): State<Arc<AppState>>) -> Response {
+async fn logout(session: Session, Form(form): Form<LogoutForm>) -> Response {
+    if !matches!(
+        auth::validate_csrf(&session, &form.csrf_token).await,
+        Ok(true)
+    ) {
+        return plain(StatusCode::FORBIDDEN, "Invalid CSRF token");
+    }
+    auth::logout(session).await
+}
+
+async fn settings_page(State(state): State<Arc<AppState>>, session: Session) -> Response {
+    let csrf = match auth::csrf_token(&session).await {
+        Ok(token) => token,
+        Err(_) => {
+            return plain(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "Could not create session token",
+            );
+        }
+    };
     let snapshot = state.settings.snapshot().await;
     render_settings(
         &state,
         snapshot.generation,
-        SettingsForm::from_settings(snapshot.generation, state.csrf_token(), &snapshot.settings),
+        SettingsForm::from_settings(snapshot.generation, &csrf, &snapshot.settings),
         None,
         StatusCode::OK,
     )
@@ -319,11 +424,26 @@ async fn settings_page(State(state): State<Arc<AppState>>) -> Response {
 
 async fn update_settings(
     State(state): State<Arc<AppState>>,
-    Form(form): Form<SettingsForm>,
+    session: Session,
+    Form(mut form): Form<SettingsForm>,
 ) -> Response {
-    if form.csrf_token != state.csrf_token() {
+    let csrf = match auth::csrf_token(&session).await {
+        Ok(token) => token,
+        Err(_) => {
+            return plain(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "Could not load session token",
+            );
+        }
+    };
+    if !matches!(
+        auth::validate_csrf(&session, &form.csrf_token).await,
+        Ok(true)
+    ) {
+        form.csrf_token = csrf;
         return render_error(&state, form, StatusCode::FORBIDDEN, "Invalid CSRF token").await;
     }
+    form.csrf_token = csrf;
     let expected = match form.generation.parse() {
         Ok(value) => value,
         Err(_) => {
@@ -453,7 +573,6 @@ async fn render_error(
 ) -> Response {
     let generation = state.settings.snapshot().await.generation;
     form.generation = generation.to_string();
-    form.csrf_token = state.csrf_token().into();
     render_settings(state, generation, form, Some(message.into()), status).await
 }
 
@@ -516,7 +635,7 @@ async fn render_settings(
     let template = SettingsTemplate {
         generation,
         queue_generation: queue.generation,
-        csrf_token: state.csrf_token().into(),
+        csrf_token: form.csrf_token.clone(),
         entries,
         reorder_lines,
         ready: !queue.entries.is_empty(),
@@ -681,9 +800,11 @@ fn text_background_name(background: TextBackground) -> &'static str {
 
 async fn reorder_queue(
     State(state): State<Arc<AppState>>,
+    session: Session,
     Form(form): Form<ReorderForm>,
 ) -> Response {
-    let generation = match validate_action(&state, &form.csrf_token, &form.queue_generation) {
+    let generation = match validate_action(&session, &form.csrf_token, &form.queue_generation).await
+    {
         Ok(value) => value,
         Err((status, message)) => return plain(status, &message),
     };
@@ -697,9 +818,11 @@ async fn reorder_queue(
 }
 async fn remove_queue_entry(
     State(state): State<Arc<AppState>>,
+    session: Session,
     Form(form): Form<RemoveForm>,
 ) -> Response {
-    let generation = match validate_action(&state, &form.csrf_token, &form.queue_generation) {
+    let generation = match validate_action(&session, &form.csrf_token, &form.queue_generation).await
+    {
         Ok(value) => value,
         Err((status, message)) => return plain(status, &message),
     };
@@ -707,9 +830,11 @@ async fn remove_queue_entry(
 }
 async fn advance_queue(
     State(state): State<Arc<AppState>>,
+    session: Session,
     Form(form): Form<QueueActionForm>,
 ) -> Response {
-    let generation = match validate_action(&state, &form.csrf_token, &form.queue_generation) {
+    let generation = match validate_action(&session, &form.csrf_token, &form.queue_generation).await
+    {
         Ok(value) => value,
         Err((status, message)) => return plain(status, &message),
     };
@@ -731,9 +856,11 @@ async fn advance_queue(
 }
 async fn refresh_supplier(
     State(state): State<Arc<AppState>>,
+    session: Session,
     Form(form): Form<QueueActionForm>,
 ) -> Response {
-    let generation = match validate_action(&state, &form.csrf_token, &form.queue_generation) {
+    let generation = match validate_action(&session, &form.csrf_token, &form.queue_generation).await
+    {
         Ok(value) => value,
         Err((status, message)) => return plain(status, &message),
     };
@@ -745,9 +872,11 @@ async fn refresh_supplier(
 }
 async fn reset_supplier_seen(
     State(state): State<Arc<AppState>>,
+    session: Session,
     Form(form): Form<QueueActionForm>,
 ) -> Response {
-    let generation = match validate_action(&state, &form.csrf_token, &form.queue_generation) {
+    let generation = match validate_action(&session, &form.csrf_token, &form.queue_generation).await
+    {
         Ok(value) => value,
         Err((status, message)) => return plain(status, &message),
     };
@@ -767,12 +896,12 @@ fn mutation_response(result: anyhow::Result<crate::queue::QueueSnapshot>) -> Res
         Err(error) => plain(StatusCode::CONFLICT, &error.to_string()),
     }
 }
-fn validate_action(
-    state: &AppState,
+async fn validate_action(
+    session: &Session,
     csrf: &str,
     generation: &str,
 ) -> Result<u64, (StatusCode, String)> {
-    if csrf != state.csrf_token() {
+    if !matches!(auth::validate_csrf(session, csrf).await, Ok(true)) {
         return Err((StatusCode::FORBIDDEN, "Invalid CSRF token".into()));
     }
     generation.parse().map_err(|_| {
@@ -783,7 +912,11 @@ fn validate_action(
     })
 }
 
-async fn upload_queue(State(state): State<Arc<AppState>>, mut multipart: Multipart) -> Response {
+async fn upload_queue(
+    State(state): State<Arc<AppState>>,
+    session: Session,
+    mut multipart: Multipart,
+) -> Response {
     let settings = state.settings.snapshot().await.settings;
     let mut csrf = None;
     let mut generation = None;
@@ -831,7 +964,7 @@ async fn upload_queue(State(state): State<Arc<AppState>>, mut multipart: Multipa
     }
     let csrf = csrf.unwrap_or_default();
     let generation = generation.unwrap_or_default();
-    let generation = match validate_action(&state, &csrf, &generation) {
+    let generation = match validate_action(&session, &csrf, &generation).await {
         Ok(value) => value,
         Err((status, message)) => return plain(status, &message),
     };
@@ -904,9 +1037,11 @@ async fn upload_queue(State(state): State<Arc<AppState>>, mut multipart: Multipa
 }
 async fn create_text_message(
     State(state): State<Arc<AppState>>,
+    session: Session,
     Form(form): Form<MessageForm>,
 ) -> Response {
-    let generation = match validate_action(&state, &form.csrf_token, &form.queue_generation) {
+    let generation = match validate_action(&session, &form.csrf_token, &form.queue_generation).await
+    {
         Ok(value) => value,
         Err((status, message)) => return plain(status, &message),
     };
@@ -983,9 +1118,11 @@ async fn create_text_message(
 
 async fn edit_queue_entry(
     State(state): State<Arc<AppState>>,
+    session: Session,
     Form(form): Form<EditEntryForm>,
 ) -> Response {
-    let generation = match validate_action(&state, &form.csrf_token, &form.queue_generation) {
+    let generation = match validate_action(&session, &form.csrf_token, &form.queue_generation).await
+    {
         Ok(value) => value,
         Err((status, message)) => return plain(status, &message),
     };
@@ -1031,9 +1168,11 @@ async fn edit_queue_entry(
 
 async fn update_queue_text(
     State(state): State<Arc<AppState>>,
+    session: Session,
     Form(form): Form<TextForm>,
 ) -> Response {
-    let generation = match validate_action(&state, &form.csrf_token, &form.queue_generation) {
+    let generation = match validate_action(&session, &form.csrf_token, &form.queue_generation).await
+    {
         Ok(value) => value,
         Err((status, message)) => return plain(status, &message),
     };
@@ -1070,9 +1209,11 @@ async fn update_queue_text(
 
 async fn remove_queue_text(
     State(state): State<Arc<AppState>>,
+    session: Session,
     Form(form): Form<RemoveForm>,
 ) -> Response {
-    let generation = match validate_action(&state, &form.csrf_token, &form.queue_generation) {
+    let generation = match validate_action(&session, &form.csrf_token, &form.queue_generation).await
+    {
         Ok(value) => value,
         Err((status, message)) => return plain(status, &message),
     };
@@ -1369,9 +1510,11 @@ async fn queue_dithered_preview(
 }
 async fn set_queue_orientation(
     State(state): State<Arc<AppState>>,
+    session: Session,
     Form(form): Form<OrientationForm>,
 ) -> Response {
-    let generation = match validate_action(&state, &form.csrf_token, &form.queue_generation) {
+    let generation = match validate_action(&session, &form.csrf_token, &form.queue_generation).await
+    {
         Ok(value) => value,
         Err((status, message)) => return plain(status, &message),
     };
@@ -1413,6 +1556,34 @@ async fn health_ready(State(state): State<Arc<AppState>>) -> StatusCode {
     } else {
         StatusCode::SERVICE_UNAVAILABLE
     }
+}
+
+async fn get_authenticated_image(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+) -> Response {
+    authenticated_current_response(&state, &headers, true).await
+}
+
+async fn head_authenticated_image(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+) -> Response {
+    authenticated_current_response(&state, &headers, false).await
+}
+
+async fn authenticated_current_response(
+    state: &AppState,
+    headers: &HeaderMap,
+    include_body: bool,
+) -> Response {
+    let _transition = state.rendering_transition.read().await;
+    let mut response = stable_current_response(state, headers, include_body, false).await;
+    response.headers_mut().insert(
+        header::CACHE_CONTROL,
+        header::HeaderValue::from_static("private, no-cache"),
+    );
+    response
 }
 
 async fn get_image(
@@ -1804,13 +1975,22 @@ fn parse_mappings(input: &str) -> Result<Vec<PathMapping>, String> {
 mod tests {
     use std::{fs, net::IpAddr, path::Path};
 
-    use axum::{body::Body, extract::ConnectInfo, http::Request};
+    use axum::{body::Body, extract::ConnectInfo};
     use http_body_util::BodyExt;
+    use jsonwebtoken::{Algorithm, EncodingKey, Header, encode};
+    use serde_json::json;
     use tempfile::tempdir;
     use tokio::time::{Duration as TokioDuration, timeout};
     use tower::ServiceExt;
+    use wiremock::{
+        Mock, MockServer, ResponseTemplate,
+        matchers::{method, path},
+    };
 
-    use crate::{config::SettingsManager, refill};
+    use crate::{
+        config::{AuthenticationConfig, SettingsManager},
+        refill,
+    };
 
     use super::*;
 
@@ -1818,7 +1998,26 @@ mod tests {
     const B: &[u8] = include_bytes!("../tests/fixtures/images/b.jpg");
     const C: &[u8] = include_bytes!("../tests/fixtures/images/c.jpg");
 
+    fn test_authentication() -> AuthenticationConfig {
+        AuthenticationConfig {
+            issuer: "http://127.0.0.1:3001".into(),
+            client_id: "paperframe-test".into(),
+            client_secret_env: "PAPERFRAME_TEST_SECRET".into(),
+            public_url: "http://127.0.0.1:3000".into(),
+            session_idle_minutes: 60,
+            session_max_hours: 12,
+            allow_insecure_http: true,
+        }
+    }
+
     async fn manual_state(policy: AdvancementSettings) -> (tempfile::TempDir, Arc<AppState>) {
+        manual_state_with_auth(policy, test_authentication()).await
+    }
+
+    async fn manual_state_with_auth(
+        policy: AdvancementSettings,
+        authentication: AuthenticationConfig,
+    ) -> (tempfile::TempDir, Arc<AppState>) {
         let directory = tempdir().unwrap();
         let source = directory.path().join("source");
         let queue = directory.path().join("queue");
@@ -1847,9 +2046,11 @@ mod tests {
         fs::write(&settings_path, toml::to_string_pretty(&settings).unwrap()).unwrap();
         let state = AppState::initialize(
             crate::config::Config {
-                bind: "127.0.0.1:0".parse().unwrap(),
+                management_bind: "127.0.0.1:0".parse().unwrap(),
+                lan_frame_bind: Some("127.0.0.1:1".parse().unwrap()),
                 settings_path: settings_path.clone(),
                 queue_dir: queue,
+                authentication,
             },
             SettingsManager::load(settings_path).unwrap(),
         )
@@ -2278,9 +2479,11 @@ mod tests {
         let settings_path = directory.path().join("settings.toml");
         let restarted = AppState::initialize(
             crate::config::Config {
-                bind: "127.0.0.1:0".parse().unwrap(),
+                management_bind: "127.0.0.1:0".parse().unwrap(),
+                lan_frame_bind: Some("127.0.0.1:1".parse().unwrap()),
                 settings_path: settings_path.clone(),
                 queue_dir: directory.path().join("queue"),
+                authentication: test_authentication(),
             },
             SettingsManager::load(settings_path).unwrap(),
         )
@@ -2739,9 +2942,11 @@ mod tests {
         let settings_path = directory.path().join("settings.toml");
         let restarted = AppState::initialize(
             crate::config::Config {
-                bind: "127.0.0.1:0".parse().unwrap(),
+                management_bind: "127.0.0.1:0".parse().unwrap(),
+                lan_frame_bind: Some("127.0.0.1:1".parse().unwrap()),
                 settings_path: settings_path.clone(),
                 queue_dir: directory.path().join("queue"),
+                authentication: test_authentication(),
             },
             SettingsManager::load(settings_path).unwrap(),
         )
@@ -2950,6 +3155,788 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec!["b.jpg", "c.jpg", "d.jpg"]
         );
+    }
+
+    #[derive(Serialize)]
+    struct TestIdTokenClaims {
+        iss: String,
+        sub: String,
+        aud: String,
+        exp: usize,
+        iat: usize,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        nonce: Option<String>,
+    }
+
+    fn session_cookie(response: &Response) -> String {
+        response
+            .headers()
+            .get_all(header::SET_COOKIE)
+            .iter()
+            .filter_map(|value| value.to_str().ok())
+            .find(|value| value.starts_with("paperframe_session="))
+            .and_then(|value| value.split(';').next())
+            .expect("session cookie")
+            .to_owned()
+    }
+
+    async fn mount_oidc_metadata(server: &MockServer) {
+        let issuer = server.uri();
+        Mock::given(method("GET"))
+            .and(path("/.well-known/openid-configuration"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "issuer": issuer,
+                "authorization_endpoint": format!("{}/authorize", server.uri()),
+                "token_endpoint": format!("{}/token", server.uri()),
+                "jwks_uri": format!("{}/jwks", server.uri()),
+                "response_types_supported": ["code"],
+                "subject_types_supported": ["public"],
+                "id_token_signing_alg_values_supported": ["RS256"],
+                "scopes_supported": ["openid", "profile"],
+                "token_endpoint_auth_methods_supported": ["client_secret_basic"]
+            })))
+            .mount(server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/jwks"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "keys": [{
+                    "kty": "RSA",
+                    "kid": "paperframe-test",
+                    "use": "sig",
+                    "alg": "RS256",
+                    "n": "wUdh1YlQ01yN5WJzvVYDssUKsNXT2b75-bh0CumoC6QTL0rxeWPsQ2JuD-u9Swvhs-U1lFpUxjJAXULNhgxleHiY_9S3DOxOnJfOUBv4H8CrQgAvoeirA1wo5xpaqkEHaZf7ZZqTKVYfG505HNibRrOxcB90-9ELVPLzUf9a9hTXYfn8vDOdFoFFl-jOz4AFa-mmjDGVtA5bpCqaSkPOICNIw9uv0xIosfNl7eOeWVYg5Fmbje4Q3Q4gyUTCMPXa4IR5AGJeAQ8JjrixtiiN247at_1ftDSqh_N2A43GtWumqy0f4fOQC2KtTH0bt6_FvAsECoJlzjP5McTdo2okzQ",
+                    "e": "AQAB"
+                }]
+            })))
+            .mount(server)
+            .await;
+    }
+
+    #[tokio::test]
+    async fn oidc_login_and_split_route_boundaries_work_end_to_end() {
+        let provider = MockServer::start().await;
+        mount_oidc_metadata(&provider).await;
+        let authentication = AuthenticationConfig {
+            issuer: provider.uri(),
+            client_id: "paperframe-test".into(),
+            client_secret_env: "UNUSED_IN_TEST".into(),
+            public_url: "https://paperframe.test".into(),
+            session_idle_minutes: 60,
+            session_max_hours: 12,
+            allow_insecure_http: true,
+        };
+        let auth_service = AuthService::discover_with_secret(&authentication, "test-secret".into())
+            .await
+            .unwrap();
+        let (_directory, state) = manual_state_with_auth(
+            AdvancementSettings::EveryFetch {
+                frame_client_ips: vec![],
+            },
+            authentication,
+        )
+        .await;
+        let management = management_router(state.clone(), auth_service);
+        let lan = lan_frame_router(state.clone());
+
+        let protected_gets = [
+            "/",
+            "/manifest.webmanifest",
+            "/sw.js",
+            "/pwa/icon-192.png",
+            "/pwa/icon-512.png",
+            "/pwa/icon-maskable-512.png",
+            "/pwa/inter-variable.ttf",
+            "/settings",
+            "/queue/thumbnail/id",
+            "/queue/preview/id",
+            "/queue/original/id",
+            "/queue/rendered/id",
+            "/queue/dithered-preview/id",
+            "/frame/authenticated/current.jpg",
+            "/frame/authenticated/current.bmp",
+        ];
+        let protected_posts = [
+            "/settings",
+            "/queue/reorder",
+            "/queue/remove",
+            "/queue/advance",
+            "/queue/message",
+            "/queue/edit",
+            "/queue/text",
+            "/queue/text/remove",
+            "/queue/upload",
+            "/queue/orientation",
+            "/supplier/refresh",
+            "/supplier/reset-seen",
+            "/auth/logout",
+        ];
+        for path in protected_gets {
+            let response = management
+                .clone()
+                .oneshot(Request::get(path).body(Body::empty()).unwrap())
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::SEE_OTHER, "GET {path}");
+            assert!(
+                response.headers()[header::LOCATION]
+                    .to_str()
+                    .unwrap()
+                    .starts_with("/auth/login?")
+            );
+            assert_eq!(
+                lan.clone()
+                    .oneshot(Request::get(path).body(Body::empty()).unwrap())
+                    .await
+                    .unwrap()
+                    .status(),
+                StatusCode::NOT_FOUND,
+                "LAN GET {path}"
+            );
+        }
+        for path in protected_posts {
+            assert_eq!(
+                management
+                    .clone()
+                    .oneshot(Request::post(path).body(Body::empty()).unwrap())
+                    .await
+                    .unwrap()
+                    .status(),
+                StatusCode::UNAUTHORIZED,
+                "POST {path}"
+            );
+            assert_eq!(
+                lan.clone()
+                    .oneshot(Request::post(path).body(Body::empty()).unwrap())
+                    .await
+                    .unwrap()
+                    .status(),
+                StatusCode::NOT_FOUND,
+                "LAN POST {path}"
+            );
+        }
+        assert_eq!(
+            management
+                .clone()
+                .oneshot(Request::get("/health/live").body(Body::empty()).unwrap())
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::OK
+        );
+        assert_eq!(
+            management
+                .clone()
+                .oneshot(
+                    Request::get("/frame/current.jpg")
+                        .body(Body::empty())
+                        .unwrap()
+                )
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::NOT_FOUND
+        );
+        for path in [
+            "/auth/login",
+            "/auth/callback",
+            "/health/live",
+            "/health/ready",
+        ] {
+            assert_eq!(
+                lan.clone()
+                    .oneshot(Request::get(path).body(Body::empty()).unwrap())
+                    .await
+                    .unwrap()
+                    .status(),
+                StatusCode::NOT_FOUND
+            );
+        }
+
+        let login = management
+            .clone()
+            .oneshot(
+                Request::get("/auth/login?return_to=%2Fframe%2Fauthenticated%2Fcurrent.jpg")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(login.status(), StatusCode::SEE_OTHER);
+        let initial_cookie = session_cookie(&login);
+        let set_cookie = login.headers()[header::SET_COOKIE].to_str().unwrap();
+        assert!(set_cookie.contains("HttpOnly"));
+        assert!(set_cookie.contains("SameSite=Lax"));
+        assert!(set_cookie.contains("Secure"));
+        assert!(set_cookie.contains("Max-Age=3600"));
+        let authorization_url =
+            url::Url::parse(login.headers()[header::LOCATION].to_str().unwrap()).unwrap();
+        let parameters = authorization_url
+            .query_pairs()
+            .into_owned()
+            .collect::<std::collections::HashMap<_, _>>();
+        assert_eq!(
+            parameters.get("code_challenge_method").map(String::as_str),
+            Some("S256")
+        );
+        let state_value = parameters["state"].clone();
+        let nonce = parameters["nonce"].clone();
+
+        let now = usize::try_from(Utc::now().timestamp()).unwrap();
+        let token = encode(
+            &Header {
+                alg: Algorithm::RS256,
+                kid: Some("paperframe-test".into()),
+                ..Header::default()
+            },
+            &TestIdTokenClaims {
+                iss: provider.uri(),
+                sub: "user-123".into(),
+                aud: "paperframe-test".into(),
+                exp: now + 300,
+                iat: now,
+                nonce: Some(nonce),
+            },
+            &EncodingKey::from_rsa_pem(include_bytes!("../tests/fixtures/oidc/test-private.pem"))
+                .unwrap(),
+        )
+        .unwrap();
+        Mock::given(method("POST"))
+            .and(path("/token"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "access_token": "not-retained",
+                "token_type": "Bearer",
+                "expires_in": 300,
+                "id_token": token
+            })))
+            .expect(1)
+            .mount(&provider)
+            .await;
+
+        let callback_uri = format!("/auth/callback?code=one-time-code&state={state_value}");
+        let callback = management
+            .clone()
+            .oneshot(
+                Request::get(&callback_uri)
+                    .header(header::COOKIE, &initial_cookie)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(callback.status(), StatusCode::SEE_OTHER);
+        assert_eq!(
+            callback.headers()[header::LOCATION],
+            "/frame/authenticated/current.jpg"
+        );
+        let authenticated_cookie = session_cookie(&callback);
+        assert_ne!(initial_cookie, authenticated_cookie);
+        let fixed_session = management
+            .clone()
+            .oneshot(
+                Request::get("/settings")
+                    .header(header::COOKIE, &initial_cookie)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(fixed_session.status(), StatusCode::SEE_OTHER);
+
+        let before = state.queue.snapshot().await;
+        let image = management
+            .clone()
+            .oneshot(
+                Request::get("/frame/authenticated/current.jpg")
+                    .header(header::COOKIE, &authenticated_cookie)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(image.status(), StatusCode::OK);
+        assert_eq!(image.headers()[header::CACHE_CONTROL], "private, no-cache");
+        let last_modified = image.headers()[header::LAST_MODIFIED].clone();
+        let conditional = management
+            .clone()
+            .oneshot(
+                Request::get("/frame/authenticated/current.bmp")
+                    .header(header::COOKIE, &authenticated_cookie)
+                    .header(header::IF_MODIFIED_SINCE, last_modified)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(conditional.status(), StatusCode::NOT_MODIFIED);
+        let head = management
+            .clone()
+            .oneshot(
+                Request::head("/frame/authenticated/current.jpg")
+                    .header(header::COOKIE, &authenticated_cookie)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(head.status(), StatusCode::OK);
+        assert!(bytes(head).await.is_empty());
+        assert_eq!(
+            state.queue.snapshot().await.entries[0].id,
+            before.entries[0].id
+        );
+        assert!(state.image_requests().await.is_empty());
+        let manifest = management
+            .clone()
+            .oneshot(
+                Request::get("/manifest.webmanifest")
+                    .header(header::COOKIE, &authenticated_cookie)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(manifest.status(), StatusCode::OK);
+        let thumbnail = management
+            .clone()
+            .oneshot(
+                Request::get(format!("/queue/thumbnail/{}", before.entries[0].id))
+                    .header(header::COOKIE, &authenticated_cookie)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(thumbnail.status(), StatusCode::OK);
+
+        let replay = management
+            .clone()
+            .oneshot(
+                Request::get(&callback_uri)
+                    .header(header::COOKIE, &authenticated_cookie)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(replay.status(), StatusCode::UNAUTHORIZED);
+
+        let settings = management
+            .clone()
+            .oneshot(
+                Request::get("/settings")
+                    .header(header::COOKIE, &authenticated_cookie)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(settings.status(), StatusCode::OK);
+        let html = String::from_utf8(bytes(settings).await).unwrap();
+        let csrf = html
+            .split("name=\"csrf_token\" value=\"")
+            .nth(1)
+            .and_then(|value| value.split('"').next())
+            .unwrap();
+        let queue_before_action = state.queue.snapshot().await;
+        let action = serde_urlencoded::to_string([
+            ("csrf_token", csrf.to_owned()),
+            (
+                "queue_generation",
+                queue_before_action.generation.to_string(),
+            ),
+        ])
+        .unwrap();
+        let advance = management
+            .clone()
+            .oneshot(
+                Request::post("/queue/advance")
+                    .header(header::COOKIE, &authenticated_cookie)
+                    .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
+                    .body(Body::from(action))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(advance.status(), StatusCode::SEE_OTHER);
+        assert_ne!(
+            state.queue.snapshot().await.entries[0].id,
+            queue_before_action.entries[0].id
+        );
+
+        let logout = management
+            .clone()
+            .oneshot(
+                Request::post("/auth/logout")
+                    .header(header::COOKIE, &authenticated_cookie)
+                    .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
+                    .body(Body::from(
+                        serde_urlencoded::to_string([("csrf_token", csrf)]).unwrap(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(logout.status(), StatusCode::SEE_OTHER);
+        let after_logout = management
+            .clone()
+            .oneshot(
+                Request::get("/settings")
+                    .header(header::COOKIE, &authenticated_cookie)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(after_logout.status(), StatusCode::SEE_OTHER);
+
+        let lan_image = lan
+            .oneshot(frame_request("HEAD", [127, 0, 0, 1]))
+            .await
+            .unwrap();
+        assert_eq!(lan_image.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn split_routers_are_isolated_over_real_tcp_listeners() {
+        let provider = MockServer::start().await;
+        mount_oidc_metadata(&provider).await;
+        let authentication = AuthenticationConfig {
+            issuer: provider.uri(),
+            client_id: "paperframe-test".into(),
+            client_secret_env: "UNUSED_IN_TEST".into(),
+            public_url: "https://paperframe.test".into(),
+            session_idle_minutes: 60,
+            session_max_hours: 12,
+            allow_insecure_http: true,
+        };
+        let auth_service = AuthService::discover_with_secret(&authentication, "test-secret".into())
+            .await
+            .unwrap();
+        let (_directory, state) =
+            manual_state_with_auth(AdvancementSettings::Manual, authentication).await;
+        let management_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let management_address = management_listener.local_addr().unwrap();
+        let lan_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let lan_address = lan_listener.local_addr().unwrap();
+        let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+        let management_state = state.clone();
+        let management_shutdown = shutdown_rx.clone();
+        let management_task = tokio::spawn(async move {
+            axum::serve(
+                management_listener,
+                management_router(management_state, auth_service)
+                    .into_make_service_with_connect_info::<SocketAddr>(),
+            )
+            .with_graceful_shutdown(crate::shutdown_requested(management_shutdown))
+            .await
+        });
+        let lan_task = tokio::spawn(async move {
+            axum::serve(
+                lan_listener,
+                lan_frame_router(state).into_make_service_with_connect_info::<SocketAddr>(),
+            )
+            .with_graceful_shutdown(crate::shutdown_requested(shutdown_rx))
+            .await
+        });
+        let client = reqwest::Client::builder()
+            .redirect(reqwest::redirect::Policy::none())
+            .build()
+            .unwrap();
+
+        assert_eq!(
+            client
+                .get(format!("http://{management_address}/settings"))
+                .send()
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::SEE_OTHER
+        );
+        assert_eq!(
+            client
+                .get(format!("http://{management_address}/frame/current.jpg"))
+                .send()
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::NOT_FOUND
+        );
+        assert_eq!(
+            client
+                .get(format!("http://{lan_address}/frame/current.jpg"))
+                .send()
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::OK
+        );
+        for path in ["settings", "auth/login", "health/live"] {
+            assert_eq!(
+                client
+                    .get(format!("http://{lan_address}/{path}"))
+                    .send()
+                    .await
+                    .unwrap()
+                    .status(),
+                StatusCode::NOT_FOUND
+            );
+        }
+        shutdown_tx.send(true).unwrap();
+        timeout(TokioDuration::from_secs(1), management_task)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        timeout(TokioDuration::from_secs(1), lan_task)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+    }
+
+    async fn invalid_id_token_status(case: &str) -> StatusCode {
+        let provider = MockServer::start().await;
+        mount_oidc_metadata(&provider).await;
+        let authentication = AuthenticationConfig {
+            issuer: provider.uri(),
+            client_id: "paperframe-test".into(),
+            client_secret_env: "UNUSED_IN_TEST".into(),
+            public_url: "https://paperframe.test".into(),
+            session_idle_minutes: 60,
+            session_max_hours: 12,
+            allow_insecure_http: true,
+        };
+        let auth_service = AuthService::discover_with_secret(&authentication, "test-secret".into())
+            .await
+            .unwrap();
+        let (_directory, state) =
+            manual_state_with_auth(AdvancementSettings::Manual, authentication).await;
+        let app = management_router(state, auth_service);
+        let login = app
+            .clone()
+            .oneshot(Request::get("/auth/login").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        let cookie = session_cookie(&login);
+        let authorization_url =
+            url::Url::parse(login.headers()[header::LOCATION].to_str().unwrap()).unwrap();
+        let parameters = authorization_url
+            .query_pairs()
+            .into_owned()
+            .collect::<std::collections::HashMap<_, _>>();
+        let now = usize::try_from(Utc::now().timestamp()).unwrap();
+        let mut claims = TestIdTokenClaims {
+            iss: provider.uri(),
+            sub: "user-123".into(),
+            aud: "paperframe-test".into(),
+            exp: now + 300,
+            iat: now,
+            nonce: Some(parameters["nonce"].clone()),
+        };
+        match case {
+            "nonce" => claims.nonce = Some("wrong-nonce".into()),
+            "missing_nonce" => claims.nonce = None,
+            "issuer" => claims.iss = "https://wrong-issuer.example".into(),
+            "audience" => claims.aud = "another-client".into(),
+            "expired" => {
+                claims.iat = now - 600;
+                claims.exp = now - 300;
+            }
+            "signature" => {}
+            _ => panic!("unknown invalid token case"),
+        }
+        let mut token = encode(
+            &Header {
+                alg: Algorithm::RS256,
+                kid: Some("paperframe-test".into()),
+                ..Header::default()
+            },
+            &claims,
+            &EncodingKey::from_rsa_pem(include_bytes!("../tests/fixtures/oidc/test-private.pem"))
+                .unwrap(),
+        )
+        .unwrap();
+        if case == "signature" {
+            let signature_start = token.rfind('.').unwrap() + 1;
+            let first = token.as_bytes()[signature_start];
+            token.replace_range(
+                signature_start..signature_start + 1,
+                if first == b'A' { "B" } else { "A" },
+            );
+        }
+        Mock::given(method("POST"))
+            .and(path("/token"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "access_token": "not-retained",
+                "token_type": "Bearer",
+                "expires_in": 300,
+                "id_token": token
+            })))
+            .mount(&provider)
+            .await;
+        let callback_uri = format!("/auth/callback?code=test&state={}", parameters["state"]);
+        app.oneshot(
+            Request::get(&callback_uri)
+                .header(header::COOKIE, cookie)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap()
+        .status()
+    }
+
+    #[tokio::test]
+    async fn oidc_rejects_invalid_nonce_issuer_audience_expiry_and_signature() {
+        for case in [
+            "nonce",
+            "missing_nonce",
+            "issuer",
+            "audience",
+            "expired",
+            "signature",
+        ] {
+            assert_eq!(
+                invalid_id_token_status(case).await,
+                StatusCode::UNAUTHORIZED,
+                "{case}"
+            );
+        }
+    }
+
+    #[test]
+    fn request_tracing_never_records_query_strings_or_headers() {
+        let request = Request::get("/auth/callback?code=secret&state=secret")
+            .header(header::AUTHORIZATION, "Bearer secret")
+            .body(())
+            .unwrap();
+        let span = SafeMakeSpan { listener: "test" }.make_span(&request);
+        let fields = span.metadata().unwrap().fields();
+        assert!(fields.field("listener").is_some());
+        assert!(fields.field("method").is_some());
+        assert!(fields.field("path").is_some());
+        assert!(fields.field("uri").is_none());
+        assert!(fields.field("headers").is_none());
+    }
+
+    #[tokio::test]
+    async fn loopback_http_development_cookie_is_explicitly_non_secure() {
+        let provider = MockServer::start().await;
+        mount_oidc_metadata(&provider).await;
+        let authentication = AuthenticationConfig {
+            issuer: provider.uri(),
+            client_id: "paperframe-test".into(),
+            client_secret_env: "UNUSED_IN_TEST".into(),
+            public_url: "http://127.0.0.1:3000".into(),
+            session_idle_minutes: 60,
+            session_max_hours: 12,
+            allow_insecure_http: true,
+        };
+        let auth_service = AuthService::discover_with_secret(&authentication, "test-secret".into())
+            .await
+            .unwrap();
+        let (_directory, state) =
+            manual_state_with_auth(AdvancementSettings::Manual, authentication).await;
+        let login = management_router(state, auth_service)
+            .oneshot(Request::get("/auth/login").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        let cookie = login.headers()[header::SET_COOKIE].to_str().unwrap();
+        assert!(cookie.contains("HttpOnly"));
+        assert!(!cookie.contains("; Secure"));
+    }
+
+    #[tokio::test]
+    async fn oidc_backend_discovery_refuses_redirects() {
+        let provider = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/.well-known/openid-configuration"))
+            .respond_with(
+                ResponseTemplate::new(302).insert_header("Location", "http://127.0.0.1:1/internal"),
+            )
+            .mount(&provider)
+            .await;
+        let authentication = AuthenticationConfig {
+            issuer: provider.uri(),
+            client_id: "paperframe-test".into(),
+            client_secret_env: "UNUSED_IN_TEST".into(),
+            public_url: "https://paperframe.test".into(),
+            session_idle_minutes: 60,
+            session_max_hours: 12,
+            allow_insecure_http: true,
+        };
+        assert!(
+            AuthService::discover_with_secret(&authentication, "test-secret".into())
+                .await
+                .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn oidc_state_is_required_correct_and_single_use() {
+        let provider = MockServer::start().await;
+        mount_oidc_metadata(&provider).await;
+        let authentication = AuthenticationConfig {
+            issuer: provider.uri(),
+            client_id: "paperframe-test".into(),
+            client_secret_env: "UNUSED_IN_TEST".into(),
+            public_url: "https://paperframe.test".into(),
+            session_idle_minutes: 60,
+            session_max_hours: 12,
+            allow_insecure_http: true,
+        };
+        let auth_service = AuthService::discover_with_secret(&authentication, "test-secret".into())
+            .await
+            .unwrap();
+        let (_directory, state) =
+            manual_state_with_auth(AdvancementSettings::Manual, authentication).await;
+        let app = management_router(state, auth_service);
+        let missing_login = app
+            .clone()
+            .oneshot(Request::get("/auth/login").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        let missing_cookie = session_cookie(&missing_login);
+        let missing = app
+            .clone()
+            .oneshot(
+                Request::get("/auth/callback?code=test")
+                    .header(header::COOKIE, missing_cookie)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(missing.status(), StatusCode::BAD_REQUEST);
+
+        let login = app
+            .clone()
+            .oneshot(Request::get("/auth/login").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        let cookie = session_cookie(&login);
+        let wrong = app
+            .clone()
+            .oneshot(
+                Request::get("/auth/callback?code=test&state=wrong")
+                    .header(header::COOKIE, &cookie)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(wrong.status(), StatusCode::UNAUTHORIZED);
+        let replay = app
+            .oneshot(
+                Request::get("/auth/callback?code=test&state=wrong")
+                    .header(header::COOKIE, cookie)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(replay.status(), StatusCode::UNAUTHORIZED);
     }
 
     #[tokio::test]

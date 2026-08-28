@@ -14,16 +14,23 @@ chrono-tz = "0.10"
 futures-util = "0.3"
 httpdate = "1.0"
 image = { version = "=0.25.6", default-features = false, features = ["bmp", "dds", "exr", "ff", "gif", "hdr", "ico", "jpeg", "png", "pnm", "qoi", "tga", "tiff", "webp"] }
+openidconnect = "4.0.1"
 rand = "0.9"
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 rusqlite = { version = "0.37", features = ["bundled"] }
 serde = { version = "1.0", features = ["derive"] }
 sha2 = "0.10"
 sqlparser = "0.59"
+subtle = "2.6.1"
+time = "0.3"
 tokio = { version = "1.0", features = ["fs", "io-util", "macros", "net", "rt-multi-thread", "signal", "sync", "time"] }
 toml = "0.9"
+tower = { version = "0.5", features = ["util"] }
 tower-http = { version = "0.6", features = ["limit", "trace"] }
+tower-sessions = "0.15.0"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+url = "2.5.4"
 
 [dev-dependencies]
 base64 = "0.22"
@@ -31,4 +38,5 @@ http-body-util = "0.1"
 serde_urlencoded = "0.7"
 serde_json = "1.0"
 tempfile = "3.0"
-tower = { version = "0.5", features = ["util"] }
+jsonwebtoken = "9.3"
+wiremock = "0.6"

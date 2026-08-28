@@ -24,10 +24,37 @@ const DEFAULT_UPLOAD_BYTES: u64 = 25 * 1024 * 1024;
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct Config {
-    pub bind: SocketAddr,
+    #[serde(alias = "bind")]
+    pub management_bind: SocketAddr,
+    #[serde(default)]
+    pub lan_frame_bind: Option<SocketAddr>,
     pub settings_path: PathBuf,
     #[serde(alias = "cache_dir")]
     pub queue_dir: PathBuf,
+    pub authentication: AuthenticationConfig,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct AuthenticationConfig {
+    pub issuer: String,
+    pub client_id: String,
+    pub client_secret_env: String,
+    pub public_url: String,
+    #[serde(default = "default_session_idle_minutes")]
+    pub session_idle_minutes: u64,
+    #[serde(default = "default_session_max_hours")]
+    pub session_max_hours: u64,
+    #[serde(default)]
+    pub allow_insecure_http: bool,
+}
+
+fn default_session_idle_minutes() -> u64 {
+    60
+}
+
+fn default_session_max_hours() -> u64 {
+    12
 }
 
 impl Config {
@@ -44,13 +71,108 @@ impl Config {
                 path.display()
             )
         })?;
-        if config.settings_path.as_os_str().is_empty() {
+        config.validate()?;
+        Ok(config)
+    }
+
+    pub fn validate(&self) -> Result<()> {
+        if self.settings_path.as_os_str().is_empty() {
             bail!("settings_path must not be empty");
         }
-        if config.queue_dir.as_os_str().is_empty() {
+        if self.queue_dir.as_os_str().is_empty() {
             bail!("queue_dir must not be empty");
         }
-        Ok(config)
+        if self.lan_frame_bind == Some(self.management_bind) {
+            bail!("lan_frame_bind must differ from management_bind");
+        }
+        self.authentication.validate()
+    }
+}
+
+impl AuthenticationConfig {
+    pub fn validate(&self) -> Result<()> {
+        if self.client_id.trim().is_empty() {
+            bail!("authentication.client_id must not be empty");
+        }
+        if self.client_secret_env.trim().is_empty() {
+            bail!("authentication.client_secret_env must not be empty");
+        }
+        if self.session_idle_minutes == 0 || self.session_idle_minutes > 24 * 60 {
+            bail!("authentication.session_idle_minutes must be between 1 and 1440");
+        }
+        if self.session_max_hours == 0 || self.session_max_hours > 24 * 30 {
+            bail!("authentication.session_max_hours must be between 1 and 720");
+        }
+        if self.session_idle_minutes > self.session_max_hours.saturating_mul(60) {
+            bail!("authentication session idle lifetime must not exceed its absolute lifetime");
+        }
+        let issuer = validate_auth_url(
+            "authentication.issuer",
+            &self.issuer,
+            self.allow_insecure_http,
+        )?;
+        let public = validate_auth_url(
+            "authentication.public_url",
+            &self.public_url,
+            self.allow_insecure_http,
+        )?;
+        if issuer.query().is_some() || issuer.fragment().is_some() {
+            bail!("authentication.issuer must not contain a query or fragment");
+        }
+        if public.path() != "/" || public.query().is_some() || public.fragment().is_some() {
+            bail!("authentication.public_url must be an origin without a path, query, or fragment");
+        }
+        Ok(())
+    }
+
+    pub fn callback_url(&self) -> Result<String> {
+        self.validate()?;
+        Ok(format!(
+            "{}/auth/callback",
+            self.public_url.trim_end_matches('/')
+        ))
+    }
+
+    pub fn client_secret(&self) -> Result<String> {
+        let value = std::env::var(&self.client_secret_env).with_context(|| {
+            format!(
+                "authentication client secret environment variable {} is not set",
+                self.client_secret_env
+            )
+        })?;
+        if value.is_empty() {
+            bail!(
+                "authentication client secret environment variable {} is empty",
+                self.client_secret_env
+            );
+        }
+        Ok(value)
+    }
+}
+
+fn validate_auth_url(name: &str, value: &str, allow_insecure: bool) -> Result<url::Url> {
+    let parsed = url::Url::parse(value).with_context(|| format!("{name} must be a valid URL"))?;
+    if parsed.username() != "" || parsed.password().is_some() {
+        bail!("{name} must not contain credentials");
+    }
+    match parsed.scheme() {
+        "https" => {}
+        "http" if allow_insecure && is_loopback_url(&parsed) => {}
+        "http" if allow_insecure => bail!("{name} may use insecure HTTP only on loopback"),
+        "http" => {
+            bail!("{name} must use HTTPS (or explicitly enable loopback HTTP for development)")
+        }
+        _ => bail!("{name} must use HTTPS"),
+    }
+    Ok(parsed)
+}
+
+fn is_loopback_url(url: &url::Url) -> bool {
+    match url.host() {
+        Some(url::Host::Domain(name)) => name.eq_ignore_ascii_case("localhost"),
+        Some(url::Host::Ipv4(address)) => address.is_loopback(),
+        Some(url::Host::Ipv6(address)) => address.is_loopback(),
+        None => false,
     }
 }
 
@@ -621,10 +743,94 @@ mod tests {
         }
     }
 
+    const AUTH: &str = "\n[authentication]\nissuer='https://auth.example.com'\nclient_id='paperframe'\nclient_secret_env='PAPERFRAME_OIDC_SECRET'\npublic_url='https://frame.example.com'\n";
+
     #[test]
-    fn bootstrap_accepts_legacy_cache_dir() {
-        let config: Config =
-            toml::from_str("bind='127.0.0.1:1'\nsettings_path='s'\ncache_dir='q'\n").unwrap();
+    fn documented_bootstrap_examples_parse_and_validate() {
+        for example in [
+            include_str!("../config.example.toml"),
+            include_str!("../docker/config.toml"),
+        ] {
+            let config: Config = toml::from_str(example).unwrap();
+            config.validate().unwrap();
+        }
+    }
+
+    #[test]
+    fn bootstrap_accepts_legacy_bind_and_cache_names() {
+        let config: Config = toml::from_str(&format!(
+            "bind='127.0.0.1:1'\nsettings_path='s'\ncache_dir='q'\n{AUTH}"
+        ))
+        .unwrap();
+        config.validate().unwrap();
+        assert_eq!(config.management_bind, "127.0.0.1:1".parse().unwrap());
         assert_eq!(config.queue_dir, PathBuf::from("q"));
+    }
+
+    #[test]
+    fn bootstrap_security_validation_fails_closed() {
+        let base =
+            format!("management_bind='127.0.0.1:1'\nsettings_path='s'\nqueue_dir='q'\n{AUTH}");
+        let valid: Config = toml::from_str(&base).unwrap();
+        valid.validate().unwrap();
+        assert_eq!(
+            valid.authentication.callback_url().unwrap(),
+            "https://frame.example.com/auth/callback"
+        );
+
+        let collision: Config = toml::from_str(&base.replace(
+            "settings_path='s'",
+            "lan_frame_bind='127.0.0.1:1'\nsettings_path='s'",
+        ))
+        .unwrap();
+        assert!(
+            collision
+                .validate()
+                .unwrap_err()
+                .to_string()
+                .contains("differ")
+        );
+
+        for bad in [
+            base.replace("https://auth.example.com", "http://auth.example.com"),
+            base.replace(
+                "https://frame.example.com",
+                "https://frame.example.com/path",
+            ),
+            base.replace("client_id='paperframe'", "client_id=' '"),
+            base.replace(
+                "client_secret_env='PAPERFRAME_OIDC_SECRET'",
+                "client_secret_env=' '",
+            ),
+        ] {
+            let config: Config = toml::from_str(&bad).unwrap();
+            assert!(config.validate().is_err());
+        }
+    }
+
+    #[test]
+    fn missing_client_secret_fails_with_only_the_environment_name() {
+        let config = AuthenticationConfig {
+            issuer: "https://auth.example.com".into(),
+            client_id: "paperframe".into(),
+            client_secret_env: "PAPERFRAME_TEST_DEFINITELY_MISSING_SECRET".into(),
+            public_url: "https://frame.example.com".into(),
+            session_idle_minutes: 60,
+            session_max_hours: 12,
+            allow_insecure_http: false,
+        };
+        let error = config.client_secret().unwrap_err().to_string();
+        assert!(error.contains("PAPERFRAME_TEST_DEFINITELY_MISSING_SECRET"));
+        assert!(!error.contains("client-secret-value"));
+    }
+
+    #[test]
+    fn insecure_http_is_explicitly_loopback_only() {
+        let loopback = "management_bind='127.0.0.1:1'\nsettings_path='s'\nqueue_dir='q'\n[authentication]\nissuer='http://127.0.0.1:3001'\nclient_id='test'\nclient_secret_env='TEST_SECRET'\npublic_url='http://localhost:3000'\nallow_insecure_http=true\n";
+        let valid: Config = toml::from_str(loopback).unwrap();
+        valid.validate().unwrap();
+        let invalid: Config =
+            toml::from_str(&loopback.replace("127.0.0.1", "192.168.1.2")).unwrap();
+        assert!(invalid.validate().is_err());
     }
 }

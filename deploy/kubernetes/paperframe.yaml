@@ -3,6 +3,8 @@
 # 2. Make a read-only PVC named digikam-library available, or replace that
 #    volume with storage appropriate for your cluster.
 # 3. Adjust database_root below to exactly match DigiKam's AlbumRoots path.
+# 4. Create Secret paperframe-oidc with key client-secret; never put the raw
+#    OIDC client secret in this ConfigMap.
 apiVersion: v1
 kind: ConfigMap
 metadata:
@@ -12,9 +14,18 @@ metadata:
     app.kubernetes.io/component: server
 data:
   config.toml: |
-    bind = "0.0.0.0:8080"
+    management_bind = "0.0.0.0:8080"
+    lan_frame_bind = "0.0.0.0:8081"
     settings_path = "/data/settings.toml"
     queue_dir = "/data/queue"
+
+    [authentication]
+    issuer = "https://auth.example.com"
+    client_id = "paperframe"
+    client_secret_env = "PAPERFRAME_OIDC_CLIENT_SECRET"
+    public_url = "https://paperframe.example.com"
+    session_idle_minutes = 60
+    session_max_hours = 12
   settings.toml: |
     [queue]
     target_length = 10
@@ -129,9 +140,18 @@ spec:
           image: ghcr.io/YOUR_USER/paperframe-server:latest
           imagePullPolicy: IfNotPresent
           ports:
-            - name: http
+            - name: management
               containerPort: 8080
               protocol: TCP
+            - name: lan-frame
+              containerPort: 8081
+              protocol: TCP
+          env:
+            - name: PAPERFRAME_OIDC_CLIENT_SECRET
+              valueFrom:
+                secretKeyRef:
+                  name: paperframe-oidc
+                  key: client-secret
           securityContext:
             allowPrivilegeEscalation: false
             readOnlyRootFilesystem: true
@@ -147,19 +167,19 @@ spec:
           startupProbe:
             httpGet:
               path: /health/live
-              port: http
+              port: management
             periodSeconds: 2
             failureThreshold: 30
           livenessProbe:
             httpGet:
               path: /health/live
-              port: http
+              port: management
             periodSeconds: 30
             timeoutSeconds: 3
           readinessProbe:
             httpGet:
               path: /health/ready
-              port: http
+              port: management
             periodSeconds: 10
             timeoutSeconds: 3
             failureThreshold: 6
@@ -201,7 +221,28 @@ spec:
     app.kubernetes.io/name: paperframe
     app.kubernetes.io/component: server
   ports:
-    - name: http
+    - name: management
       port: 8080
-      targetPort: http
+      targetPort: management
+      protocol: TCP
+---
+# This remains ClusterIP by default. Publish it only through a LAN-restricted
+# LoadBalancer/NodePort or equivalent private network path; never via the
+# public management Ingress.
+apiVersion: v1
+kind: Service
+metadata:
+  name: paperframe-lan
+  labels:
+    app.kubernetes.io/name: paperframe
+    app.kubernetes.io/component: lan-frame
+spec:
+  type: ClusterIP
+  selector:
+    app.kubernetes.io/name: paperframe
+    app.kubernetes.io/component: server
+  ports:
+    - name: frame
+      port: 8081
+      targetPort: lan-frame
       protocol: TCP
