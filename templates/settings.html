@@ -100,6 +100,7 @@ textarea.code{min-height:210px;font:12px/1.5 ui-monospace,SFMono-Regular,Consola
     <span class="brand-text"><strong>Paper Frame</strong><span>Your photos, beautifully displayed</span></span>
   </a>
   <div class="connection{% if !ready %} offline{% endif %}"><span class="connection-dot"></span>{% if ready %}Frame ready{% else %}Needs attention{% endif %}</div>
+  <form method="post" action="/auth/logout"><input type="hidden" name="csrf_token" value="{{ csrf_token }}"><button class="btn btn-quiet" type="submit">Log out</button></form>
 </header>
 
 {% match error %}{% when Some with (message) %}
@@ -116,7 +117,7 @@ textarea.code{min-height:210px;font:12px/1.5 ui-monospace,SFMono-Regular,Consola
         <input type="hidden" name="csrf_token" value="{{ csrf_token }}"><input type="hidden" name="queue_generation" value="{{ queue_generation }}">
         <button class="btn btn-primary" type="submit"{% if entries.is_empty() %} disabled{% endif %}><svg viewBox="0 0 24 24" fill="none" stroke="currentColor"><path d="m6 4 10 8L6 20V4Z"/><path d="M19 5v14"/></svg>Show next photo</button>
       </form>
-      {% if !entries.is_empty() %}<a class="btn btn-secondary" href="/frame/current.jpg" target="_blank"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor"><path d="M2.5 12s3.5-6 9.5-6 9.5 6 9.5 6-3.5 6-9.5 6-9.5-6-9.5-6Z"/><circle cx="12" cy="12" r="2.5"/></svg>View frame</a>{% endif %}
+      {% if !entries.is_empty() %}<a class="btn btn-secondary" href="/frame/authenticated/current.jpg" target="_blank"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor"><path d="M2.5 12s3.5-6 9.5-6 9.5 6 9.5 6-3.5 6-9.5 6-9.5-6-9.5-6Z"/><circle cx="12" cy="12" r="2.5"/></svg>View frame</a>{% endif %}
       <button class="btn btn-secondary" id="install-app" type="button" hidden><svg viewBox="0 0 24 24" fill="none" stroke="currentColor"><path d="M12 3v12m0 0 4-4m-4 4-4-4"/><path d="M5 19h14"/></svg>Install app</button>
     </div>
   </div>

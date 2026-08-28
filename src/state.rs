@@ -37,7 +37,6 @@ pub struct AppState {
     pub frame_serialization: Arc<Mutex<()>>,
     pub render_serialization: Arc<Semaphore>,
     pub rendering_transition: RwLock<()>,
-    csrf_token: String,
 }
 
 impl AppState {
@@ -95,7 +94,6 @@ impl AppState {
             frame_serialization: Arc::new(Mutex::new(())),
             render_serialization: Arc::new(Semaphore::new(1)),
             rendering_transition: RwLock::new(()),
-            csrf_token: random_token(),
         }))
     }
 
@@ -114,8 +112,9 @@ impl AppState {
         self.registry.read().await.clone()
     }
 
+    #[cfg(test)]
     pub fn csrf_token(&self) -> &str {
-        &self.csrf_token
+        "paperframe-test-csrf"
     }
     pub fn trigger_runtime(&self) {
         self.runtime_trigger
@@ -193,11 +192,4 @@ fn check_source_separation(queue: &std::path::Path, configured: &std::path::Path
         bail!("supplier source and queue root must be separate");
     }
     Ok(())
-}
-
-fn random_token() -> String {
-    rand::random::<[u8; 32]>()
-        .iter()
-        .map(|byte| format!("{byte:02x}"))
-        .collect()
 }
