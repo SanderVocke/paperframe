@@ -1,5 +1,20 @@
-# Process settings. Changes require a restart.
+# Process configuration. Changes require a restart.
 # Relative paths are resolved from the directory where the server is started.
-bind = "0.0.0.0:8080"
+management_bind = "0.0.0.0:8080"
+# Bind this to a LAN-only interface, and enforce the boundary with the host
+# firewall. Omit it to disable the unauthenticated device endpoint.
+lan_frame_bind = "192.168.1.20:8081"
 settings_path = "data/settings.toml"
 queue_dir = "data/queue"
+
+[authentication]
+# The configured OIDC issuer, not its discovery-document URL.
+issuer = "https://auth.example.com"
+client_id = "paperframe"
+# The raw client secret is read at startup from this environment variable.
+client_secret_env = "PAPERFRAME_OIDC_CLIENT_SECRET"
+# Exact externally visible HTTPS origin. The callback is
+# https://paperframe.example.com/auth/callback.
+public_url = "https://paperframe.example.com"
+session_idle_minutes = 60
+session_max_hours = 12

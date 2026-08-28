@@ -6,13 +6,15 @@ The repository includes a production multi-stage [`Dockerfile`](../Dockerfile), 
 
 The image:
 
-- listens on port `8080`;
+- listens on authenticated management port `8080` and LAN frame port `8081` with the bundled example configuration;
 - runs as the non-root user and group `10001:10001`;
 - stores writable settings, queue state, immutable sources, and rendered BMP/JPEG derivatives under `/data`;
 - reads bootstrap configuration from `/config/config.toml`;
 - expects a manual photo folder at `/photos` with the default settings;
 - handles `SIGTERM` for graceful shutdown; and
-- reports process health at `/health/live` and frame readiness at `/health/ready`.
+- reports process health at `/health/live` and frame readiness at `/health/ready` on the management listener.
+
+Paper Frame performs OIDC login but does not terminate TLS. Put port `8080` behind an HTTPS reverse proxy. Port `8081` serves only `/frame/current.jpg` and `/frame/current.bmp` without authentication; bind/publish it only on the LAN and enforce that boundary with the host firewall or network policy. Docker `EXPOSE` is not a security boundary.
 
 On the first start of a new `/data` volume, the entrypoint creates `/data/settings.toml` from the bundled manual-folder defaults. It never overwrites an existing settings file. Changes made in the web app are therefore retained when `/data` is persistent.
 
@@ -28,9 +30,13 @@ Build the image from the repository root:
 docker build --pull -t paperframe-server:local .
 ```
 
-Run it with a normal photo folder:
+Prepare the bootstrap config, register the exact callback URI from its `public_url` with Authelia, and provide the raw client secret through the configured environment variable:
 
 ```sh
+mkdir -p runtime
+cp docker/config.toml runtime/config.toml
+# Edit issuer, client_id, public_url, and the host/LAN publication below.
+export PAPERFRAME_OIDC_CLIENT_SECRET='replace-with-the-raw-client-secret'
 docker volume create paperframe-data
 
 docker run -d \
@@ -38,13 +44,16 @@ docker run -d \
   --restart unless-stopped \
   --read-only \
   --tmpfs /tmp:rw,noexec,nosuid,size=268435456 \
-  -p 8080:8080 \
+  -e PAPERFRAME_OIDC_CLIENT_SECRET \
+  -p 127.0.0.1:8080:8080 \
+  -p 192.168.1.20:8081:8081 \
+  -v "$PWD/runtime/config.toml:/config/config.toml:ro" \
   -v paperframe-data:/data \
   -v /absolute/path/to/photos:/photos:ro \
   paperframe-server:local
 ```
 
-Open `http://DOCKER_HOST:8080/`. The default policy is manual, so browser testing does not unexpectedly advance the frame.
+Point the HTTPS reverse proxy at `127.0.0.1:8080`, open the configured public URL, and point the frame at `http://192.168.1.20:8081/frame/current.jpg`. Replace `192.168.1.20` with a host LAN address; never use `0.0.0.0` as a Docker publication address when public interfaces may also be present.
 
 The named `paperframe-data` volume contains both the queue and the settings changed through the web app. Back up the entire volume together and do not mount it into more than one running container.
 
@@ -58,7 +67,10 @@ docker run -d \
   --restart unless-stopped \
   --read-only \
   --tmpfs /tmp:rw,noexec,nosuid,size=268435456 \
-  -p 8080:8080 \
+  -e PAPERFRAME_OIDC_CLIENT_SECRET \
+  -p 127.0.0.1:8080:8080 \
+  -p 192.168.1.20:8081:8081 \
+  -v "$PWD/runtime/config.toml:/config/config.toml:ro" \
   -v paperframe-data:/data \
   -v /mnt/data/digikam:/library:ro \
   paperframe-server:local
@@ -79,9 +91,13 @@ cp settings.example.toml runtime/settings.toml
 # Edit paths so they refer to container paths such as /library/...
 sudo chown -R 10001:10001 runtime
 
-docker run --rm -p 8080:8080 \
+docker run --rm \
   --read-only \
+  -e PAPERFRAME_OIDC_CLIENT_SECRET \
+  -p 127.0.0.1:8080:8080 \
+  -p 192.168.1.20:8081:8081 \
   --tmpfs /tmp:rw,noexec,nosuid,size=268435456 \
+  -v "$PWD/runtime/config.toml:/config/config.toml:ro" \
   -v "$PWD/runtime:/data" \
   -v /mnt/data/digikam:/library:ro \
   paperframe-server:local
@@ -124,11 +140,16 @@ Use immutable version tags or image digests in Kubernetes for repeatable deploym
 - an init container that seeds settings only when the data claim is new;
 - non-root, read-only-root-filesystem security settings;
 - startup, liveness, and readiness probes; and
-- a ClusterIP Service on port `8080`.
+- separate ClusterIP Services for authenticated management port `8080` and LAN frame port `8081`.
 
-### 1. Prepare the image and library storage
+### 1. Prepare the image, OIDC secret, and library storage
 
-Replace both `ghcr.io/YOUR_USER/paperframe-server:latest` values in the manifest with your published image tag.
+Replace both `ghcr.io/YOUR_USER/paperframe-server:latest` values in the manifest with your published image tag. Edit the ConfigMap's OIDC issuer, client ID, and public URL, register its exact `/auth/callback` URI with Authelia, then create the referenced Secret without committing it:
+
+```sh
+kubectl create secret generic paperframe-oidc \
+  --from-literal=client-secret='replace-with-the-raw-client-secret'
+```
 
 The example expects a PVC named `digikam-library` whose root has this shape:
 
@@ -175,15 +196,16 @@ kubectl get pods,service,pvc -l app.kubernetes.io/name=paperframe
 kubectl logs deployment/paperframe
 ```
 
-For an initial local check:
+For an initial unauthenticated health check:
 
 ```sh
 kubectl port-forward service/paperframe 8080:8080
+curl --fail http://127.0.0.1:8080/health/live
 ```
 
-Then open `http://127.0.0.1:8080/`.
+A complete browser login must use the HTTPS origin configured as `public_url`; a plain HTTP port-forward cannot carry the production `Secure` session cookie.
 
-`/health/ready` returns `503` while no image is available, so the Service may temporarily have no ready endpoints during initial import or a source error. If needed, port-forward directly to the pod to inspect the control page:
+`/health/ready` returns `503` while no image is available, so the Service may temporarily have no ready endpoints during initial import or a source error. If needed, port-forward directly to the pod for health diagnostics (use the configured HTTPS origin for the control page):
 
 ```sh
 kubectl port-forward pod/$(kubectl get pod \
@@ -191,15 +213,17 @@ kubectl port-forward pod/$(kubectl get pod \
   -o jsonpath='{.items[0].metadata.name}') 8080:8080
 ```
 
-### 4. Expose it on the home network
+### 4. Expose management and frame access separately
 
-Keep the supplied ClusterIP Service when using an Ingress or Gateway. Point the frame at:
+Route only the `paperframe` management Service through an HTTPS Ingress or Gateway. OIDC is enforced by Paper Frame itself; do not add a proxy bypass for management or private-media paths. The proxy must not rewrite the configured public origin or callback path.
+
+Publish `paperframe-lan` separately using a LAN-restricted LoadBalancer, NodePort, or private network path, then point the frame at:
 
 ```text
-https://YOUR_PRIVATE_HOST/frame/current.jpg
+http://YOUR_LAN_SERVICE_ADDRESS:8081/frame/current.jpg
 ```
 
-The application itself has no authentication or TLS. Do not publish it directly to the internet. Use a private LAN/VPN and, for browser access, an authenticating HTTPS ingress if possible. If you change the Service to `LoadBalancer` or `NodePort`, restrict it to trusted networks with firewall rules or network policy.
+Never route `paperframe-lan` through the public Ingress. Confirm from an external network that port `8081` is unreachable, and restrict it with firewall rules and network policy. Browser users can view the same current bytes without advancing through the authenticated `/frame/authenticated/current.jpg` management path.
 
 ## Operations
 

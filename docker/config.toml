@@ -1,5 +1,14 @@
 # Container bootstrap configuration. Mount a replacement at
-# /config/config.toml if different paths or a different port are required.
-bind = "0.0.0.0:8080"
+# /config/config.toml and set PAPERFRAME_OIDC_CLIENT_SECRET.
+management_bind = "0.0.0.0:8080"
+lan_frame_bind = "0.0.0.0:8081"
 settings_path = "/data/settings.toml"
 queue_dir = "/data/queue"
+
+[authentication]
+issuer = "https://auth.example.com"
+client_id = "paperframe"
+client_secret_env = "PAPERFRAME_OIDC_CLIENT_SECRET"
+public_url = "https://paperframe.example.com"
+session_idle_minutes = 60
+session_max_hours = 12

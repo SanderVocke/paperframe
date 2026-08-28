@@ -29,7 +29,9 @@ LABEL org.opencontainers.image.title="Paper Frame Server" \
 
 USER 10001:10001
 VOLUME ["/data"]
-EXPOSE 8080
+# 8080 is the authenticated management listener; 8081 is the LAN-only
+# unauthenticated frame listener. EXPOSE is documentation, not a firewall.
+EXPOSE 8080 8081
 STOPSIGNAL SIGTERM
 
 HEALTHCHECK --interval=30s --timeout=3s --start-period=10s --retries=3 \
