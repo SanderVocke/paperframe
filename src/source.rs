@@ -245,6 +245,39 @@ mod tests {
         assert_eq!(fs::read(root.join("nested/photo.jpg")).unwrap(), b"inside");
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn relative_import_never_follows_directory_replacement_symlinks() {
+        use std::os::unix::fs::symlink;
+        let dir = tempdir().unwrap();
+        let root = dir.path().join("root");
+        let outside = dir.path().join("outside");
+        fs::create_dir_all(root.join("album")).unwrap();
+        fs::create_dir(&outside).unwrap();
+        fs::write(root.join("album/picture.jpg"), b"inside").unwrap();
+        fs::write(outside.join("picture.jpg"), b"outside").unwrap();
+        let writer_root = root.clone();
+        let writer = std::thread::spawn(move || {
+            for _ in 0..300 {
+                fs::rename(writer_root.join("album"), writer_root.join("pinned-album")).unwrap();
+                symlink(&outside, writer_root.join("album")).unwrap();
+                std::thread::yield_now();
+                fs::remove_file(writer_root.join("album")).unwrap();
+                fs::rename(writer_root.join("pinned-album"), writer_root.join("album")).unwrap();
+            }
+        });
+        for _ in 0..1500 {
+            if let Ok(bytes) = read_relative_picture(&root, Path::new("album/picture.jpg"), 100) {
+                assert_eq!(bytes, b"inside", "replacement race escaped configured root");
+            }
+        }
+        writer.join().unwrap();
+        assert_eq!(
+            read_relative_picture(&root, Path::new("album/picture.jpg"), 100).unwrap(),
+            b"inside"
+        );
+    }
+
     fn settings(root: &Path) -> DigikamSettings {
         DigikamSettings {
             database_path: root.join("digikam.db"),

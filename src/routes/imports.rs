@@ -96,7 +96,7 @@ pub(super) async fn import_upload(
         let field = match multipart.next_field().await {
             Ok(Some(field)) => field,
             Ok(None) => break,
-            Err(error) => return plain(StatusCode::BAD_REQUEST, &error.to_string()),
+            Err(error) => return plain(error.status(), &error.to_string()),
         };
         match field.name().unwrap_or("") {
             "csrf_token" => csrf = field.text().await.ok(),
@@ -115,7 +115,7 @@ pub(super) async fn import_upload(
                     .unwrap_or_else(|| "upload".into());
                 let bytes = match field.bytes().await {
                     Ok(bytes) => bytes,
-                    Err(error) => return plain(StatusCode::BAD_REQUEST, &error.to_string()),
+                    Err(error) => return plain(error.status(), &error.to_string()),
                 };
                 if bytes.len() as u64
                     > settings

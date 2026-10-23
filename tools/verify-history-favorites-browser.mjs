@@ -19,7 +19,7 @@ let server, session;
 const delay = ms => new Promise(resolve => setTimeout(resolve, ms));
 async function waitFor(fn, label) { for (let i = 0; i < 200; i++) { if (await fn()) return; await delay(50); } throw Error(`Timed out: ${label}`); }
 async function start() {
-  server = spawn(resolve('target/debug/paperframe-server'), [join(root, 'config.toml')], { stdio: ['ignore', 'pipe', 'pipe'] });
+  server = spawn(resolve(process.env.PAPERFRAME_BINARY || 'target/debug/paperframe-server'), [join(root, 'config.toml')], { stdio: ['ignore', 'pipe', 'pipe'] });
   let logs = ''; server.stdout.on('data', bytes => logs += bytes); server.stderr.on('data', bytes => logs += bytes);
   server.on('error', error => logs += error.message);
   await waitFor(async () => { if (server.exitCode !== null) throw Error(logs); try { return (await fetch(origin + '/health/ready')).ok; } catch { return false; } }, 'server ready');
@@ -67,7 +67,9 @@ try {
   await click('form[action="/favorites/upload"] button');
   assert.equal(await execute('return document.querySelectorAll("article").length;'), 3);
   await assertLayout('desktop-favorites');
+  await execute(`document.addEventListener('submit', event=>sessionStorage.setItem('pending-proof', JSON.stringify({disabled:event.submitter.disabled,pending:event.target.dataset.pending,position:event.target.querySelector('input[name=position]').value})), {once:true});`);
   await click('form[action="/queue/from-saved"] button[value=front]');
+  assert.deepEqual(JSON.parse(await execute("return sessionStorage.getItem('pending-proof');")), { disabled: true, pending: 'true', position: 'front' });
   assert.equal(await execute('return document.querySelectorAll(".queue>li").length;'), 4);
   assert.equal(await execute('return document.querySelector(".queue .photo-name").textContent;'), 'c.jpg');
   await navigate('/favorites');
@@ -78,6 +80,15 @@ try {
   assert.equal(await execute('return document.querySelectorAll("article").length;'), 2);
   await command('POST', `/session/${session}/window/rect`, { width: 390, height: 844 });
   for (const [path, name] of [['/settings', 'mobile-queue'], ['/history', 'mobile-history'], ['/favorites', 'mobile-favorites']]) { await navigate(path); await assertLayout(name); }
+  await execute('document.querySelector(\'article form[action="/queue/from-saved"]\').scrollIntoView({block:"center",behavior:"instant"});');
+  await waitFor(()=>execute('const rect=document.querySelector(\'article form[action="/queue/from-saved"]\').getBoundingClientRect();return rect.top>=0 && rect.bottom<=innerHeight;'), 'mobile card actions visible');
+  await delay(300);
+  await screenshot('mobile-favorite-actions');
+  const cachedPaths = await execute(`return navigator.serviceWorker.ready.then(()=>fetch('/manifest.webmanifest')).then(()=>caches.keys()).then(names=>Promise.all(names.map(name=>caches.open(name).then(cache=>cache.keys())))).then(groups=>groups.flat().map(request=>new URL(request.url).pathname));`);
+  assert(cachedPaths.includes('/manifest.webmanifest'), 'PWA metadata must actually exercise the cache');
+  assert(cachedPaths.every(path=>['/manifest.webmanifest','/pwa/icon-192.png','/pwa/icon-512.png','/pwa/icon-maskable-512.png','/pwa/inter-variable.ttf'].includes(path)), 'private pages/photos entered service-worker cache');
+  const viewport = await execute('return {width:innerWidth,height:innerHeight};');
+  assert(viewport.width <= 680, 'narrow layout must hit mobile breakpoint');
   await stop(); await start();
   await navigate('/favorites');
   assert.equal(await execute('return document.querySelectorAll("article").length;'), 3);
@@ -85,7 +96,7 @@ try {
   assert.equal(await execute('return document.querySelectorAll("article").length;'), 2);
   const descriptor = await readFile(join(root, 'queue/queue-state.toml'), 'utf8');
   assert(descriptor.includes('history_limit = 2'));
-  await writeFile(join(root, 'report.json'), JSON.stringify({ passed: true, browser: 'Firefox WebDriver', checks: ['desktop/mobile layout', 'loaded thumbnails', 'shared saved preview', 'queue favorite', 'server path import', 'client upload', 'front/back insertion', 'history trimming', 'restart'], root }, null, 2));
+  await writeFile(join(root, 'report.json'), JSON.stringify({ passed: true, browser: 'Firefox WebDriver', checks: ['desktop/mobile layout', 'loaded thumbnails', 'shared saved preview', 'queue favorite', 'server path import', 'client upload', 'front/back insertion', 'pending submit/position preservation', 'history trimming', 'PWA private-cache exclusion', 'restart'], viewport, root }, null, 2));
   console.log(`PASS: browser evidence in ${root}`);
 } finally {
   if (session) await command('DELETE', `/session/${session}`).catch(() => {});

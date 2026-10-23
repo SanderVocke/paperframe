@@ -275,13 +275,16 @@ queue/
   objects/
     <opaque-id>.source
     <opaque-id>.<bmp-or-jpg>
+    saved-<opaque-id>.source
+    saved-<opaque-id>.image
   thumbnails/
     <opaque-id>.jpg
+    saved-<opaque-id>.jpg
 ```
 
 Do not manually edit, reorder, or remove these files while the server is running. Use the control page. To preserve queue order and supplier history, stop the server and back up the whole queue directory together.
 
-The queue descriptor and settings are atomically replaced. Queue objects use opaque names and immutable metadata. Text recipes are stored in the descriptor; a dedicated message also owns a minimal immutable canvas source so the same transactional source/derivative machinery applies. Thumbnails are bounded, derived cache files; missing thumbnails are regenerated from the immutable source or, for text-bearing entries, the already-dithered derivative. Startup reconciles safe temporary/orphan files and refuses to serve a descriptor that points to a missing, unsafe, or corrupt object.
+The queue descriptor and settings are each atomically replaced. They are separate files, not a single cross-file power-loss transaction. Live settings-save failures restore the previous history descriptor before returning; startup reapplies the configured history limit. An abrupt stop between the two replacements can leave history already trimmed, but cannot delete favorites or leave saved references pointing to queue-owned assets. Back up the complete data directory and settings together. Queue objects use opaque names and immutable metadata. Text recipes are stored in the descriptor; a dedicated message also owns a minimal immutable canvas source so the same transactional source/derivative machinery applies. Thumbnails are bounded, derived cache files; missing thumbnails are regenerated from the immutable source or, for text-bearing entries, the already-dithered derivative. Startup reconciles safe temporary/orphan files and refuses to serve a descriptor that points to a missing, unsafe, or corrupt object.
 
 Use three separate storage locations:
 
@@ -358,6 +361,11 @@ Most users only need `/settings` and the stable `/frame/current.jpg` endpoint. T
 | `GET` | `/pwa/*` | Progressive web app icons |
 | `GET` / `HEAD` | `/frame/current.jpg` | Stable backward-compatible endpoint; returns the configured JPEG or BMP representation |
 | `GET` / `HEAD` | `/frame/current.bmp` | Alias for the same configured representation |
+| `GET` | `/history`, `/favorites` | Paginated saved collections (`?page=1`, 24 per page) |
+| `GET` | `/saved/{thumbnail,preview,original,rendered,dithered-preview}/{id}` | Non-advancing retained-picture assets |
+| `POST` | `/favorites/add`, `/favorites/remove` | Save a queue/history composition or remove a favorite |
+| `POST` | `/favorites/path`, `/favorites/upload` | Import one picture directly into favorites |
+| `POST` | `/queue/from-saved` | Add a history/favorite composition at front or back |
 | `GET` | `/queue/thumbnail/{id}` | Non-advancing thumbnail |
 | `GET` | `/queue/preview/{id}` | Browser-compatible, undithered original preview |
 | `GET` | `/queue/original/{id}` | Retained original source bytes |
@@ -365,7 +373,7 @@ Most users only need `/settings` and the stable `/frame/current.jpg` endpoint. T
 | `GET` | `/queue/dithered-preview/{id}` | Browser-compatible, non-advancing six-color preview |
 | `POST` | `/queue/reorder` | Save complete current-first order |
 | `POST` | `/queue/remove` | Remove any queue entry |
-| `POST` | `/queue/upload` | Decode/render and append uploaded images |
+| `POST` | `/queue/upload` | Decode/render and insert uploaded images at front or back |
 | `POST` | `/queue/message` | Create and render a dedicated text queue item |
 | `POST` | `/queue/text` | Add or edit a queue entry's text recipe and stored derivative |
 | `POST` | `/queue/text/remove` | Remove a photo's text recipe and rebuild it from its retained source |
@@ -386,3 +394,11 @@ cargo clippy --all-targets --all-features -- -D warnings
 cargo test
 cargo build --release
 ```
+
+For a disposable real-browser history/favorites smoke check, start `geckodriver --port 4444`, then run:
+
+```sh
+PAPERFRAME_BINARY=target/release/paperframe-server node tools/verify-history-favorites-browser.mjs
+```
+
+Firefox must be installed (`FIREFOX_BINARY` can select it). The verifier creates its own temporary settings, queue and source fixtures, uses local port 18549, and prints a directory containing its report and desktop/narrow screenshots. Do not point it at production data.

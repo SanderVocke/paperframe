@@ -2195,6 +2195,14 @@ mod tests {
     #[tokio::test]
     async fn global_rendering_settings_rerender_the_whole_queue_before_activation() {
         let (_directory, state) = manual_state(AdvancementSettings::Manual).await;
+        let queue = state.queue.snapshot().await;
+        let key = state
+            .queue
+            .favorite_queue_entry(queue.generation, &queue.entries[0].id)
+            .await
+            .unwrap();
+        let saved = state.queue.prepare(&key).await.unwrap().bytes;
+        let history = state.queue.history().await;
         let snapshot = state.settings.snapshot().await;
         let mut form = SettingsForm::from_settings(
             snapshot.generation,
@@ -2222,6 +2230,8 @@ mod tests {
                 .output_mode,
             OutputMode::ServerDitherBmp
         );
+        assert_eq!(state.queue.prepare(&key).await.unwrap().bytes, saved);
+        assert_eq!(state.queue.history().await, history);
         let queue = state.queue.snapshot().await;
         assert!(
             queue
@@ -2277,6 +2287,8 @@ mod tests {
                 "JPEG source should pass through"
             );
         }
+        assert_eq!(state.queue.prepare(&key).await.unwrap().bytes, saved);
+        assert_eq!(state.queue.history().await, history);
     }
 
     #[tokio::test]
@@ -2880,6 +2892,36 @@ mod tests {
                 .unwrap();
             assert_eq!(response.status(), StatusCode::OK);
         }
+    }
+
+    #[tokio::test]
+    async fn favorite_upload_enforces_fixed_body_cap_before_publication() {
+        let (_directory, state) = manual_state(AdvancementSettings::Manual).await;
+        let before = state.queue.snapshot().await;
+        let history = state.queue.history().await;
+        let prefix = Bytes::from_static(b"--large-upload\r\nContent-Disposition: form-data; name=\"image\"; filename=\"large.jpg\"\r\nContent-Type: image/jpeg\r\n\r\n");
+        let chunk = Bytes::from(vec![0u8; 1024 * 1024]);
+        let length = prefix.len() + chunk.len() * 102;
+        let chunks = std::iter::once(Ok::<_, std::io::Error>(prefix))
+            .chain((0..102).map(move |_| Ok(chunk.clone())));
+        let body = Body::from_stream(futures_util::stream::iter(chunks));
+        let response = router(state.clone())
+            .oneshot(
+                Request::post("/favorites/upload")
+                    .header(
+                        header::CONTENT_TYPE,
+                        "multipart/form-data; boundary=large-upload",
+                    )
+                    .header(header::CONTENT_LENGTH, length.to_string())
+                    .body(body)
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
+        assert_eq!(state.queue.snapshot().await.entries, before.entries);
+        assert_eq!(state.queue.history().await, history);
+        assert!(state.queue.favorites().await.is_empty());
     }
 
     #[tokio::test]
