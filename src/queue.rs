@@ -34,6 +34,9 @@ pub struct QueueEntry {
     pub id: String,
     /// Served derivative object; retained name keeps version-1 descriptor compatibility.
     pub object_name: String,
+    /// Saved snapshots own this immutable thumbnail; queue entries use their ID cache.
+    #[serde(default)]
+    pub thumbnail_object_name: Option<String>,
     pub display_name: String,
     pub digest: String,
     pub content_length: u64,
@@ -417,6 +420,7 @@ impl QueueStore {
                 QueueEntry {
                     object_name: format!("{id}.jpg"),
                     id,
+                    thumbnail_object_name: None,
                     display_name: request.display_name.clone(),
                     digest: digest(&request.bytes),
                     content_length: request.bytes.len() as u64,
@@ -566,6 +570,7 @@ impl QueueStore {
                     object_name: format!("{id}.{extension}"),
                     source_object_name: Some(format!("{id}.source")),
                     id,
+                    thumbnail_object_name: None,
                     display_name: request.display_name.clone(),
                     digest: digest(&request.derivative_bytes),
                     content_length: request.derivative_bytes.len() as u64,
@@ -934,7 +939,7 @@ impl QueueStore {
             .entries
             .iter()
             .filter(|entry| entry.text_overlay.is_some())
-            .map(|entry| self.thumbnails.join(thumbnail_name(&entry.id)))
+            .map(|entry| self.thumbnails.join(entry_thumbnail_name(&entry)))
             .collect::<Vec<_>>();
         let _ = tokio::task::spawn_blocking(move || {
             for path in stale_thumbnails {
@@ -1255,6 +1260,9 @@ impl QueueStore {
     }
 
     pub async fn current(&self) -> Result<Option<PreparedImage>> {
+        // Pin the selected entry until its bytes have been loaded. An advancement
+        // must not remove its queue-owned object between selection and preparation.
+        let _guard = self.mutation.lock().await;
         let entry = self.descriptor.read().await.entries.first().cloned();
         match entry {
             Some(entry) => self.prepare(&entry.id).await.map(Some),
@@ -1412,7 +1420,7 @@ impl QueueStore {
 
     pub async fn prepare_thumbnail(&self, id: &str) -> Result<Option<PreparedThumbnail>> {
         let entry = self.resolve_read_entry(id).await?;
-        let path = self.thumbnails.join(thumbnail_name(&entry.id));
+        let path = self.thumbnails.join(entry_thumbnail_name(&entry));
         tokio::task::spawn_blocking(move || -> Result<Option<PreparedThumbnail>> {
             let metadata = match fs::symlink_metadata(&path) {
                 Ok(metadata) => metadata,
@@ -1443,7 +1451,7 @@ impl QueueStore {
         let _guard = self.mutation.lock().await;
         let entry = self.resolve_read_entry(id).await?;
         let directory = self.thumbnails.clone();
-        let path = directory.join(thumbnail_name(&entry.id));
+        let path = directory.join(entry_thumbnail_name(&entry));
         tokio::task::spawn_blocking(move || -> Result<PreparedThumbnail> {
             write_cached_thumbnail(&directory, &path, &bytes)?;
             let modified = fs::metadata(&path)?
@@ -1484,10 +1492,11 @@ impl QueueStore {
         let mut next = self.descriptor.read().await.clone();
         require_generation(&next, expected)?;
         let id = format!("saved-{}", random_id());
-        let entry = QueueEntry {
+        let mut entry = QueueEntry {
             object_name: format!("{id}.image"),
             source_object_name: Some(format!("{id}.source")),
             id,
+            thumbnail_object_name: None,
             display_name: request.display_name,
             digest: digest(&request.derivative_bytes),
             content_length: request.derivative_bytes.len() as u64,
@@ -1506,6 +1515,7 @@ impl QueueStore {
             supplier_id: request.supplier_id,
             source_key: request.source_key,
         };
+        entry.thumbnail_object_name = Some(entry_thumbnail_name(&entry));
         let key = composition_key(&entry)?;
         if next.favorites.iter().any(|item| item.picture_id == key) {
             return Ok(key);
@@ -1604,7 +1614,7 @@ impl QueueStore {
         let thumbnails = descriptor
             .pictures
             .values()
-            .map(|entry| thumbnail_name(&entry.id))
+            .map(|entry| entry_thumbnail_name(&entry))
             .collect::<HashSet<_>>();
         for (directory, reachable) in [(&self.objects, objects), (&self.thumbnails, thumbnails)] {
             if let Ok(entries) = fs::read_dir(directory) {
@@ -1687,12 +1697,14 @@ impl QueueStore {
             .get(picture_id)
             .cloned()
             .context("saved picture not found")?;
-        let path = self.objects.join(
-            entry
-                .source_object_name
-                .as_ref()
-                .unwrap_or(&entry.object_name),
-        );
+        if entry.source_object_name.is_none() {
+            return self
+                .enqueue_legacy_saved(expected, entry, position, target, mode)
+                .await;
+        }
+        let path = self
+            .objects
+            .join(entry.source_object_name.as_ref().unwrap());
         let request = tokio::task::spawn_blocking(move || -> Result<RenderedEnqueueRequest> {
             if entry.source_object_name.is_none() {
                 bail!(
@@ -1737,6 +1749,88 @@ impl QueueStore {
         .context("saved picture render worker stopped")??;
         self.enqueue_rendered_batch_at_impl(Some(expected), None, position, vec![request], false)
             .await
+    }
+
+    async fn enqueue_legacy_saved(
+        &self,
+        expected: u64,
+        mut entry: QueueEntry,
+        position: QueueInsertPosition,
+        target: FrameTarget,
+        mode: crate::renderer::OutputMode,
+    ) -> Result<Vec<QueueEntry>> {
+        let expected_media = if entry.text_overlay.is_some()
+            || mode == crate::renderer::OutputMode::ServerDitherBmp
+        {
+            "image/bmp"
+        } else {
+            "image/jpeg"
+        };
+        if entry.media_type != expected_media
+            || entry.frame_target != target
+            || (expected_media == "image/bmp"
+                && (entry.renderer_profile != RENDER_PROFILE_VERSION
+                    || (entry.text_overlay.is_some()
+                        && entry.text_renderer_profile != TEXT_RENDER_PROFILE_VERSION)))
+        {
+            bail!(
+                "Saved picture has no original and its derivative is incompatible with current rendering settings"
+            );
+        }
+        let _guard = self.mutation.lock().await;
+        let mut next = self.descriptor.read().await.clone();
+        require_generation(&next, expected)?;
+        let source = self.objects.join(&entry.object_name);
+        entry.id = random_id();
+        entry.thumbnail_object_name = None;
+        entry.object_name = format!(
+            "{}.{}",
+            entry.id,
+            if entry.media_type == "image/bmp" {
+                "bmp"
+            } else {
+                "jpg"
+            }
+        );
+        match position {
+            QueueInsertPosition::Front => next.entries.insert(0, entry.clone()),
+            QueueInsertPosition::Back => next.entries.push(entry.clone()),
+        }
+        next.generation = next.generation.saturating_add(1);
+        let root = self.root.clone();
+        let objects = self.objects.clone();
+        let path = self.state_path.clone();
+        let disk_entry = entry.clone();
+        let result = tokio::task::spawn_blocking(move || -> Result<Descriptor> {
+            let bytes = fs::read(source)?;
+            validate_derivative(&bytes, &disk_entry.media_type, disk_entry.frame_target)?;
+            if digest(&bytes) != disk_entry.digest {
+                bail!("saved derivative digest mismatch");
+            }
+            publish_enqueue_batch(
+                &root,
+                &objects,
+                &path,
+                &[disk_entry],
+                vec![bytes],
+                &mut next,
+            )?;
+            Ok(next)
+        })
+        .await
+        .context("legacy saved publication worker stopped")?;
+        match result {
+            Ok(next) => {
+                self.cleanup_saved(&next);
+                *self.descriptor.write().await = next.clone();
+                self.notify(QueueEventReason::Enqueue, next.generation);
+                Ok(vec![entry])
+            }
+            Err(error) => {
+                self.cleanup_saved(&*self.descriptor.read().await);
+                Err(error)
+            }
+        }
     }
 
     pub async fn remove_favorite(&self, expected: u64, picture_id: &str) -> Result<()> {
@@ -1909,6 +2003,7 @@ fn retain_picture(
     let mut saved = entry.clone();
     saved.id = format!("saved-{}", random_id());
     saved.object_name = format!("{}.image", saved.id);
+    saved.thumbnail_object_name = Some(thumbnail_name(&saved.id));
     saved.source_object_name = entry
         .source_object_name
         .as_ref()
@@ -1935,9 +2030,9 @@ fn retain_picture(
             std::io::copy(&mut input, &mut output)?;
             output.sync_all()?;
         }
-        let thumbnail = thumbnails.join(thumbnail_name(&entry.id));
+        let thumbnail = thumbnails.join(entry_thumbnail_name(&entry));
         if thumbnail.exists() {
-            let destination = thumbnails.join(thumbnail_name(&saved.id));
+            let destination = thumbnails.join(entry_thumbnail_name(&saved));
             let mut input = fs::File::open(thumbnail)?;
             let mut output = OpenOptions::new()
                 .write(true)
@@ -2004,6 +2099,24 @@ fn initialize(
         persist_descriptor(&state_path, &value)?;
         value
     };
+    for entry in &descriptor.entries {
+        if entry.object_name.starts_with("saved-")
+            || entry
+                .source_object_name
+                .as_ref()
+                .is_some_and(|name| name.starts_with("saved-"))
+            || entry.thumbnail_object_name.is_some()
+        {
+            bail!("queue entry cannot own saved-picture assets");
+        }
+    }
+    let mut thumbnails_migrated = false;
+    for entry in descriptor.pictures.values_mut() {
+        if entry.thumbnail_object_name.is_none() {
+            entry.thumbnail_object_name = Some(thumbnail_name(&entry.id));
+            thumbnails_migrated = true;
+        }
+    }
     let retention_changed = descriptor.history_limit != history_limit;
     descriptor.history_limit = history_limit;
     for entry in descriptor
@@ -2012,6 +2125,9 @@ fn initialize(
         .chain(descriptor.pictures.values())
     {
         validate_object_name(&entry.object_name)?;
+        if let Some(name) = &entry.thumbnail_object_name {
+            validate_object_name(name)?;
+        }
         if let Some(source) = &entry.source_object_name {
             validate_object_name(source)?;
         }
@@ -2026,6 +2142,13 @@ fn initialize(
         validate_object_name(&entry.id)?;
         if !entry.id.starts_with("saved-") || composition_key(entry)? != *id {
             bail!("invalid saved picture identity");
+        }
+        if entry
+            .thumbnail_object_name
+            .as_ref()
+            .is_some_and(|name| name != &thumbnail_name(&entry.id))
+        {
+            bail!("saved thumbnail must belong to its saved picture");
         }
         if entry.object_name != format!("{}.image", entry.id)
             || entry
@@ -2066,7 +2189,7 @@ fn initialize(
         capture_current(&objects, &thumbnails, &previous, &mut descriptor)?;
         persist_descriptor(&state_path, &descriptor)?;
     }
-    if retention_changed {
+    if retention_changed || thumbnails_migrated {
         descriptor.history.truncate(history_limit);
         prune_pictures(&mut descriptor);
         persist_descriptor(&state_path, &descriptor)?;
@@ -2110,7 +2233,7 @@ fn initialize(
         .entries
         .iter()
         .chain(descriptor.pictures.values())
-        .map(|entry| thumbnail_name(&entry.id))
+        .map(|entry| entry_thumbnail_name(&entry))
         .collect::<HashSet<_>>();
     for entry in fs::read_dir(&thumbnails).context("failed to inspect queue thumbnails")? {
         let entry = entry?;
@@ -2256,7 +2379,7 @@ fn publish_rendered_batch(
                 ("derivative", objects.join(&entry.object_name), derivative),
                 (
                     "thumbnail",
-                    thumbnails.join(thumbnail_name(&entry.id)),
+                    thumbnails.join(entry_thumbnail_name(&entry)),
                     thumbnail,
                 ),
             ] {
@@ -2413,6 +2536,13 @@ fn text_message_display_name(body: &str) -> String {
     format!("Message: {summary}")
 }
 
+fn entry_thumbnail_name(entry: &QueueEntry) -> String {
+    entry
+        .thumbnail_object_name
+        .clone()
+        .unwrap_or_else(|| thumbnail_name(&entry.id))
+}
+
 fn thumbnail_name(id: &str) -> String {
     format!("{id}.jpg")
 }
@@ -2558,6 +2688,193 @@ mod tests {
             supplier_id: None,
             source_key: None,
         }
+    }
+
+    #[tokio::test]
+    async fn favorite_text_recipe_survives_queue_edits_and_renders_for_new_target() {
+        let dir = tempdir().unwrap();
+        let queue = QueueStore::new(dir.path(), false).await.unwrap();
+        let entry = queue
+            .enqueue_rendered_batch(None, None, vec![rendered_request("a.jpg", A)])
+            .await
+            .unwrap()
+            .remove(0);
+        let text = TextOverlay::new(
+            "Saved caption".into(),
+            crate::renderer::HorizontalTextPosition::Middle,
+            crate::renderer::VerticalTextPosition::Bottom,
+            crate::renderer::TextBackground::Black,
+        );
+        queue
+            .set_text(
+                queue.snapshot().await.generation,
+                &entry.id,
+                Some(text.clone()),
+                FrameTarget::Paper7,
+                crate::renderer::OutputMode::DirectJpeg,
+            )
+            .await
+            .unwrap();
+        let key = queue
+            .favorite_queue_entry(queue.snapshot().await.generation, &entry.id)
+            .await
+            .unwrap();
+        let saved = queue.prepare(&key).await.unwrap();
+        queue
+            .set_text(
+                queue.snapshot().await.generation,
+                &entry.id,
+                None,
+                FrameTarget::Paper7,
+                crate::renderer::OutputMode::DirectJpeg,
+            )
+            .await
+            .unwrap();
+        assert_eq!(queue.prepare(&key).await.unwrap().bytes, saved.bytes);
+        let inserted = queue
+            .enqueue_saved(
+                queue.snapshot().await.generation,
+                &key,
+                QueueInsertPosition::Back,
+                FrameTarget::PaperL,
+                crate::renderer::OutputMode::DirectJpeg,
+            )
+            .await
+            .unwrap()
+            .remove(0);
+        assert_eq!(inserted.text_overlay, Some(text));
+        assert_eq!(inserted.media_type, "image/bmp");
+        assert_eq!(inserted.frame_target, FrameTarget::PaperL);
+        assert_eq!(queue.prepare_source(&inserted.id).await.unwrap().bytes, A);
+        assert_eq!(queue.prepare(&key).await.unwrap().bytes, saved.bytes);
+        let decoded = crate::renderer::decode_source(&saved.bytes).unwrap();
+        queue
+            .store_thumbnail(&key, crate::renderer::thumbnail_jpeg(&decoded).unwrap())
+            .await
+            .unwrap();
+        assert!(queue.prepare_thumbnail(&key).await.unwrap().is_some());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn concurrent_save_remove_edit_and_requeue_preserve_referenced_assets() {
+        let dir = tempdir().unwrap();
+        let queue = QueueStore::new(dir.path(), false).await.unwrap();
+        let entry = queue
+            .enqueue_rendered_batch(None, None, vec![rendered_request("a.jpg", A)])
+            .await
+            .unwrap()
+            .remove(0);
+        let expected = queue.snapshot().await.generation;
+        let (save, remove) = tokio::join!(
+            queue.favorite_queue_entry(expected, &entry.id),
+            queue.remove(expected, &entry.id)
+        );
+        assert_ne!(
+            save.is_ok(),
+            remove.is_ok(),
+            "exactly one competing generation may commit"
+        );
+        let key = queue.history().await[0].0.picture_id.clone();
+        if queue.snapshot().await.entries.is_empty() {
+            queue
+                .enqueue_saved(
+                    queue.snapshot().await.generation,
+                    &key,
+                    QueueInsertPosition::Back,
+                    FrameTarget::Paper7,
+                    crate::renderer::OutputMode::DirectJpeg,
+                )
+                .await
+                .unwrap();
+        }
+        let snapshot = queue.snapshot().await;
+        let (edit, requeue) = tokio::join!(
+            queue.set_orientation(
+                snapshot.generation,
+                &snapshot.entries[0].id,
+                ImageOrientation::Portrait,
+                FrameTarget::Paper7,
+                crate::renderer::OutputMode::DirectJpeg
+            ),
+            queue.enqueue_saved(
+                snapshot.generation,
+                &key,
+                QueueInsertPosition::Front,
+                FrameTarget::Paper7,
+                crate::renderer::OutputMode::DirectJpeg
+            )
+        );
+        assert_ne!(edit.is_ok(), requeue.is_ok());
+        for entry in queue.snapshot().await.entries {
+            queue.prepare(&entry.id).await.unwrap();
+            queue.prepare_source(&entry.id).await.unwrap();
+        }
+        for (record, _) in queue.history().await {
+            queue.prepare(&record.picture_id).await.unwrap();
+            queue.prepare_source(&record.picture_id).await.unwrap();
+        }
+        drop(queue);
+        let queue = QueueStore::new(dir.path(), false).await.unwrap();
+        queue.prepare(&key).await.unwrap();
+        queue.prepare_source(&key).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn derivative_only_saved_records_reuse_compatible_bytes_without_fabricating_sources() {
+        let dir = tempdir().unwrap();
+        let queue = QueueStore::new(dir.path(), false).await.unwrap();
+        let entry = queue
+            .enqueue("legacy.jpg".into(), A.to_vec(), None, None)
+            .await
+            .unwrap();
+        let key = queue
+            .favorite_queue_entry(queue.snapshot().await.generation, &entry.id)
+            .await
+            .unwrap();
+        queue
+            .remove(queue.snapshot().await.generation, &entry.id)
+            .await
+            .unwrap();
+        let generation = queue.snapshot().await.generation;
+        assert!(
+            queue
+                .enqueue_saved(
+                    generation,
+                    &key,
+                    QueueInsertPosition::Front,
+                    FrameTarget::Paper7,
+                    crate::renderer::OutputMode::ServerDitherBmp
+                )
+                .await
+                .is_err()
+        );
+        assert!(
+            queue
+                .enqueue_saved(
+                    generation,
+                    &key,
+                    QueueInsertPosition::Front,
+                    FrameTarget::PaperL,
+                    crate::renderer::OutputMode::DirectJpeg
+                )
+                .await
+                .is_err()
+        );
+        let inserted = queue
+            .enqueue_saved(
+                generation,
+                &key,
+                QueueInsertPosition::Back,
+                FrameTarget::Paper7,
+                crate::renderer::OutputMode::DirectJpeg,
+            )
+            .await
+            .unwrap()
+            .remove(0);
+        assert!(inserted.source_object_name.is_none());
+        assert!(inserted.source_digest.is_none());
+        assert_eq!(queue.current().await.unwrap().unwrap().bytes, A);
+        assert_eq!(queue.history().await[0].0.picture_id, key);
     }
 
     #[tokio::test]
@@ -3091,7 +3408,7 @@ mod tests {
                 .bytes,
             expected
         );
-        let path = queue.thumbnails.join(thumbnail_name(&entry.id));
+        let path = queue.thumbnails.join(entry_thumbnail_name(&entry));
         assert!(path.is_file());
         queue
             .remove(queue.snapshot().await.generation, &entry.id)

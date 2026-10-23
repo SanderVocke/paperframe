@@ -1,0 +1,31 @@
+<script>
+(function(){
+  const previewDialog=document.getElementById('photo-preview');
+  const previewTitle=document.getElementById('preview-title');
+  const previewGrid=document.getElementById('preview-grid');
+  const originalPanel=document.getElementById('original-panel');
+  const originalPreview=document.getElementById('original-preview');
+  const originalFull=document.getElementById('original-full');
+  const ditheredPanel=document.getElementById('dithered-panel');
+  const ditheredPreview=document.getElementById('dithered-preview');
+  const ditheredFull=document.getElementById('dithered-full');
+  document.querySelectorAll('[data-preview-trigger]').forEach(trigger=>trigger.addEventListener('click',()=>{
+    const id=encodeURIComponent(trigger.dataset.id);
+    const prefix=trigger.dataset.prefix||'/queue';
+    const name=trigger.dataset.name;
+    const isDithered=trigger.dataset.dithered==='true';
+    const isDedicated=trigger.dataset.dedicated==='true';
+    previewTitle.textContent=name;
+    originalPanel.hidden=isDedicated;
+    if(!isDedicated){originalPreview.alt='Undithered preview of '+name;originalPreview.src=prefix+'/preview/'+id;originalFull.href=prefix+'/original/'+id;}
+    ditheredPanel.hidden=!isDithered;
+    previewGrid.classList.toggle('single',!isDithered||isDedicated);
+    if(isDithered){ditheredPreview.alt='Dithered preview of '+name;ditheredPreview.src=prefix+'/dithered-preview/'+id;ditheredFull.href=prefix+'/rendered/'+id;}
+    previewDialog.showModal();
+  }));
+  document.getElementById('preview-close').addEventListener('click',()=>previewDialog.close());
+  previewDialog.addEventListener('click',event=>{if(event.target===previewDialog)previewDialog.close();});
+  previewDialog.addEventListener('close',()=>{originalPreview.removeAttribute('src');ditheredPreview.removeAttribute('src');});
+
+})();
+</script>

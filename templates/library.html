@@ -1,5 +1,6 @@
 <!doctype html>
 <html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>{{ title }} · Paper Frame</title>
+{% include "styles.html" %}
 <style>
 :root{font-family:system-ui,sans-serif;color:#232a26;background:#f4f6f3}body{max-width:1100px;margin:auto;padding:20px}nav,.actions,.pagination{display:flex;gap:12px;flex-wrap:wrap;align-items:center}a{color:#245d40}button{font:inherit;cursor:pointer;border:1px solid #bac8bd;border-radius:8px;padding:8px;background:white;color:#245d40}button:disabled{opacity:.5;cursor:wait}.grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(min(100%,260px),1fr));gap:18px;margin:24px 0}article{background:white;border:1px solid #d4ddd5;border-radius:12px;padding:14px;min-width:0}img{display:block;width:100%;height:220px;object-fit:contain;background:#eef1ed;border-radius:8px}h2{font-size:1.05rem;overflow-wrap:anywhere}small{display:block;color:#5a655e;margin-bottom:12px}.actions{gap:8px;margin:12px 0}.pagination{margin:24px 0}.danger{color:#a32828}form{margin:0}
 </style></head><body>
@@ -15,8 +16,8 @@
 {% if items.is_empty() %}<p>No pictures here yet.</p>{% endif %}
 <div class="grid">
 {% for item in items %}
-<article>
-<a href="/saved/rendered/{{ item.id }}" target="_blank" rel="noopener"><img src="/saved/thumbnail/{{ item.id }}" alt="{{ item.display_name }}" loading="lazy"></a>
+<article class="photo-card">
+<button class="photo-link" type="button" data-preview-trigger data-prefix="/saved" data-id="{{ item.id }}" data-name="{{ item.display_name }}" data-dithered="{{ item.dithered }}" data-dedicated="{{ item.dedicated }}" aria-label="Preview {{ item.display_name }}"><img src="/saved/thumbnail/{{ item.id }}" alt="{{ item.display_name }}" loading="lazy"></button>
 <h2>{{ item.display_name }}</h2><small>{{ item.timestamp }}</small>
 <div class="actions"><a href="/saved/preview/{{ item.id }}" target="_blank" rel="noopener">Preview original</a><a href="/saved/rendered/{{ item.id }}" target="_blank" rel="noopener">Saved composition</a><a href="/saved/original/{{ item.id }}" target="_blank" rel="noopener">Full source</a></div>
 <div class="actions">
@@ -34,9 +35,6 @@
 {% endfor %}
 </div>
 <nav class="pagination" aria-label="Pagination">{% if page > 1 %}<a href="{{ path }}?page={{ previous }}">Previous</a>{% endif %}<span>Page {{ page }} of {{ pages }}</span>{% if page < pages %}<a href="{{ path }}?page={{ next }}">Next</a>{% endif %}</nav>
-<script>
-// Capture clicked button's name/value before disabling controls. Native form
-// submission otherwise drops the insertion-position submitter.
-document.addEventListener('submit',event=>{const form=event.target;if(event.defaultPrevented)return;if(form.dataset.pending){event.preventDefault();return;}form.dataset.pending='true';const button=event.submitter;if(button&&button.name){const input=document.createElement('input');input.type='hidden';input.name=button.name;input.value=button.value;form.append(input);}form.querySelectorAll('button').forEach(button=>button.disabled=true);});
-window.addEventListener('pageshow',()=>{document.querySelectorAll('form').forEach(form=>{delete form.dataset.pending;form.querySelectorAll('button').forEach(button=>button.disabled=false);});});
-</script></body></html>
+{% include "preview-dialog.html" %}
+{% include "preview-script.html" %}
+{% include "pending-submit-script.html" %}</body></html>

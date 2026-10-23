@@ -14,6 +14,8 @@ struct SavedCard {
     display_name: String,
     timestamp: String,
     favorite: bool,
+    dithered: bool,
+    dedicated: bool,
 }
 
 #[derive(Template)]
@@ -88,6 +90,8 @@ async fn render_library(state: &Arc<AppState>, page: usize, favorites: bool) -> 
                 .map(|date| date.format("%Y-%m-%d %H:%M UTC").to_string())
                 .unwrap_or_default(),
             favorite: item.favorite,
+            dithered: item.entry.media_type == "image/bmp",
+            dedicated: item.entry.dedicated_text,
         })
         .collect();
     let settings = state.settings.snapshot().await;
