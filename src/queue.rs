@@ -23,7 +23,7 @@ use crate::{
     },
 };
 
-const STATE_VERSION: u32 = 4;
+const STATE_VERSION: u32 = 5;
 const STATE_FILE: &str = "queue-state.toml";
 const OBJECTS_DIR: &str = "objects";
 const THUMBNAILS_DIR: &str = "thumbnails";
@@ -84,6 +84,39 @@ struct Descriptor {
     entries: Vec<QueueEntry>,
     #[serde(default)]
     seen: BTreeMap<String, BTreeSet<String>>,
+    #[serde(default)]
+    pictures: BTreeMap<String, QueueEntry>,
+    #[serde(default)]
+    history: Vec<HistoryRecord>,
+    #[serde(default)]
+    favorites: Vec<FavoriteRecord>,
+}
+
+/// An immutable composition reference, ordered explicitly rather than by clock time.
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+pub struct HistoryRecord {
+    pub picture_id: String,
+    pub last_current_at: i64,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+pub struct FavoriteRecord {
+    pub picture_id: String,
+    pub added_at: i64,
+}
+
+/// Content/recipe identity deliberately excludes queue-instance and render-cache fields.
+/// Serializing a tuple makes field boundaries unambiguous, including arbitrary text.
+fn composition_key(entry: &QueueEntry) -> Result<String> {
+    let recipe = (
+        entry.source_digest.as_deref().unwrap_or(&entry.digest),
+        entry.source_digest.is_some(),
+        entry.orientation,
+        &entry.text_overlay,
+        entry.dedicated_text,
+    );
+    let bytes = serde_json::to_vec(&recipe).context("failed to encode composition identity")?;
+    Ok(digest(&bytes))
 }
 
 #[derive(Clone, Debug)]
@@ -1311,6 +1344,9 @@ fn initialize(configured: &Path) -> Result<(PathBuf, PathBuf, PathBuf, Descripto
             generation: 1,
             entries: Vec::new(),
             seen: BTreeMap::new(),
+            pictures: BTreeMap::new(),
+            history: Vec::new(),
+            favorites: Vec::new(),
         };
         persist_descriptor(&state_path, &value)?;
         value
@@ -1810,6 +1846,42 @@ mod tests {
         }
     }
 
+    #[test]
+    fn version_four_descriptor_defaults_saved_collections_and_round_trips() {
+        let mut descriptor: Descriptor = toml::from_str(
+            "version = 4\ngeneration = 7\nentries = []\n[seen]\nprimary = ['old-source']\n",
+        )
+        .unwrap();
+        assert!(descriptor.pictures.is_empty());
+        assert!(descriptor.history.is_empty());
+        assert!(descriptor.favorites.is_empty());
+        let dir = tempdir().unwrap();
+        migrate_descriptor(dir.path(), &mut descriptor).unwrap();
+        assert_eq!(descriptor.version, STATE_VERSION);
+        assert_eq!(descriptor.seen["primary"].len(), 1);
+        let encoded = toml::to_string(&descriptor).unwrap();
+        assert_eq!(descriptor, toml::from_str::<Descriptor>(&encoded).unwrap());
+    }
+
+    #[tokio::test]
+    async fn saved_composition_identity_ignores_instance_and_render_cache() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = QueueStore::new(directory.path(), false).await.unwrap();
+        let entry = store
+            .enqueue("first.jpg".into(), A.to_vec(), None, None)
+            .await
+            .unwrap();
+        let key = composition_key(&entry).unwrap();
+        let mut equivalent = entry.clone();
+        equivalent.id = "another-instance".into();
+        equivalent.display_name = "renamed.jpg".into();
+        equivalent.renderer_profile += 1;
+        equivalent.supplier_id = Some("different-supplier".into());
+        assert_eq!(key, composition_key(&equivalent).unwrap());
+        equivalent.dedicated_text = true;
+        assert_ne!(key, composition_key(&equivalent).unwrap());
+    }
+
     #[tokio::test]
     async fn rendered_batches_can_be_added_to_the_front_or_back() {
         let dir = tempdir().unwrap();
@@ -2199,10 +2271,11 @@ mod tests {
         let source_name = entry.source_object_name.clone().unwrap();
         drop(queue);
         let state_path = dir.path().join(STATE_FILE);
-        let state =
-            fs::read_to_string(&state_path)
-                .unwrap()
-                .replacen("version = 4", "version = 2", 1);
+        let state = fs::read_to_string(&state_path).unwrap().replacen(
+            &format!("version = {STATE_VERSION}"),
+            "version = 2",
+            1,
+        );
         fs::write(&state_path, state).unwrap();
 
         let reopened = QueueStore::new(dir.path(), false).await.unwrap();
@@ -2216,7 +2289,7 @@ mod tests {
         assert!(
             fs::read_to_string(state_path)
                 .unwrap()
-                .contains("version = 4")
+                .contains(&format!("version = {STATE_VERSION}"))
         );
     }
 
@@ -2240,7 +2313,7 @@ mod tests {
         assert_eq!(entry.source_object_name.as_deref(), Some("legacy.source"));
         assert_eq!(queue.prepare_source(&entry.id).await.unwrap().bytes, A);
         let persisted = fs::read_to_string(dir.path().join(STATE_FILE)).unwrap();
-        assert!(persisted.contains("version = 4"));
+        assert!(persisted.contains(&format!("version = {STATE_VERSION}")));
     }
 
     #[tokio::test]
