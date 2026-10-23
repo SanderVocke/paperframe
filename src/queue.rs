@@ -90,6 +90,48 @@ struct Descriptor {
     history: Vec<HistoryRecord>,
     #[serde(default)]
     favorites: Vec<FavoriteRecord>,
+    #[serde(default = "default_history_limit")]
+    history_limit: usize,
+}
+
+fn default_history_limit() -> usize {
+    100
+}
+
+fn capture_current(
+    objects: &Path,
+    thumbnails: &Path,
+    previous: &Descriptor,
+    next: &mut Descriptor,
+) -> Result<()> {
+    let old_id = previous.entries.first().map(|entry| &entry.id);
+    let entry = next.entries.first().cloned();
+    if old_id != entry.as_ref().map(|entry| &entry.id) && next.history_limit > 0 {
+        if let Some(entry) = entry {
+            let picture_id = retain_picture(objects, thumbnails, next, &entry)?;
+            next.history.retain(|item| item.picture_id != picture_id);
+            next.history.insert(
+                0,
+                HistoryRecord {
+                    picture_id,
+                    last_current_at: chrono::Utc::now().timestamp(),
+                },
+            );
+        }
+    }
+    next.history.truncate(next.history_limit);
+    prune_pictures(next);
+    Ok(())
+}
+
+fn prune_pictures(next: &mut Descriptor) {
+    let retained = next
+        .history
+        .iter()
+        .map(|item| &item.picture_id)
+        .chain(next.favorites.iter().map(|item| &item.picture_id))
+        .collect::<HashSet<_>>();
+    next.pictures.retain(|id, _| retained.contains(id));
 }
 
 /// An immutable composition reference, ordered explicitly rather than by clock time.
@@ -193,6 +235,8 @@ pub enum QueueEventReason {
 pub struct QueueEvent {
     pub serial: u64,
     pub revision: u64,
+    /// Preserved across library-only events so watch coalescing cannot hide refill work.
+    pub work_serial: u64,
     pub reason: QueueEventReason,
 }
 
@@ -225,6 +269,7 @@ impl QueueStore {
         let (events, _) = watch::channel(QueueEvent {
             serial: 0,
             revision: descriptor.generation,
+            work_serial: 0,
             reason: QueueEventReason::Startup,
         });
         let store = Arc::new(Self {
@@ -384,19 +429,28 @@ impl QueueStore {
         let state_path = self.state_path.clone();
         let disk_entries = entries.clone();
         let payloads = requests.into_iter().map(|request| request.bytes).collect();
-        let next_for_disk = next.clone();
-        tokio::task::spawn_blocking(move || {
+        let mut next_for_disk = next.clone();
+        let next = tokio::task::spawn_blocking(move || -> Result<Descriptor> {
             publish_enqueue_batch(
                 &root,
                 &objects,
                 &state_path,
                 &disk_entries,
                 payloads,
-                &next_for_disk,
-            )
+                &mut next_for_disk,
+            )?;
+            Ok(next_for_disk)
         })
         .await
-        .context("queue enqueue worker stopped")??;
+        .context("queue enqueue worker stopped")?;
+        let next = match next {
+            Ok(next) => next,
+            Err(error) => {
+                self.cleanup_saved(&*self.descriptor.read().await);
+                return Err(error);
+            }
+        };
+        self.cleanup_saved(&next);
         *self.descriptor.write().await = next.clone();
         self.notify(QueueEventReason::Enqueue, next.generation);
         Ok(entries)
@@ -526,8 +580,8 @@ impl QueueStore {
                 )
             })
             .collect();
-        let next_for_disk = next.clone();
-        tokio::task::spawn_blocking(move || {
+        let mut next_for_disk = next.clone();
+        let next = tokio::task::spawn_blocking(move || -> Result<Descriptor> {
             publish_rendered_batch(
                 &root,
                 &objects,
@@ -535,11 +589,20 @@ impl QueueStore {
                 &state_path,
                 &disk_entries,
                 payloads,
-                &next_for_disk,
-            )
+                &mut next_for_disk,
+            )?;
+            Ok(next_for_disk)
         })
         .await
-        .context("rendered queue enqueue worker stopped")??;
+        .context("rendered queue enqueue worker stopped")?;
+        let next = match next {
+            Ok(next) => next,
+            Err(error) => {
+                self.cleanup_saved(&*self.descriptor.read().await);
+                return Err(error);
+            }
+        };
+        self.cleanup_saved(&next);
         *self.descriptor.write().await = next.clone();
         self.notify(QueueEventReason::Enqueue, next.generation);
         Ok(entries)
@@ -1290,69 +1353,6 @@ impl QueueStore {
         .context("queue thumbnail publication worker stopped")?
     }
 
-    /// Snapshot assets into a separate immutable namespace. Queue publication and
-    /// cleanup are free to replace/delete queue-owned files without touching these.
-    /// Caller holds `mutation` throughout copying and descriptor publication.
-    fn retain_picture(&self, next: &mut Descriptor, entry: &QueueEntry) -> Result<String> {
-        let key = composition_key(entry)?;
-        if next.pictures.contains_key(&key) {
-            return Ok(key);
-        }
-        let mut saved = entry.clone();
-        saved.id = format!("saved-{}", random_id());
-        saved.object_name = format!("{}.image", saved.id);
-        saved.source_object_name = entry
-            .source_object_name
-            .as_ref()
-            .map(|_| format!("{}.source", saved.id));
-        let mut created = Vec::new();
-        let result = (|| -> Result<()> {
-            for (source, destination) in std::iter::once((
-                self.objects.join(&entry.object_name),
-                self.objects.join(&saved.object_name),
-            ))
-            .chain(
-                entry
-                    .source_object_name
-                    .as_ref()
-                    .zip(saved.source_object_name.as_ref())
-                    .map(|(a, b)| (self.objects.join(a), self.objects.join(b))),
-            ) {
-                let mut input = fs::File::open(source)?;
-                let mut output = OpenOptions::new()
-                    .write(true)
-                    .create_new(true)
-                    .open(&destination)?;
-                created.push(destination);
-                std::io::copy(&mut input, &mut output)?;
-                output.sync_all()?;
-            }
-            let thumbnail = self.thumbnails.join(thumbnail_name(&entry.id));
-            if thumbnail.exists() {
-                let destination = self.thumbnails.join(thumbnail_name(&saved.id));
-                let mut input = fs::File::open(thumbnail)?;
-                let mut output = OpenOptions::new()
-                    .write(true)
-                    .create_new(true)
-                    .open(&destination)?;
-                created.push(destination);
-                std::io::copy(&mut input, &mut output)?;
-                output.sync_all()?;
-            }
-            sync_directory(&self.objects)?;
-            sync_directory(&self.thumbnails)?;
-            Ok(())
-        })();
-        if let Err(error) = result {
-            for path in created {
-                let _ = fs::remove_file(path);
-            }
-            return Err(error);
-        }
-        next.pictures.insert(key.clone(), saved);
-        Ok(key)
-    }
-
     pub async fn favorite_queue_entry(&self, expected: u64, id: &str) -> Result<String> {
         let _guard = self.mutation.lock().await;
         let mut next = self.descriptor.read().await.clone();
@@ -1363,7 +1363,14 @@ impl QueueStore {
             .find(|entry| entry.id == id)
             .cloned()
             .context("queue entry not found")?;
-        let key = self.retain_picture(&mut next, &entry)?;
+        let objects = self.objects.clone();
+        let thumbnails = self.thumbnails.clone();
+        let (mut next, key) = tokio::task::spawn_blocking(move || -> Result<_> {
+            let key = retain_picture(&objects, &thumbnails, &mut next, &entry)?;
+            Ok((next, key))
+        })
+        .await
+        .context("favorite snapshot worker stopped")??;
         if !next
             .favorites
             .iter()
@@ -1451,13 +1458,58 @@ impl QueueStore {
             .collect()
     }
 
-    async fn commit_descriptor(&self, next: Descriptor) -> Result<()> {
+    async fn commit_descriptor(&self, mut next: Descriptor) -> Result<()> {
         let path = self.state_path.clone();
-        let disk = next.clone();
-        tokio::task::spawn_blocking(move || persist_descriptor(&path, &disk))
-            .await
-            .context("queue state worker stopped")??;
-        *self.descriptor.write().await = next;
+        let previous = self.descriptor.read().await.clone();
+        let objects = self.objects.clone();
+        let thumbnails = self.thumbnails.clone();
+        let result = tokio::task::spawn_blocking(move || -> Result<Descriptor> {
+            capture_current(&objects, &thumbnails, &previous, &mut next)?;
+            persist_descriptor(&path, &next)?;
+            Ok(next)
+        })
+        .await
+        .context("queue state worker stopped")?;
+        match result {
+            Ok(next) => {
+                self.cleanup_saved(&next);
+                *self.descriptor.write().await = next;
+                Ok(())
+            }
+            Err(error) => {
+                self.cleanup_saved(&*self.descriptor.read().await);
+                Err(error)
+            }
+        }
+    }
+
+    pub async fn history(&self) -> Vec<(HistoryRecord, QueueEntry)> {
+        let descriptor = self.descriptor.read().await;
+        descriptor
+            .history
+            .iter()
+            .filter_map(|item| {
+                descriptor
+                    .pictures
+                    .get(&item.picture_id)
+                    .map(|entry| (item.clone(), entry.clone()))
+            })
+            .collect()
+    }
+
+    pub async fn set_history_limit(&self, limit: usize) -> Result<()> {
+        if limit > 100_000 {
+            bail!("history limit must not exceed 100000");
+        }
+        let _guard = self.mutation.lock().await;
+        let mut next = self.descriptor.read().await.clone();
+        if next.history_limit == limit {
+            return Ok(());
+        }
+        next.history_limit = limit;
+        next.generation = next.generation.saturating_add(1);
+        self.commit_descriptor(next.clone()).await?;
+        self.notify(QueueEventReason::Library, next.generation);
         Ok(())
     }
 
@@ -1466,12 +1518,86 @@ impl QueueStore {
             .event_serial
             .fetch_add(1, Ordering::Relaxed)
             .saturating_add(1);
-        self.events.send_replace(QueueEvent {
-            serial,
-            revision,
-            reason,
+        self.events.send_modify(|event| {
+            let work_serial = event
+                .work_serial
+                .saturating_add(u64::from(reason != QueueEventReason::Library));
+            *event = QueueEvent {
+                serial,
+                revision,
+                reason,
+                work_serial,
+            };
         });
     }
+}
+
+/// Snapshot assets into a separate immutable namespace. Queue publication and
+/// cleanup are free to replace/delete queue-owned files without touching these.
+/// Caller holds `mutation` throughout copying and descriptor publication.
+fn retain_picture(
+    objects: &Path,
+    thumbnails: &Path,
+    next: &mut Descriptor,
+    entry: &QueueEntry,
+) -> Result<String> {
+    let key = composition_key(entry)?;
+    if next.pictures.contains_key(&key) {
+        return Ok(key);
+    }
+    let mut saved = entry.clone();
+    saved.id = format!("saved-{}", random_id());
+    saved.object_name = format!("{}.image", saved.id);
+    saved.source_object_name = entry
+        .source_object_name
+        .as_ref()
+        .map(|_| format!("{}.source", saved.id));
+    let mut created = Vec::new();
+    let result = (|| -> Result<()> {
+        for (source, destination) in std::iter::once((
+            objects.join(&entry.object_name),
+            objects.join(&saved.object_name),
+        ))
+        .chain(
+            entry
+                .source_object_name
+                .as_ref()
+                .zip(saved.source_object_name.as_ref())
+                .map(|(a, b)| (objects.join(a), objects.join(b))),
+        ) {
+            let mut input = fs::File::open(source)?;
+            let mut output = OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&destination)?;
+            created.push(destination);
+            std::io::copy(&mut input, &mut output)?;
+            output.sync_all()?;
+        }
+        let thumbnail = thumbnails.join(thumbnail_name(&entry.id));
+        if thumbnail.exists() {
+            let destination = thumbnails.join(thumbnail_name(&saved.id));
+            let mut input = fs::File::open(thumbnail)?;
+            let mut output = OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&destination)?;
+            created.push(destination);
+            std::io::copy(&mut input, &mut output)?;
+            output.sync_all()?;
+        }
+        sync_directory(&objects)?;
+        sync_directory(&thumbnails)?;
+        Ok(())
+    })();
+    if let Err(error) = result {
+        for path in created {
+            let _ = fs::remove_file(path);
+        }
+        return Err(error);
+    }
+    next.pictures.insert(key.clone(), saved);
+    Ok(key)
 }
 
 fn initialize(configured: &Path) -> Result<(PathBuf, PathBuf, PathBuf, Descriptor)> {
@@ -1509,6 +1635,7 @@ fn initialize(configured: &Path) -> Result<(PathBuf, PathBuf, PathBuf, Descripto
             pictures: BTreeMap::new(),
             history: Vec::new(),
             favorites: Vec::new(),
+            history_limit: default_history_limit(),
         };
         persist_descriptor(&state_path, &value)?;
         value
@@ -1568,6 +1695,9 @@ fn initialize(configured: &Path) -> Result<(PathBuf, PathBuf, PathBuf, Descripto
     }
     if descriptor.version < STATE_VERSION {
         migrate_descriptor(&objects, &mut descriptor)?;
+        let mut previous = descriptor.clone();
+        previous.entries.clear();
+        capture_current(&objects, &thumbnails, &previous, &mut descriptor)?;
         persist_descriptor(&state_path, &descriptor)?;
     }
     let expected = descriptor
@@ -1689,7 +1819,7 @@ fn publish_enqueue_batch(
     state_path: &Path,
     entries: &[QueueEntry],
     payloads: Vec<Vec<u8>>,
-    descriptor: &Descriptor,
+    descriptor: &mut Descriptor,
 ) -> Result<()> {
     let mut temporaries = Vec::new();
     let mut published = Vec::new();
@@ -1715,6 +1845,8 @@ fn publish_enqueue_batch(
             published.push(destination.clone());
         }
         sync_directory(objects)?;
+        let previous: Descriptor = toml::from_str(&fs::read_to_string(state_path)?)?;
+        capture_current(objects, &root.join(THUMBNAILS_DIR), &previous, descriptor)?;
         persist_descriptor(state_path, descriptor)?;
         let _ = sync_directory(root);
         Ok(())
@@ -1738,7 +1870,7 @@ fn publish_rendered_batch(
     state_path: &Path,
     entries: &[QueueEntry],
     payloads: Vec<(Vec<u8>, Vec<u8>, Vec<u8>)>,
-    descriptor: &Descriptor,
+    descriptor: &mut Descriptor,
 ) -> Result<()> {
     let mut temporaries = Vec::new();
     let mut published = Vec::new();
@@ -1782,6 +1914,8 @@ fn publish_rendered_batch(
         }
         sync_directory(objects)?;
         sync_directory(thumbnails)?;
+        let previous: Descriptor = toml::from_str(&fs::read_to_string(state_path)?)?;
+        capture_current(objects, &root.join(THUMBNAILS_DIR), &previous, descriptor)?;
         persist_descriptor(state_path, descriptor)?;
         let _ = sync_directory(root);
         Ok(())
@@ -2056,6 +2190,137 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn library_events_preserve_coalesced_refill_work() {
+        let dir = tempdir().unwrap();
+        let queue = QueueStore::new(dir.path(), false).await.unwrap();
+        let events = queue.subscribe();
+        let initial = events.borrow().work_serial;
+        queue.demand(QueueEventReason::Library);
+        assert_eq!(events.borrow().work_serial, initial);
+        queue.demand(QueueEventReason::Remove);
+        queue.demand(QueueEventReason::Library);
+        assert_eq!(events.borrow().reason, QueueEventReason::Library);
+        assert!(events.borrow().work_serial > initial);
+    }
+
+    #[tokio::test]
+    async fn history_tracks_current_transitions_not_reads_or_noops() {
+        let dir = tempdir().unwrap();
+        let queue = QueueStore::new(dir.path(), false).await.unwrap();
+        let entries = queue
+            .enqueue_rendered_batch(
+                None,
+                None,
+                vec![rendered_request("a.jpg", A), rendered_request("b.jpg", B)],
+            )
+            .await
+            .unwrap();
+        assert_eq!(queue.history().await.len(), 1);
+        assert_eq!(queue.history().await[0].1.display_name, "a.jpg");
+        let before = queue.history().await;
+        let generation = queue.snapshot().await.generation;
+        queue
+            .set_orientation(
+                generation,
+                &entries[0].id,
+                ImageOrientation::Portrait,
+                FrameTarget::Paper7,
+                crate::renderer::OutputMode::DirectJpeg,
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            queue.history().await,
+            before,
+            "editing current is not a promotion"
+        );
+        queue.current().await.unwrap();
+        let snapshot = queue.snapshot().await;
+        queue
+            .reorder(
+                snapshot.generation,
+                entries.iter().map(|entry| entry.id.clone()).collect(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(queue.history().await, before);
+        queue.advance(QueueAdvanceBehavior::Rotate).await.unwrap();
+        assert_eq!(queue.history().await.len(), 2);
+        assert_eq!(queue.history().await[0].1.display_name, "b.jpg");
+        queue.advance(QueueAdvanceBehavior::Rotate).await.unwrap();
+        assert_eq!(
+            queue.history().await.len(),
+            3,
+            "edited recipe is a distinct composition when promoted again"
+        );
+        assert_eq!(queue.history().await[0].1.display_name, "a.jpg");
+        queue.set_history_limit(1).await.unwrap();
+        assert_eq!(queue.history().await.len(), 1);
+        let before = queue.history().await;
+        drop(queue);
+        let queue = QueueStore::new(dir.path(), false).await.unwrap();
+        assert_eq!(queue.history().await, before);
+        queue.set_history_limit(0).await.unwrap();
+        queue.advance(QueueAdvanceBehavior::Rotate).await.unwrap();
+        assert!(queue.history().await.is_empty());
+        queue.set_history_limit(100).await.unwrap();
+        assert!(
+            queue.history().await.is_empty(),
+            "enabling history does not promote current"
+        );
+        let snapshot = queue.snapshot().await;
+        queue
+            .remove(snapshot.generation, &snapshot.entries[0].id)
+            .await
+            .unwrap();
+        assert_eq!(queue.history().await.len(), 1);
+        let before = queue.history().await;
+        assert!(
+            !queue
+                .advance(QueueAdvanceBehavior::DropAndRefill)
+                .await
+                .unwrap()
+        );
+        assert_eq!(queue.history().await, before);
+    }
+
+    #[tokio::test]
+    async fn history_records_front_and_empty_back_insertions_only() {
+        let dir = tempdir().unwrap();
+        let queue = QueueStore::new(dir.path(), false).await.unwrap();
+        queue
+            .enqueue_rendered_batch_at(
+                None,
+                None,
+                QueueInsertPosition::Back,
+                vec![rendered_request("a.jpg", A)],
+            )
+            .await
+            .unwrap();
+        queue
+            .enqueue_rendered_batch_at(
+                None,
+                None,
+                QueueInsertPosition::Back,
+                vec![rendered_request("b.jpg", B)],
+            )
+            .await
+            .unwrap();
+        assert_eq!(queue.history().await.len(), 1);
+        queue
+            .enqueue_rendered_batch_at(
+                None,
+                None,
+                QueueInsertPosition::Front,
+                vec![rendered_request("b.jpg", B)],
+            )
+            .await
+            .unwrap();
+        assert_eq!(queue.history().await[0].1.display_name, "b.jpg");
+        assert_eq!(queue.history().await.len(), 2);
+    }
+
+    #[tokio::test]
     async fn favorite_snapshot_survives_queue_edit_removal_and_restart() {
         let dir = tempdir().unwrap();
         let queue = QueueStore::new(dir.path(), false).await.unwrap();
@@ -2114,6 +2379,11 @@ mod tests {
         );
         let generation = reopened.snapshot().await.generation;
         reopened.remove_favorite(generation, &key).await.unwrap();
+        assert!(
+            reopened.objects.join(&favorite.object_name).exists(),
+            "history still owns snapshot"
+        );
+        reopened.set_history_limit(0).await.unwrap();
         assert!(!reopened.objects.join(&favorite.object_name).exists());
         assert!(reopened.favorites().await.is_empty());
     }
@@ -2122,6 +2392,7 @@ mod tests {
     async fn favorite_failure_does_not_publish_or_leak_snapshot_assets() {
         let dir = tempdir().unwrap();
         let queue = QueueStore::new(dir.path(), false).await.unwrap();
+        queue.set_history_limit(0).await.unwrap();
         let entry = queue
             .enqueue("legacy.jpg".into(), A.to_vec(), None, None)
             .await
@@ -2804,6 +3075,7 @@ mod tests {
             .await
             .unwrap();
         let before = queue.current().await.unwrap().unwrap().bytes;
+        let object_count = fs::read_dir(dir.path().join(OBJECTS_DIR)).unwrap().count();
         fs::remove_file(dir.path().join(STATE_FILE)).unwrap();
         fs::create_dir(dir.path().join(STATE_FILE)).unwrap();
         assert!(
@@ -2819,7 +3091,7 @@ mod tests {
         assert_eq!(queue.snapshot().await.entries[0].media_type, "image/jpeg");
         assert_eq!(
             fs::read_dir(dir.path().join(OBJECTS_DIR)).unwrap().count(),
-            2
+            object_count
         );
     }
 

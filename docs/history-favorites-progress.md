@@ -49,6 +49,17 @@ The main plan's boxes intentionally remain unchecked until their whole requireme
 - Verification before final namespace validation: CI test command: 95 passed, 0 failed, 1 ignored. Final verification is recorded in the commit/continuation report.
 - History, UI, imports, saved previews, and requeue operations remain unimplemented. The objective is not complete.
 
+## Current-slot history increment
+
+- Added central current-transition capture to descriptor commits and both enqueue publication helpers. History/queue are published atomically, and the exact persisted descriptor becomes the live enqueue state.
+- First entry of an empty-queue batch and front insertion are recorded; back insertion into a nonempty queue is not. Reorder, remove, drop, and rotate share the commit hook. Same-ID edits/rerenders and reads do not capture history.
+- Distinct compositions move to the top; immutable saved recipes remain unchanged when queue entries are edited. Store retention defaults to 100, has a validated limit setter, trims/clears atomically, and garbage-collects only unreferenced saved assets.
+- Older descriptor migrations seed their current entry once. Normal v5 startup does not reorder history or refresh timestamps.
+- Snapshot copying for favorite creation now runs on a blocking worker. Enqueue failures clean orphan saved assets against the still-live descriptor.
+- Added tests for current transitions, edits, no-op reorder, reads, rotation, deduplication, front/back insertion, trimming, disable/re-enable, blocked advancement, restart, and favorite/history shared retention.
+- Added a refill-work serial distinct from UI/library event serial so library saves do not trigger scans or hide coalesced queue work; supplier poll deadlines are preserved.
+- **Not done:** `[history]` settings and live settings synchronization, migration with configured history disabled, path/upload imports, HTTP/UI, saved previews, requeue, full security/concurrency audit, manual verification, and user documentation.
+
 ## Next concrete action
 
-Add current-slot capture consistently to ordinary commits and enqueue publication helpers; move snapshot copy I/O onto blocking workers before exposing HTTP handlers. Complete the deletion/publication audit and tests before enabling history/favorites. In particular inspect `preserve_legacy_source`, `remove`, `advance_internal`, `rerender_all`, orientation/text/edit operations, `publish_rerender`, `replace_derivative`, thumbnail publication, and startup orphan cleanup. Enqueues publish descriptors directly rather than exclusively through `commit_descriptor`, so a current-slot hook only in that method would miss initial/front enqueue transitions.
+Wire `[history] max_entries` through configuration, startup and live settings transactions (including configured-disable migration semantics). Then implement history-to-favorite and saved-to-queue store operations with front/back positions, and expose previews/import/UI routes. Complete the deletion/publication audit and additional failure/concurrency tests before marking the plan executed. In particular inspect `preserve_legacy_source`, `remove`, `advance_internal`, `rerender_all`, orientation/text/edit operations, `publish_rerender`, `replace_derivative`, thumbnail publication, and startup orphan cleanup. Enqueues publish descriptors directly rather than exclusively through `commit_descriptor`, so a current-slot hook only in that method would miss initial/front enqueue transitions.
