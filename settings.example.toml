@@ -10,6 +10,11 @@ max_upload_bytes = 26214400
 # Use "rotate" to move the previous photo to the back of the existing queue.
 advance_behavior = "drop_and_refill"
 
+[history]
+# Distinct compositions recently promoted to current. 0 disables and clears history.
+# Favorites are retained independently of this limit.
+max_entries = 100
+
 [rendering]
 target = "paper_7" # or "paper_l"
 output_mode = "server_dither_bmp" # or "direct_jpeg"

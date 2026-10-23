@@ -1,0 +1,40 @@
+<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>{{ title }} · Paper Frame</title>
+{% include "styles.html" %}
+<style>
+:root{font-family:system-ui,sans-serif;color:#232a26;background:#f4f6f3}body{max-width:1100px;margin:auto;padding:20px}nav,.actions,.pagination{display:flex;gap:12px;flex-wrap:wrap;align-items:center}a{color:#245d40}button{font:inherit;cursor:pointer;border:1px solid #bac8bd;border-radius:8px;padding:8px;background:white;color:#245d40}button:disabled{opacity:.5;cursor:wait}.grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(min(100%,260px),1fr));gap:18px;margin:24px 0}article{background:white;border:1px solid #d4ddd5;border-radius:12px;padding:14px;min-width:0}img{display:block;width:100%;height:220px;object-fit:contain;background:#eef1ed;border-radius:8px}h2{font-size:1.05rem;overflow-wrap:anywhere}small{display:block;color:#5a655e;margin-bottom:12px}.actions{gap:8px;margin:12px 0}.pagination{margin:24px 0}.danger{color:#a32828}form{margin:0}
+</style></head><body>
+<nav aria-label="Main navigation"><a href="/settings">Queue &amp; settings</a><a href="/history">History</a><a href="/favorites">Favorites</a></nav>
+<h1>{{ title }}</h1><p>{{ description }}</p><p><strong>Queue at front</strong> makes a picture current immediately. <strong>Queue at back</strong> appends it.</p>
+{% if favorites %}
+<section aria-label="Add a favorite"><h2>Add a favorite</h2>
+<p>Import a managed copy without adding it to the queue. One picture per submission.</p>
+<form method="post" action="/favorites/upload" enctype="multipart/form-data"><input type="hidden" name="csrf_token" value="{{ csrf_token }}"><input type="hidden" name="queue_generation" value="{{ generation }}"><input type="hidden" name="settings_generation" value="{{ settings_generation }}"><label>Picture from your device <input type="file" name="image" accept="image/*" required></label><button>Upload to favorites</button></form>
+<form method="post" action="/favorites/path" style="margin-top:16px"><input type="hidden" name="csrf_token" value="{{ csrf_token }}"><input type="hidden" name="queue_generation" value="{{ generation }}"><input type="hidden" name="settings_generation" value="{{ settings_generation }}"><label>Server source root <select name="root" required>{% for root in roots %}<option value="{{ root.index }}">{{ root.label }}</option>{% endfor %}</select></label> <label>Relative path <input name="path" placeholder="album/photo.jpg" required></label> <button>Add path to favorites</button><p><small>Relative to the selected configured root. Nested folders allowed; absolute paths, parent traversal and symlinks are rejected.</small></p></form>
+</section>
+{% endif %}
+{% if items.is_empty() %}<p>No pictures here yet.</p>{% endif %}
+<div class="grid">
+{% for item in items %}
+<article class="photo-card">
+<button class="photo-link" type="button" data-preview-trigger data-prefix="/saved" data-id="{{ item.id }}" data-name="{{ item.display_name }}" data-dithered="{{ item.dithered }}" data-dedicated="{{ item.dedicated }}" aria-label="Preview {{ item.display_name }}"><img src="/saved/thumbnail/{{ item.id }}" alt="{{ item.display_name }}" loading="lazy"></button>
+<h2>{{ item.display_name }}</h2><small>{{ item.timestamp }}</small>
+<div class="actions"><a href="/saved/preview/{{ item.id }}" target="_blank" rel="noopener">Preview original</a><a href="/saved/rendered/{{ item.id }}" target="_blank" rel="noopener">Saved composition</a><a href="/saved/original/{{ item.id }}" target="_blank" rel="noopener">Full source</a></div>
+<div class="actions">
+<form method="post" action="/queue/from-saved">
+<input type="hidden" name="csrf_token" value="{{ csrf_token }}"><input type="hidden" name="queue_generation" value="{{ generation }}"><input type="hidden" name="id" value="{{ item.id }}"><input type="hidden" name="source" value="{% if favorites %}favorites{% else %}history{% endif %}">
+<button name="position" value="front" title="Make this picture current immediately">Queue at front</button><button name="position" value="back">Queue at back</button>
+</form>
+{% if favorites %}
+<form method="post" action="/favorites/remove" onsubmit="return confirm('Remove this favorite? Queue and history are unaffected.')"><input type="hidden" name="csrf_token" value="{{ csrf_token }}"><input type="hidden" name="queue_generation" value="{{ generation }}"><input type="hidden" name="id" value="{{ item.id }}"><button class="danger">Remove favorite</button></form>
+{% else %}
+{% if item.favorite %}<span>★ Favorite</span>{% else %}
+<form method="post" action="/favorites/add"><input type="hidden" name="csrf_token" value="{{ csrf_token }}"><input type="hidden" name="queue_generation" value="{{ generation }}"><input type="hidden" name="id" value="{{ item.id }}"><input type="hidden" name="source" value="history"><button>☆ Favorite</button></form>
+{% endif %}{% endif %}
+</div></article>
+{% endfor %}
+</div>
+<nav class="pagination" aria-label="Pagination">{% if page > 1 %}<a href="{{ path }}?page={{ previous }}">Previous</a>{% endif %}<span>Page {{ page }} of {{ pages }}</span>{% if page < pages %}<a href="{{ path }}?page={{ next }}">Next</a>{% endif %}</nav>
+{% include "preview-dialog.html" %}
+{% include "preview-script.html" %}
+{% include "pending-submit-script.html" %}</body></html>

@@ -1,0 +1,22 @@
+{
+  "passed": true,
+  "browser": "Firefox WebDriver",
+  "checks": [
+    "desktop/mobile layout",
+    "loaded thumbnails",
+    "shared saved preview",
+    "queue favorite",
+    "server path import",
+    "client upload",
+    "front/back insertion",
+    "pending submit/position preservation",
+    "history trimming",
+    "PWA private-cache exclusion",
+    "restart"
+  ],
+  "viewport": {
+    "height": 758,
+    "width": 500
+  },
+  "root": "/tmp/paperframe-browser-5ETQ69"
+}

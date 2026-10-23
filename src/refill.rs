@@ -19,6 +19,7 @@ pub async fn run(state: Arc<AppState>, mut shutdown: watch::Receiver<bool>) {
         if *shutdown.borrow() {
             return;
         }
+        let work_serial = queue_events.borrow_and_update().work_serial;
         state.refill_started().await;
         let result = refill_once(&state).await;
         state.refill_finished(&result).await;
@@ -31,11 +32,23 @@ pub async fn run(state: Arc<AppState>, mut shutdown: watch::Receiver<bool>) {
         } else {
             state.registry().await.shortest_poll().unwrap_or(IDLE_POLL)
         };
-        tokio::select! {
-            _ = tokio::time::sleep(poll) => state.queue.demand(QueueEventReason::SupplierRefresh),
-            changed = queue_events.changed() => { if changed.is_err() { return; } }
-            changed = runtime.changed() => { if changed.is_err() { return; } }
-            changed = shutdown.changed() => { if changed.is_err() || *shutdown.borrow() { return; } }
+        let deadline = tokio::time::sleep(poll);
+        tokio::pin!(deadline);
+        loop {
+            tokio::select! {
+                _ = &mut deadline => {
+                    state.queue.demand(QueueEventReason::SupplierRefresh);
+                    break;
+                }
+                changed = queue_events.changed() => {
+                    if changed.is_err() { return; }
+                    if queue_events.borrow_and_update().work_serial != work_serial { break; }
+                    // Library-only changes refresh the UI, not supplier polling.
+                    // Keep the existing deadline so saves cannot postpone a scan.
+                }
+                changed = runtime.changed() => { if changed.is_err() { return; } break; }
+                changed = shutdown.changed() => { if changed.is_err() || *shutdown.borrow() { return; } break; }
+            }
         }
     }
 }

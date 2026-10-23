@@ -52,7 +52,12 @@ impl AppState {
             snapshot.settings.supplier().kind,
             SupplierKind::DigikamSqlite(_)
         );
-        let queue = QueueStore::new(&config.queue_dir, migrate_current).await?;
+        let queue = QueueStore::new_with_history_limit(
+            &config.queue_dir,
+            migrate_current,
+            snapshot.settings.history.max_entries,
+        )
+        .await?;
         let queue_snapshot = queue.snapshot().await;
         let needs_rerender = queue_snapshot.entries.iter().any(|entry| {
             let effective_mode = if entry.text_overlay.is_some() {

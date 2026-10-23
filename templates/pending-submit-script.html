@@ -1,0 +1,6 @@
+<script>
+// Capture clicked button's name/value before disabling controls. Native form
+// submission otherwise drops the insertion-position submitter.
+document.addEventListener('submit',event=>{const form=event.target;if(event.defaultPrevented)return;if(form.dataset.pending){event.preventDefault();return;}form.dataset.pending='true';const button=event.submitter;if(button&&button.name){const input=document.createElement('input');input.type='hidden';input.name=button.name;input.value=button.value;form.append(input);}form.querySelectorAll('button').forEach(button=>button.disabled=true);});
+window.addEventListener('pageshow',()=>{document.querySelectorAll('form').forEach(form=>{delete form.dataset.pending;form.querySelectorAll('button').forEach(button=>button.disabled=false);});});
+</script>

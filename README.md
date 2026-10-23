@@ -120,6 +120,30 @@ Advancing never consumes or rotates the only remaining image, so the frame keeps
 
 `target_length` is a refill target, not a maximum. In drop-and-refill mode supplier images are added until the queue reaches the target; direct uploads may make it longer.
 
+### Recent history and favorites
+
+Open **History** or **Favorites** from the control page. History means pictures that became the queue's **current (first) entry**, not confirmed frame deliveries. Repeated HTTP downloads and previews do not add history. Promoting the same composition again moves it to the top; a different orientation or text recipe is a distinct composition. Editing the current entry does not itself add a history event.
+
+Configure retention through Frame settings or at startup:
+
+```toml
+[history]
+max_entries = 100 # 0 disables and clears history; maximum 100000
+```
+
+Both collections are newest-first and paginated. **Queue at front** makes a saved picture current immediately; **Queue at back** appends it (and becomes current if the queue was empty). Each insertion creates an independent queue entry and intentional duplicates are allowed. Saved compositions are rendered for the current frame settings when requeued.
+
+Use **Favorite** on a queue or history card to retain its original and composition until explicitly removed. Later queue edits, history eviction, source changes/deletion, and supplier changes do not modify a favorite. Removing a favorite leaves queue/history references intact. Favorites are not automatically used for supplier refill.
+
+The Favorites page also imports one picture directly, without enqueueing:
+
+- **Upload to favorites** reads a picture from your device, using the same size/format/decoder limits as queue uploads.
+- **Add path to favorites** reads a relative path beneath a configured supplier root. Select the root (including the mapped root for DigiKam), then enter e.g. `album/photo.jpg`. Nested folders are supported. Absolute paths, `..`, symlinks, and non-regular files are rejected. Secure server-path imports currently require Unix; client uploads work on other platforms.
+
+Imports never modify source files or supplier-import tracking. Duplicate favorites are ignored. Reload and retry if another tab or queue advancement invalidated a form.
+
+**Storage and upgrades:** back up the entire managed data directory and settings before upgrading. Descriptor version 5 retains immutable saved copies separately from mutable queue assets; favorites are unbounded until removed, while history is count-bounded (not byte-bounded). Files are collected only after their final saved reference disappears. Saved copies can therefore use additional disk space even when the picture is also queued. Older binaries cannot read the new descriptor; downgrade by restoring the matching backup, not by editing the version number. Upgrading an older descriptor seeds its current picture once if history is enabled; ordinary restarts do not refresh its history timestamp.
+
 ### Refresh and supplier history
 
 - **Refresh supplier and refill** scans now instead of waiting for the next poll.
@@ -251,13 +275,16 @@ queue/
   objects/
     <opaque-id>.source
     <opaque-id>.<bmp-or-jpg>
+    saved-<opaque-id>.source
+    saved-<opaque-id>.image
   thumbnails/
     <opaque-id>.jpg
+    saved-<opaque-id>.jpg
 ```
 
 Do not manually edit, reorder, or remove these files while the server is running. Use the control page. To preserve queue order and supplier history, stop the server and back up the whole queue directory together.
 
-The queue descriptor and settings are atomically replaced. Queue objects use opaque names and immutable metadata. Text recipes are stored in the descriptor; a dedicated message also owns a minimal immutable canvas source so the same transactional source/derivative machinery applies. Thumbnails are bounded, derived cache files; missing thumbnails are regenerated from the immutable source or, for text-bearing entries, the already-dithered derivative. Startup reconciles safe temporary/orphan files and refuses to serve a descriptor that points to a missing, unsafe, or corrupt object.
+The queue descriptor and settings are each atomically replaced. They are separate files, not a single cross-file power-loss transaction. Live settings-save failures restore the previous history descriptor before returning; startup reapplies the configured history limit. An abrupt stop between the two replacements can leave history already trimmed, but cannot delete favorites or leave saved references pointing to queue-owned assets. Back up the complete data directory and settings together. Queue objects use opaque names and immutable metadata. Text recipes are stored in the descriptor; a dedicated message also owns a minimal immutable canvas source so the same transactional source/derivative machinery applies. Thumbnails are bounded, derived cache files; missing thumbnails are regenerated from the immutable source or, for text-bearing entries, the already-dithered derivative. Startup reconciles safe temporary/orphan files and refuses to serve a descriptor that points to a missing, unsafe, or corrupt object.
 
 Use three separate storage locations:
 
@@ -334,6 +361,11 @@ Most users only need `/settings` and the stable `/frame/current.jpg` endpoint. T
 | `GET` | `/pwa/*` | Progressive web app icons |
 | `GET` / `HEAD` | `/frame/current.jpg` | Stable backward-compatible endpoint; returns the configured JPEG or BMP representation |
 | `GET` / `HEAD` | `/frame/current.bmp` | Alias for the same configured representation |
+| `GET` | `/history`, `/favorites` | Paginated saved collections (`?page=1`, 24 per page) |
+| `GET` | `/saved/{thumbnail,preview,original,rendered,dithered-preview}/{id}` | Non-advancing retained-picture assets |
+| `POST` | `/favorites/add`, `/favorites/remove` | Save a queue/history composition or remove a favorite |
+| `POST` | `/favorites/path`, `/favorites/upload` | Import one picture directly into favorites |
+| `POST` | `/queue/from-saved` | Add a history/favorite composition at front or back |
 | `GET` | `/queue/thumbnail/{id}` | Non-advancing thumbnail |
 | `GET` | `/queue/preview/{id}` | Browser-compatible, undithered original preview |
 | `GET` | `/queue/original/{id}` | Retained original source bytes |
@@ -341,7 +373,7 @@ Most users only need `/settings` and the stable `/frame/current.jpg` endpoint. T
 | `GET` | `/queue/dithered-preview/{id}` | Browser-compatible, non-advancing six-color preview |
 | `POST` | `/queue/reorder` | Save complete current-first order |
 | `POST` | `/queue/remove` | Remove any queue entry |
-| `POST` | `/queue/upload` | Decode/render and append uploaded images |
+| `POST` | `/queue/upload` | Decode/render and insert uploaded images at front or back |
 | `POST` | `/queue/message` | Create and render a dedicated text queue item |
 | `POST` | `/queue/text` | Add or edit a queue entry's text recipe and stored derivative |
 | `POST` | `/queue/text/remove` | Remove a photo's text recipe and rebuild it from its retained source |
@@ -362,3 +394,11 @@ cargo clippy --all-targets --all-features -- -D warnings
 cargo test
 cargo build --release
 ```
+
+For a disposable real-browser history/favorites smoke check, start `geckodriver --port 4444`, then run:
+
+```sh
+PAPERFRAME_BINARY=target/release/paperframe-server node tools/verify-history-favorites-browser.mjs
+```
+
+Firefox must be installed (`FIREFOX_BINARY` can select it). The verifier creates its own temporary settings, queue and source fixtures, uses local port 18549, and prints a directory containing its report and desktop/narrow screenshots. Do not point it at production data.

@@ -11,7 +11,7 @@ use askama::Template;
 use axum::{
     Router,
     body::{Body, Bytes},
-    extract::{ConnectInfo, DefaultBodyLimit, Form, Multipart, Path as AxumPath, State},
+    extract::{ConnectInfo, DefaultBodyLimit, Form, Multipart, Path as AxumPath, Query, State},
     http::{HeaderMap, StatusCode, header},
     response::{Html, IntoResponse, Redirect, Response},
     routing::{get, post},
@@ -25,7 +25,7 @@ use tracing::{Level, error, info};
 
 use crate::{
     config::{
-        AdvancementSettings, DigikamSettings, ManualFolderSettings, PathMapping,
+        AdvancementSettings, DigikamSettings, HistorySettings, ManualFolderSettings, PathMapping,
         QueueAdvanceBehavior, QueueSettings, RenderingSettings, ReplaceSettingsError, Settings,
         SupplierKind, SupplierSettings,
     },
@@ -36,6 +36,10 @@ use crate::{
     },
     state::{AppState, ImageRequest},
 };
+
+mod imports;
+mod library;
+use library::{add_favorite, enqueue_saved, favorites_page, history_page, remove_favorite};
 
 const SETTINGS_LIMIT: usize = 64 * 1024;
 const UPLOAD_LIMIT: usize = 101 * 1024 * 1024;
@@ -55,6 +59,21 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/pwa/icon-maskable-512.png", get(icon_maskable_512))
         .route("/pwa/inter-variable.ttf", get(inter_font))
         .route("/settings", get(settings_page).post(update_settings))
+        .route("/history", get(history_page))
+        .route("/favorites", get(favorites_page))
+        .route("/favorites/add", post(add_favorite))
+        .route("/favorites/remove", post(remove_favorite))
+        .route("/favorites/path", post(imports::import_path))
+        .route(
+            "/favorites/upload",
+            post(imports::import_upload).layer(DefaultBodyLimit::max(UPLOAD_LIMIT)),
+        )
+        .route("/queue/from-saved", post(enqueue_saved))
+        .route("/saved/thumbnail/{id}", get(queue_thumbnail))
+        .route("/saved/preview/{id}", get(queue_preview))
+        .route("/saved/original/{id}", get(queue_original))
+        .route("/saved/rendered/{id}", get(queue_rendered))
+        .route("/saved/dithered-preview/{id}", get(queue_dithered_preview))
         .route("/queue/reorder", post(reorder_queue))
         .route("/queue/remove", post(remove_queue_entry))
         .route("/queue/advance", post(advance_queue))
@@ -168,6 +187,7 @@ struct QueueView {
     display_name: String,
     provenance: String,
     is_current: bool,
+    favorite: bool,
     orientation_label: String,
     portrait: bool,
     is_dithered: bool,
@@ -198,6 +218,7 @@ struct SettingsTemplate {
     supplier_status: String,
     target_length: String,
     max_upload_bytes: String,
+    history_max_entries: String,
     target_paper_7: bool,
     target_paper_l: bool,
     output_dither_bmp: bool,
@@ -228,6 +249,7 @@ struct SettingsForm {
     csrf_token: String,
     target_length: String,
     max_upload_bytes: String,
+    history_max_entries: String,
     frame_target: String,
     output_mode: String,
     advancement_type: String,
@@ -405,7 +427,16 @@ async fn update_settings(
             }
         }
     }
-    match state.settings.replace(expected, proposed).await {
+    let history_limit = proposed.history.max_entries;
+    let replacement = state
+        .queue
+        .with_history_limit(history_limit, state.settings.replace(expected, proposed))
+        .await;
+    let replacement = match replacement {
+        Ok(result) => result,
+        Err(error) => Err(ReplaceSettingsError::Persistence(error.to_string())),
+    };
+    match replacement {
         Ok(_) => {
             state.activate_registry(registry).await;
             state.queue.demand(QueueEventReason::Settings);
@@ -465,11 +496,16 @@ async fn render_settings(
     status: StatusCode,
 ) -> Response {
     let queue = state.queue.snapshot().await;
+    let favorite_ids = state.queue.queue_favorite_ids().await.unwrap_or_default();
     let entries = queue
         .entries
         .iter()
         .enumerate()
-        .map(|(index, entry)| queue_view(index, entry))
+        .map(|(index, entry)| {
+            let mut view = queue_view(index, entry);
+            view.favorite = favorite_ids.contains(&entry.id);
+            view
+        })
         .collect::<Vec<_>>();
     let reorder_lines = entries
         .iter()
@@ -527,6 +563,7 @@ async fn render_settings(
         supplier_status,
         target_length: form.target_length,
         max_upload_bytes: form.max_upload_bytes,
+        history_max_entries: form.history_max_entries,
         target_paper_7: form.frame_target == "paper_7",
         target_paper_l: form.frame_target == "paper_l",
         output_dither_bmp: form.output_mode == "server_dither_bmp",
@@ -608,6 +645,7 @@ fn queue_view(index: usize, entry: &QueueEntry) -> QueueView {
         display_name: entry.display_name.clone(),
         provenance,
         is_current: index == 0,
+        favorite: false,
         orientation_label: format!(
             "{}{}",
             match entry.orientation {
@@ -860,30 +898,7 @@ async fn upload_queue(State(state): State<Arc<AppState>>, mut multipart: Multipa
         uploads
             .into_iter()
             .map(|(display_name, bytes)| {
-                let decoded = crate::renderer::decode_source_named(&bytes, Some(&display_name))?;
-                let thumbnail = crate::renderer::thumbnail_jpeg(&decoded)?;
-                let rendered = crate::renderer::render_with_original(
-                    &decoded,
-                    &bytes,
-                    rendering.target,
-                    rendering.output_mode,
-                    decoded.orientation,
-                )?;
-                Ok(crate::queue::RenderedEnqueueRequest {
-                    display_name,
-                    source_bytes: bytes,
-                    derivative_bytes: rendered.bytes,
-                    thumbnail_bytes: thumbnail,
-                    media_type: rendered.media_type.into(),
-                    source_width: decoded.pixels.width(),
-                    source_height: decoded.pixels.height(),
-                    orientation: decoded.orientation,
-                    frame_target: rendering.target,
-                    text_overlay: None,
-                    dedicated_text: false,
-                    supplier_id: None,
-                    source_key: None,
-                })
+                imports::prepare_photo(display_name, bytes, rendering.clone())
             })
             .collect()
     })
@@ -1629,6 +1644,7 @@ impl SettingsForm {
             csrf_token: csrf.into(),
             target_length: settings.queue.target_length.to_string(),
             max_upload_bytes: settings.queue.max_upload_bytes.to_string(),
+            history_max_entries: settings.history.max_entries.to_string(),
             frame_target: match settings.rendering.target {
                 FrameTarget::Paper7 => "paper_7",
                 FrameTarget::PaperL => "paper_l",
@@ -1747,6 +1763,12 @@ impl SettingsForm {
             _ => return Err("Unknown supplier type".into()),
         };
         let settings = Settings {
+            history: HistorySettings {
+                max_entries: self
+                    .history_max_entries
+                    .parse()
+                    .map_err(|_| "Invalid history limit")?,
+            },
             queue: QueueSettings {
                 target_length: self
                     .target_length
@@ -1828,6 +1850,7 @@ mod tests {
         fs::write(source.join("a.jpg"), A).unwrap();
         fs::write(source.join("c.jpg"), C).unwrap();
         let settings = Settings {
+            history: HistorySettings::default(),
             queue: QueueSettings {
                 target_length: 3,
                 max_upload_bytes: 1024,
@@ -2172,6 +2195,14 @@ mod tests {
     #[tokio::test]
     async fn global_rendering_settings_rerender_the_whole_queue_before_activation() {
         let (_directory, state) = manual_state(AdvancementSettings::Manual).await;
+        let queue = state.queue.snapshot().await;
+        let key = state
+            .queue
+            .favorite_queue_entry(queue.generation, &queue.entries[0].id)
+            .await
+            .unwrap();
+        let saved = state.queue.prepare(&key).await.unwrap().bytes;
+        let history = state.queue.history().await;
         let snapshot = state.settings.snapshot().await;
         let mut form = SettingsForm::from_settings(
             snapshot.generation,
@@ -2199,6 +2230,8 @@ mod tests {
                 .output_mode,
             OutputMode::ServerDitherBmp
         );
+        assert_eq!(state.queue.prepare(&key).await.unwrap().bytes, saved);
+        assert_eq!(state.queue.history().await, history);
         let queue = state.queue.snapshot().await;
         assert!(
             queue
@@ -2254,6 +2287,8 @@ mod tests {
                 "JPEG source should pass through"
             );
         }
+        assert_eq!(state.queue.prepare(&key).await.unwrap().bytes, saved);
+        assert_eq!(state.queue.history().await, history);
     }
 
     #[tokio::test]
@@ -2352,8 +2387,9 @@ mod tests {
         let page = String::from_utf8(bytes(page).await.to_vec()).unwrap();
         assert!(page.contains("<dialog class=\"preview-dialog\""));
         assert!(page.contains("data-dithered=\"true\""));
-        assert!(page.contains("/queue/original/"));
-        assert!(page.contains("/queue/rendered/"));
+        assert!(page.contains("trigger.dataset.prefix||'/queue'"));
+        assert!(page.contains("prefix+'/original/'"));
+        assert!(page.contains("prefix+'/rendered/'"));
         assert_eq!(state.queue.snapshot().await.generation, before.generation);
 
         let generation = before.generation.to_string();
@@ -2729,6 +2765,496 @@ mod tests {
             image::ImageFormat::Png
         );
         assert!(!directory.path().join("source/direct.png").exists());
+    }
+
+    fn favorite_upload_body(
+        queue_generation: u64,
+        settings_generation: u64,
+        csrf: &str,
+        content: &[u8],
+    ) -> Vec<u8> {
+        let mut body = format!("--favorite-boundary\r\nContent-Disposition: form-data; name=\"csrf_token\"\r\n\r\n{csrf}\r\n--favorite-boundary\r\nContent-Disposition: form-data; name=\"queue_generation\"\r\n\r\n{queue_generation}\r\n--favorite-boundary\r\nContent-Disposition: form-data; name=\"settings_generation\"\r\n\r\n{settings_generation}\r\n--favorite-boundary\r\nContent-Disposition: form-data; name=\"image\"; filename=\"client.jpg\"\r\nContent-Type: image/jpeg\r\n\r\n").into_bytes();
+        body.extend_from_slice(content);
+        body.extend_from_slice(b"\r\n--favorite-boundary--\r\n");
+        body
+    }
+
+    #[tokio::test]
+    async fn favorite_imports_do_not_touch_queue_history_seen_or_source() {
+        let (directory, state) = manual_state(AdvancementSettings::Manual).await;
+        let before = state.queue.snapshot().await;
+        let history = state.queue.history().await;
+        let seen = state.queue.seen("manual").await;
+        let settings_generation = state.settings.snapshot().await.generation;
+        let app = router(state.clone());
+        let oversized = vec![0u8; 1025];
+        let mut bmp = std::io::Cursor::new(Vec::new());
+        image::DynamicImage::new_rgb8(1, 1)
+            .write_to(&mut bmp, image::ImageFormat::Bmp)
+            .unwrap();
+        let mut overdimensioned = bmp.into_inner();
+        overdimensioned[18..22]
+            .copy_from_slice(&(crate::renderer::MAX_SOURCE_DIMENSION + 1).to_le_bytes());
+        for (csrf, content, expected) in [
+            ("bad", B, StatusCode::FORBIDDEN),
+            (
+                state.csrf_token(),
+                &b"corrupt"[..],
+                StatusCode::UNPROCESSABLE_ENTITY,
+            ),
+            (
+                state.csrf_token(),
+                oversized.as_slice(),
+                StatusCode::PAYLOAD_TOO_LARGE,
+            ),
+            (
+                state.csrf_token(),
+                overdimensioned.as_slice(),
+                StatusCode::UNPROCESSABLE_ENTITY,
+            ),
+            (
+                state.csrf_token(),
+                &b"<svg xmlns='http://www.w3.org/2000/svg'/>"[..],
+                StatusCode::UNPROCESSABLE_ENTITY,
+            ),
+            (state.csrf_token(), B, StatusCode::SEE_OTHER),
+        ] {
+            let body = favorite_upload_body(
+                state.queue.snapshot().await.generation,
+                settings_generation,
+                csrf,
+                content,
+            );
+            let response = app
+                .clone()
+                .oneshot(
+                    Request::post("/favorites/upload")
+                        .header(
+                            header::CONTENT_TYPE,
+                            "multipart/form-data; boundary=favorite-boundary",
+                        )
+                        .body(Body::from(body))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), expected);
+        }
+        assert_eq!(state.queue.favorites().await.len(), 1);
+        fs::create_dir(directory.path().join("source/nested")).unwrap();
+        fs::write(directory.path().join("source/nested/photo.jpg"), C).unwrap();
+        for (root, path, expected) in [
+            ("0", "../settings.toml", StatusCode::UNPROCESSABLE_ENTITY),
+            ("99", "nested/photo.jpg", StatusCode::UNPROCESSABLE_ENTITY),
+            ("0", "nested/photo.jpg", StatusCode::SEE_OTHER),
+        ] {
+            let body = serde_urlencoded::to_string([
+                ("csrf_token", state.csrf_token().to_owned()),
+                (
+                    "queue_generation",
+                    state.queue.snapshot().await.generation.to_string(),
+                ),
+                ("settings_generation", settings_generation.to_string()),
+                ("root", root.into()),
+                ("path", path.into()),
+            ])
+            .unwrap();
+            let response = app
+                .clone()
+                .oneshot(
+                    Request::post("/favorites/path")
+                        .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
+                        .body(Body::from(body))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), expected);
+        }
+        assert_eq!(state.queue.favorites().await.len(), 2);
+        assert_eq!(state.queue.snapshot().await.entries, before.entries);
+        assert_eq!(state.queue.history().await, history);
+        assert_eq!(state.queue.seen("manual").await, seen);
+        assert_eq!(
+            fs::read(directory.path().join("source/nested/photo.jpg")).unwrap(),
+            C
+        );
+        fs::remove_dir_all(directory.path().join("source")).unwrap();
+        for (favorite, _) in state.queue.favorites().await {
+            let response = app
+                .clone()
+                .oneshot(
+                    Request::get(format!("/saved/original/{}", favorite.picture_id))
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+        }
+    }
+
+    #[tokio::test]
+    async fn favorite_upload_enforces_fixed_body_cap_before_publication() {
+        let (_directory, state) = manual_state(AdvancementSettings::Manual).await;
+        let before = state.queue.snapshot().await;
+        let history = state.queue.history().await;
+        let prefix = Bytes::from_static(b"--large-upload\r\nContent-Disposition: form-data; name=\"image\"; filename=\"large.jpg\"\r\nContent-Type: image/jpeg\r\n\r\n");
+        let chunk = Bytes::from(vec![0u8; 1024 * 1024]);
+        let length = prefix.len() + chunk.len() * 102;
+        let chunks = std::iter::once(Ok::<_, std::io::Error>(prefix))
+            .chain((0..102).map(move |_| Ok(chunk.clone())));
+        let body = Body::from_stream(futures_util::stream::iter(chunks));
+        let response = router(state.clone())
+            .oneshot(
+                Request::post("/favorites/upload")
+                    .header(
+                        header::CONTENT_TYPE,
+                        "multipart/form-data; boundary=large-upload",
+                    )
+                    .header(header::CONTENT_LENGTH, length.to_string())
+                    .body(body)
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
+        assert_eq!(state.queue.snapshot().await.entries, before.entries);
+        assert_eq!(state.queue.history().await, history);
+        assert!(state.queue.favorites().await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn history_follows_common_advancement_not_frame_delivery_under_all_policies() {
+        for policy in [
+            AdvancementSettings::Manual,
+            AdvancementSettings::Scheduled {
+                timezone: "UTC".into(),
+                times: vec!["12:00".into()],
+            },
+            AdvancementSettings::EveryFetch {
+                frame_client_ips: vec![],
+            },
+        ] {
+            let every_fetch = matches!(policy, AdvancementSettings::EveryFetch { .. });
+            let (_directory, state) = manual_state(policy).await;
+            let before = state.queue.history().await;
+            let response = router(state.clone())
+                .oneshot(frame_request("GET", [127, 0, 0, 1]))
+                .await
+                .unwrap();
+            bytes(response).await;
+            if every_fetch {
+                wait_for_current(&state, B).await;
+            } else {
+                assert_eq!(
+                    state.queue.history().await,
+                    before,
+                    "fetch alone must not write history"
+                );
+                // This is the same store operation called by manual/scheduled advancement.
+                state
+                    .queue
+                    .advance(
+                        state
+                            .settings
+                            .snapshot()
+                            .await
+                            .settings
+                            .queue
+                            .advance_behavior,
+                    )
+                    .await
+                    .unwrap();
+            }
+            let history = state.queue.history().await;
+            assert_eq!(history.len(), 2);
+            assert_eq!(history[0].1.display_name, "b.jpg");
+        }
+    }
+
+    #[tokio::test]
+    async fn library_mutations_reject_stale_unknown_and_invalid_sources_without_changes() {
+        let (_directory, state) = manual_state(AdvancementSettings::Manual).await;
+        let snapshot = state.queue.snapshot().await;
+        let history = state.queue.history().await;
+        let app = router(state.clone());
+        for (path, source, id, generation, expected) in [
+            (
+                "/favorites/add",
+                "queue",
+                snapshot.entries[0].id.as_str(),
+                snapshot.generation - 1,
+                StatusCode::CONFLICT,
+            ),
+            (
+                "/favorites/add",
+                "queue",
+                "unknown",
+                snapshot.generation,
+                StatusCode::CONFLICT,
+            ),
+            (
+                "/favorites/add",
+                "history",
+                "unknown",
+                snapshot.generation,
+                StatusCode::CONFLICT,
+            ),
+            (
+                "/favorites/add",
+                "invalid",
+                "unknown",
+                snapshot.generation,
+                StatusCode::UNPROCESSABLE_ENTITY,
+            ),
+            (
+                "/favorites/remove",
+                "favorites",
+                "unknown",
+                snapshot.generation,
+                StatusCode::CONFLICT,
+            ),
+            (
+                "/queue/from-saved",
+                "favorites",
+                "unknown",
+                snapshot.generation,
+                StatusCode::NOT_FOUND,
+            ),
+            (
+                "/queue/from-saved",
+                "invalid",
+                "unknown",
+                snapshot.generation,
+                StatusCode::UNPROCESSABLE_ENTITY,
+            ),
+        ] {
+            let body = serde_urlencoded::to_string([
+                ("csrf_token", state.csrf_token().to_owned()),
+                ("queue_generation", generation.to_string()),
+                ("source", source.into()),
+                ("id", id.into()),
+                ("position", "front".into()),
+            ])
+            .unwrap();
+            let response = app
+                .clone()
+                .oneshot(
+                    Request::post(path)
+                        .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
+                        .body(Body::from(body))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), expected, "{path} {source}");
+        }
+        for path in [
+            "/favorites/add",
+            "/favorites/remove",
+            "/queue/from-saved",
+            "/favorites/path",
+        ] {
+            let body = serde_urlencoded::to_string([
+                ("csrf_token", "bad".to_owned()),
+                ("queue_generation", snapshot.generation.to_string()),
+                ("source", "history".into()),
+                ("id", history[0].0.picture_id.clone()),
+                ("position", "front".into()),
+                ("settings_generation", "1".into()),
+                ("root", "0".into()),
+                ("path", "a.jpg".into()),
+            ])
+            .unwrap();
+            let response = app
+                .clone()
+                .oneshot(
+                    Request::post(path)
+                        .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
+                        .body(Body::from(body))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::FORBIDDEN, "{path}");
+        }
+        assert_eq!(state.queue.snapshot().await.entries, snapshot.entries);
+        assert_eq!(state.queue.history().await, history);
+        assert!(state.queue.favorites().await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn library_pages_and_actions_are_protected_and_retained_previews_work() {
+        let (_directory, state) = manual_state(AdvancementSettings::Manual).await;
+        let app = router(state.clone());
+        for path in ["/history", "/favorites"] {
+            let response = app
+                .clone()
+                .oneshot(Request::get(path).body(Body::empty()).unwrap())
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            let html = String::from_utf8(bytes(response).await).unwrap();
+            assert!(html.contains("Queue &amp; settings"));
+        }
+        for path in [
+            "/history?page=0",
+            "/history?page=99999999",
+            "/favorites?page=-1",
+        ] {
+            let response = app
+                .clone()
+                .oneshot(Request::get(path).body(Body::empty()).unwrap())
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        }
+        let snapshot = state.queue.snapshot().await;
+        let id = snapshot.entries[0].id.clone();
+        for (csrf, expected) in [
+            ("bad", StatusCode::FORBIDDEN),
+            (state.csrf_token(), StatusCode::SEE_OTHER),
+        ] {
+            let body = serde_urlencoded::to_string([
+                ("csrf_token", csrf.to_owned()),
+                ("queue_generation", snapshot.generation.to_string()),
+                ("source", "queue".into()),
+                ("id", id.clone()),
+            ])
+            .unwrap();
+            let response = app
+                .clone()
+                .oneshot(
+                    Request::post("/favorites/add")
+                        .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
+                        .body(Body::from(body))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), expected);
+        }
+        let key = state.queue.favorites().await[0].0.picture_id.clone();
+        let snapshot = state.queue.snapshot().await;
+        state.queue.remove(snapshot.generation, &id).await.unwrap();
+        for kind in ["thumbnail", "preview", "original", "rendered"] {
+            let response = app
+                .clone()
+                .oneshot(
+                    Request::get(format!("/saved/{kind}/{key}"))
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK, "{kind}");
+            assert!(!bytes(response).await.is_empty());
+        }
+        for position in ["invalid", "front", "back"] {
+            let snapshot = state.queue.snapshot().await;
+            let body = serde_urlencoded::to_string([
+                ("csrf_token", state.csrf_token().to_owned()),
+                ("queue_generation", snapshot.generation.to_string()),
+                ("source", "favorites".into()),
+                ("id", key.clone()),
+                ("position", position.into()),
+            ])
+            .unwrap();
+            let response = app
+                .clone()
+                .oneshot(
+                    Request::post("/queue/from-saved")
+                        .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
+                        .body(Body::from(body))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            if position == "invalid" {
+                assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
+            } else {
+                assert_eq!(response.status(), StatusCode::SEE_OTHER);
+                let after = state.queue.snapshot().await;
+                assert_eq!(after.entries.len(), snapshot.entries.len() + 1);
+                let inserted = if position == "front" {
+                    &after.entries[0]
+                } else {
+                    after.entries.last().unwrap()
+                };
+                assert!(!snapshot.entries.iter().any(|entry| entry.id == inserted.id));
+                assert_eq!(inserted.display_name, "a.jpg");
+            }
+        }
+        let snapshot = state.queue.snapshot().await;
+        let body = serde_urlencoded::to_string([
+            ("csrf_token", state.csrf_token().to_owned()),
+            ("queue_generation", snapshot.generation.to_string()),
+            ("id", key),
+        ])
+        .unwrap();
+        let response = app
+            .oneshot(
+                Request::post("/favorites/remove")
+                    .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
+                    .body(Body::from(body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::SEE_OTHER);
+        assert!(state.queue.favorites().await.is_empty());
+        assert!(!state.queue.history().await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn history_settings_form_updates_limit_and_preserves_history_on_save_failure() {
+        let (directory, state) = manual_state(AdvancementSettings::Manual).await;
+        let before = state.queue.history().await;
+        assert!(!before.is_empty());
+        let snapshot = state.settings.snapshot().await;
+        let mut form = SettingsForm::from_settings(
+            snapshot.generation,
+            state.csrf_token(),
+            &snapshot.settings,
+        );
+        form.history_max_entries = "0".into();
+        let path = directory.path().join("settings.toml");
+        let settings_bytes = fs::read(&path).unwrap();
+        fs::remove_file(&path).unwrap();
+        fs::create_dir(&path).unwrap();
+        let response = router(state.clone())
+            .oneshot(
+                Request::post("/settings")
+                    .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
+                    .body(Body::from(serde_urlencoded::to_string(&form).unwrap()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(state.queue.history().await, before);
+        assert_eq!(
+            state.settings.snapshot().await.settings.history.max_entries,
+            100
+        );
+        fs::remove_dir(&path).unwrap();
+        fs::write(&path, settings_bytes).unwrap();
+        let response = router(state.clone())
+            .oneshot(
+                Request::post("/settings")
+                    .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
+                    .body(Body::from(serde_urlencoded::to_string(&form).unwrap()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::SEE_OTHER);
+        assert!(state.queue.history().await.is_empty());
+        assert_eq!(
+            state.settings.snapshot().await.settings.history.max_entries,
+            0
+        );
     }
 
     #[tokio::test]

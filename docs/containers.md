@@ -18,6 +18,8 @@ On the first start of a new `/data` volume, the entrypoint creates `/data/settin
 
 Source photos and DigiKam files should always be mounted read-only. Only `/data` needs write access.
 
+History and favorites are persisted inside the managed queue data under `/data`; back up that data together with settings. Favorites can grow without a retention limit. Server-relative favorite imports use the already configured source-folder/DigiKam mounts (including nested files); paths refer to those container-visible roots, not arbitrary host paths. No additional writable source mount is needed.
+
 Each queued item stores its encoded source and one served derivative. A Paper 7 BMP is about 188 KiB and a Paper L BMP about 938 KiB, in addition to the original, so size persistent storage for the queue target and source-photo sizes. Rendering is pure Rust, serialized to one job, and uses bounded decoded-image memory; the example 512 MiB memory limit accommodates the 256 MiB decoder ceiling plus a Paper L framebuffer/error buffers. CPU limits primarily affect enqueue, preview, and settings-wide rerender latency, not static frame downloads. Keep enough termination grace for an in-progress render and descriptor publication.
 
 ## Build and run with Docker

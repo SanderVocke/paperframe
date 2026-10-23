@@ -57,9 +57,29 @@ impl Config {
 #[derive(Clone, Debug, Serialize, PartialEq, Eq)]
 pub struct Settings {
     pub queue: QueueSettings,
+    pub history: HistorySettings,
     pub rendering: RenderingSettings,
     pub advancement: AdvancementSettings,
     pub suppliers: Vec<SupplierSettings>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct HistorySettings {
+    #[serde(default = "default_history_entries")]
+    pub max_entries: usize,
+}
+
+fn default_history_entries() -> usize {
+    100
+}
+
+impl Default for HistorySettings {
+    fn default() -> Self {
+        Self {
+            max_entries: default_history_entries(),
+        }
+    }
 }
 
 #[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
@@ -206,6 +226,8 @@ struct OldTagged {
 struct CanonicalSettings {
     queue: QueueSettings,
     #[serde(default)]
+    history: HistorySettings,
+    #[serde(default)]
     rendering: RenderingSettings,
     advancement: AdvancementSettings,
     suppliers: Vec<SupplierSettings>,
@@ -224,6 +246,7 @@ impl<'de> Deserialize<'de> for Settings {
             let current: CanonicalSettings = value.try_into().map_err(D::Error::custom)?;
             return Ok(Self {
                 queue: current.queue,
+                history: current.history,
                 rendering: current.rendering,
                 advancement: current.advancement,
                 suppliers: current.suppliers,
@@ -247,6 +270,7 @@ fn migrate_old_mode(mode: OldModeSettings) -> Settings {
                 max_upload_bytes: settings.max_upload_bytes,
                 advance_behavior: QueueAdvanceBehavior::default(),
             },
+            history: HistorySettings::default(),
             rendering: RenderingSettings::default(),
             advancement: AdvancementSettings::EveryFetch {
                 frame_client_ips: Vec::new(),
@@ -270,6 +294,7 @@ fn migrate_digikam(old: OldDigikamSettings) -> Settings {
             max_upload_bytes: DEFAULT_UPLOAD_BYTES,
             advance_behavior: QueueAdvanceBehavior::default(),
         },
+        history: HistorySettings::default(),
         rendering: RenderingSettings::default(),
         advancement: AdvancementSettings::Scheduled {
             timezone: old.selection.timezone,
@@ -299,6 +324,9 @@ impl Settings {
     }
 
     pub fn validate(&self) -> Result<()> {
+        if self.history.max_entries > 100_000 {
+            bail!("history.max_entries must not exceed 100000");
+        }
         if self.queue.target_length == 0 || self.queue.target_length > 100_000 {
             bail!("target_length must be between 1 and 100000");
         }
@@ -561,6 +589,7 @@ mod tests {
         let tagged = "mode='digikam_sqlite'\n[mode_settings]\ndatabase_path='/db'\nquery='SELECT 1'\nmax_candidates=10\n[[mode_settings.path_mappings]]\ndatabase_root='/a'\nmounted_root='/b'\n[mode_settings.selection]\nmode='daily_random'\nrandom_seed='old'\ntimezone='UTC'\nrollover_time='03:00'\n";
         let tagged_digi: Settings = toml::from_str(tagged).unwrap();
         assert_eq!(tagged_digi.queue.target_length, 10);
+        assert_eq!(tagged_digi.history.max_entries, 100);
         assert!(matches!(
             tagged_digi.supplier().kind,
             SupplierKind::DigikamSqlite(_)
@@ -572,6 +601,12 @@ mod tests {
         let mut settings: Settings = toml::from_str("queue={target_length=10,max_upload_bytes=100}\nadvancement={type='manual'}\n[[suppliers]]\nid='one'\ntype='manual_folder'\n[suppliers.settings]\ndirectory='/images'\npoll_interval_seconds=60\n").unwrap();
         settings.validate().unwrap();
         assert_eq!(settings.rendering, RenderingSettings::default());
+        assert_eq!(settings.history.max_entries, 100);
+        settings.history.max_entries = 0;
+        settings.validate().unwrap();
+        settings.history.max_entries = 100_001;
+        assert!(settings.validate().is_err());
+        settings.history.max_entries = 100;
         settings.queue.target_length = 0;
         assert!(settings.validate().is_err());
         settings.queue.target_length = 10;
