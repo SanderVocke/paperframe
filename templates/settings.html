@@ -101,6 +101,7 @@ textarea.code{min-height:210px;font:12px/1.5 ui-monospace,SFMono-Regular,Consola
   </a>
   <div class="connection{% if !ready %} offline{% endif %}"><span class="connection-dot"></span>{% if ready %}Frame ready{% else %}Needs attention{% endif %}</div>
 </header>
+<nav aria-label="Photo collections" style="display:flex;gap:1rem;margin:1rem 0"><a href="/settings">Queue &amp; settings</a><a href="/history">History</a><a href="/favorites">Favorites</a></nav>
 
 {% match error %}{% when Some with (message) %}
 <div class="alert" role="alert"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor"><circle cx="12" cy="12" r="9"/><path d="M12 7v6m0 4h.01"/></svg><span>{{ message }}</span></div>
@@ -184,6 +185,7 @@ textarea.code{min-height:210px;font:12px/1.5 ui-monospace,SFMono-Regular,Consola
             <button class="icon-btn" type="button" data-move="down" title="Move later" aria-label="Move {{ image.display_name }} later"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor"><path d="m6 9 6 6 6-6"/></svg></button>
           </div>
           <button class="icon-btn" type="button" data-edit-trigger data-id="{{ image.id }}" data-name="{{ image.display_name }}" data-orientation="{% if image.portrait %}portrait{% else %}landscape{% endif %}" data-dedicated="{% if image.dedicated_text %}true{% else %}false{% endif %}" data-has-text="{% if image.has_text %}true{% else %}false{% endif %}" data-text="{{ image.text_body }}" data-horizontal="{{ image.text_horizontal }}" data-vertical="{{ image.text_vertical }}" data-background="{{ image.text_background }}" data-size="{{ image.text_size }}" title="Edit" aria-label="Edit {{ image.display_name }}"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor"><path d="m4 20 4.2-1 10.6-10.6a2.1 2.1 0 0 0-3-3L5.2 16 4 20Z"/><path d="m14.5 6.5 3 3"/></svg></button>
+          {% if image.favorite %}<span title="Saved in favorites">★</span>{% else %}<form method="post" action="/favorites/add"><input type="hidden" name="csrf_token" value="{{ csrf_token }}"><input type="hidden" name="queue_generation" value="{{ queue_generation }}"><input type="hidden" name="id" value="{{ image.id }}"><input type="hidden" name="source" value="queue"><button class="btn btn-quiet" type="submit" title="Save favorite">☆ Favorite</button></form>{% endif %}
           <form method="post" action="/queue/remove" onsubmit="return confirm('Remove this item from the queue?')">
             <input type="hidden" name="csrf_token" value="{{ csrf_token }}"><input type="hidden" name="queue_generation" value="{{ queue_generation }}"><input type="hidden" name="id" value="{{ image.id }}">
             <button class="icon-btn remove" type="submit" title="Remove from queue" aria-label="Remove {{ image.display_name }}"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor"><path d="M4 7h16m-10 4v6m4-6v6M9 7l1-3h4l1 3m3 0-1 14H7L6 7"/></svg></button>

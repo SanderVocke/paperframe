@@ -17,6 +17,7 @@ image = { version = "=0.25.6", default-features = false, features = ["bmp", "dds
 rand = "0.9"
 rusqlite = { version = "0.37", features = ["bundled"] }
 serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
 sha2 = "0.10"
 sqlparser = "0.59"
 tokio = { version = "1.0", features = ["fs", "io-util", "macros", "net", "rt-multi-thread", "signal", "sync", "time"] }
@@ -29,6 +30,5 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 base64 = "0.22"
 http-body-util = "0.1"
 serde_urlencoded = "0.7"
-serde_json = "1.0"
 tempfile = "3.0"
 tower = { version = "0.5", features = ["util"] }

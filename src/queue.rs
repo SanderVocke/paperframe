@@ -162,6 +162,20 @@ fn composition_key(entry: &QueueEntry) -> Result<String> {
 }
 
 #[derive(Clone, Debug)]
+pub struct LibraryItem {
+    pub picture_id: String,
+    pub entry: QueueEntry,
+    pub timestamp: i64,
+    pub favorite: bool,
+}
+
+pub struct LibraryPage {
+    pub generation: u64,
+    pub items: Vec<LibraryItem>,
+    pub pages: usize,
+}
+
+#[derive(Clone, Debug)]
 pub struct QueueSnapshot {
     pub generation: u64,
     pub entries: Vec<QueueEntry>,
@@ -1248,16 +1262,97 @@ impl QueueStore {
         }
     }
 
-    pub async fn prepare(&self, id: &str) -> Result<PreparedImage> {
-        let entry = self
-            .descriptor
-            .read()
-            .await
+    async fn resolve_read_entry(&self, id: &str) -> Result<QueueEntry> {
+        let descriptor = self.descriptor.read().await;
+        descriptor
             .entries
             .iter()
             .find(|entry| entry.id == id)
+            .or_else(|| descriptor.pictures.get(id))
             .cloned()
-            .context("queue entry not found")?;
+            .context("picture not found")
+    }
+
+    pub async fn library_page(
+        &self,
+        favorites: bool,
+        page: usize,
+        page_size: usize,
+    ) -> Result<LibraryPage> {
+        let descriptor = self.descriptor.read().await;
+        let total = if favorites {
+            descriptor.favorites.len()
+        } else {
+            descriptor.history.len()
+        };
+        if page_size == 0 || page_size > 100 || page == 0 {
+            bail!("invalid page");
+        }
+        let pages = total.div_ceil(page_size).max(1);
+        if page > pages {
+            bail!("page out of range");
+        }
+        let offset = (page - 1) * page_size;
+        let records: Vec<_> = if favorites {
+            descriptor
+                .favorites
+                .iter()
+                .skip(offset)
+                .take(page_size)
+                .map(|item| (&item.picture_id, item.added_at))
+                .collect()
+        } else {
+            descriptor
+                .history
+                .iter()
+                .skip(offset)
+                .take(page_size)
+                .map(|item| (&item.picture_id, item.last_current_at))
+                .collect()
+        };
+        let items = records
+            .into_iter()
+            .filter_map(|(id, timestamp)| {
+                descriptor.pictures.get(id).map(|entry| LibraryItem {
+                    picture_id: id.clone(),
+                    entry: entry.clone(),
+                    timestamp,
+                    favorite: descriptor
+                        .favorites
+                        .iter()
+                        .any(|item| &item.picture_id == id),
+                })
+            })
+            .collect();
+        Ok(LibraryPage {
+            generation: descriptor.generation,
+            items,
+            pages,
+        })
+    }
+
+    pub async fn queue_favorite_ids(&self) -> Result<HashSet<String>> {
+        let descriptor = self.descriptor.read().await;
+        descriptor
+            .entries
+            .iter()
+            .filter_map(|entry| match composition_key(entry) {
+                Ok(key)
+                    if descriptor
+                        .favorites
+                        .iter()
+                        .any(|item| item.picture_id == key) =>
+                {
+                    Some(Ok(entry.id.clone()))
+                }
+                Ok(_) => None,
+                Err(error) => Some(Err(error)),
+            })
+            .collect()
+    }
+
+    pub async fn prepare(&self, id: &str) -> Result<PreparedImage> {
+        let entry = self.resolve_read_entry(id).await?;
         let path = self.objects.join(&entry.object_name);
         let expected_digest = entry.digest.clone();
         let media_type = entry.media_type.clone();
@@ -1289,15 +1384,7 @@ impl QueueStore {
     }
 
     pub async fn prepare_source(&self, id: &str) -> Result<PreparedSource> {
-        let entry = self
-            .descriptor
-            .read()
-            .await
-            .entries
-            .iter()
-            .find(|entry| entry.id == id)
-            .cloned()
-            .context("queue entry not found")?;
+        let entry = self.resolve_read_entry(id).await?;
         let name = entry
             .source_object_name
             .clone()
@@ -1324,15 +1411,7 @@ impl QueueStore {
     }
 
     pub async fn prepare_thumbnail(&self, id: &str) -> Result<Option<PreparedThumbnail>> {
-        let entry = self
-            .descriptor
-            .read()
-            .await
-            .entries
-            .iter()
-            .find(|entry| entry.id == id)
-            .cloned()
-            .context("queue entry not found")?;
+        let entry = self.resolve_read_entry(id).await?;
         let path = self.thumbnails.join(thumbnail_name(&entry.id));
         tokio::task::spawn_blocking(move || -> Result<Option<PreparedThumbnail>> {
             let metadata = match fs::symlink_metadata(&path) {
@@ -1362,15 +1441,7 @@ impl QueueStore {
     pub async fn store_thumbnail(&self, id: &str, bytes: Vec<u8>) -> Result<PreparedThumbnail> {
         validate_jpeg(&bytes)?;
         let _guard = self.mutation.lock().await;
-        let entry = self
-            .descriptor
-            .read()
-            .await
-            .entries
-            .iter()
-            .find(|entry| entry.id == id)
-            .cloned()
-            .context("queue entry not found")?;
+        let entry = self.resolve_read_entry(id).await?;
         let directory = self.thumbnails.clone();
         let path = directory.join(thumbnail_name(&entry.id));
         tokio::task::spawn_blocking(move || -> Result<PreparedThumbnail> {
@@ -1483,6 +1554,18 @@ impl QueueStore {
     }
 
     /// Resolve only retained records; callers cannot use this to address arbitrary objects.
+    pub async fn saved_in_collection(&self, id: &str, favorites: bool) -> bool {
+        let descriptor = self.descriptor.read().await;
+        if favorites {
+            descriptor
+                .favorites
+                .iter()
+                .any(|item| item.picture_id == id)
+        } else {
+            descriptor.history.iter().any(|item| item.picture_id == id)
+        }
+    }
+
     pub async fn saved_picture(&self, picture_id: &str) -> Result<QueueEntry> {
         self.descriptor
             .read()
@@ -2379,6 +2462,39 @@ mod tests {
             supplier_id: None,
             source_key: None,
         }
+    }
+
+    #[tokio::test]
+    async fn library_pagination_is_bounded_and_has_no_missing_or_duplicate_records() {
+        let dir = tempdir().unwrap();
+        let queue = QueueStore::new(dir.path(), false).await.unwrap();
+        for index in 0..25u8 {
+            let mut bytes = A.to_vec();
+            // A valid JPEG comment changes content identity without changing pixels.
+            bytes.splice(2..2, [0xff, 0xfe, 0x00, 0x03, index]);
+            queue
+                .enqueue(format!("{index}.jpg"), bytes, None, None)
+                .await
+                .unwrap();
+        }
+        for _ in 0..24 {
+            queue.advance(QueueAdvanceBehavior::Rotate).await.unwrap();
+        }
+        let first = queue.library_page(false, 1, 24).await.unwrap();
+        let second = queue.library_page(false, 2, 24).await.unwrap();
+        assert_eq!(first.pages, 2);
+        assert_eq!(first.items.len(), 24);
+        assert_eq!(second.items.len(), 1);
+        assert!(
+            !first
+                .items
+                .iter()
+                .any(|item| item.picture_id == second.items[0].picture_id)
+        );
+        assert!(queue.library_page(false, usize::MAX, 24).await.is_err());
+        assert!(queue.library_page(false, 0, 24).await.is_err());
+        assert!(queue.library_page(false, 1, 0).await.is_err());
+        assert!(queue.library_page(false, 1, 101).await.is_err());
     }
 
     #[tokio::test]

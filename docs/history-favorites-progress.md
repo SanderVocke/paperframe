@@ -70,6 +70,17 @@ The main plan's boxes intentionally remain unchecked until their whole requireme
 - Verification: `cargo fmt --check` and `cargo test --locked --all-targets --all-features`: **102 passed, 0 failed, 1 ignored**.
 - The objective is still not complete. Settings and descriptor are separate files; cross-file process-crash recovery is not proven by the ordinary failure/rollback tests and remains an audit consideration.
 
+## Browsing and HTTP-action increment
+
+- Added paginated `/history` and `/favorites` pages (24 cards per page), collection navigation, lazy thumbnails, timestamps, favorite state, saved composition/original links, front/back queue actions, and favorite removal. Added Favorite actions to queue cards.
+- Added `src/routes/library.rs` and `templates/library.html`. Mutations validate CSRF, generation, typed source and insertion position; saved requeue runs under rendering-transition and render concurrency guards. Pending-submit handling preserves the clicked front/back button value.
+- Existing image preparation/thumbnail cache helpers now resolve retained picture keys as well as queue IDs. Saved thumbnails, previews, originals, and rendered assets remain accessible after queue removal, without arbitrary filesystem lookup.
+- Store pagination clones only the selected page and validates bounds; added page-size, overflow, and completeness tests.
+- Added integration test for pages/bad pagination, CSRF, retained previews, favorite add/remove, and both insertion positions.
+- Production-only checking exposed that composition identity uses `serde_json`, previously listed only as a dev dependency. Moved it to production dependencies and verified `cargo check --locked`.
+- Latest verification before the final pagination test: 103 passed, 0 failed, 1 ignored. Final results are recorded in the continuation/commit report.
+- **Still incomplete:** direct favorites upload/path import, shared in-page preview/card polish, complete stale/unknown-ID/security/concurrency tests, legacy compatible reuse, crash-recovery audit, docs, and manual desktop/mobile/PWA checks. No completion claim is made.
+
 ## Next concrete action
 
-Implement saved previews and paginated History/Favorites pages with CSRF-protected add/remove/front/back actions. Then implement direct favorite import/upload without transient queue insertion or supplier-seen updates. Audit compatible legacy reuse, cross-file crash recovery, saved-asset cleanup, failure/concurrency/security coverage, documentation, and manual desktop/mobile verification before marking the plan executed. In particular inspect `preserve_legacy_source`, `remove`, `advance_internal`, `rerender_all`, orientation/text/edit operations, `publish_rerender`, `replace_derivative`, thumbnail publication, and startup orphan cleanup. Enqueues publish descriptors directly rather than exclusively through `commit_descriptor`, so a current-slot hook only in that method would miss initial/front enqueue transitions.
+Implement a direct rendered-favorite publication operation, then client multipart upload and server relative-path imports with configured root selection and race-resistant no-symlink opening. Neither import may create a transient queue item or alter supplier-seen state. Follow with the remaining UI/test/audit/documentation gates above. In particular inspect `preserve_legacy_source`, `remove`, `advance_internal`, `rerender_all`, orientation/text/edit operations, `publish_rerender`, `replace_derivative`, thumbnail publication, and startup orphan cleanup. Enqueues publish descriptors directly rather than exclusively through `commit_descriptor`, so a current-slot hook only in that method would miss initial/front enqueue transitions.

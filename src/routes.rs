@@ -11,7 +11,7 @@ use askama::Template;
 use axum::{
     Router,
     body::{Body, Bytes},
-    extract::{ConnectInfo, DefaultBodyLimit, Form, Multipart, Path as AxumPath, State},
+    extract::{ConnectInfo, DefaultBodyLimit, Form, Multipart, Path as AxumPath, Query, State},
     http::{HeaderMap, StatusCode, header},
     response::{Html, IntoResponse, Redirect, Response},
     routing::{get, post},
@@ -37,6 +37,9 @@ use crate::{
     state::{AppState, ImageRequest},
 };
 
+mod library;
+use library::{add_favorite, enqueue_saved, favorites_page, history_page, remove_favorite};
+
 const SETTINGS_LIMIT: usize = 64 * 1024;
 const UPLOAD_LIMIT: usize = 101 * 1024 * 1024;
 const WEB_APP_MANIFEST: &[u8] = include_bytes!("../assets/pwa/manifest.webmanifest");
@@ -55,6 +58,15 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/pwa/icon-maskable-512.png", get(icon_maskable_512))
         .route("/pwa/inter-variable.ttf", get(inter_font))
         .route("/settings", get(settings_page).post(update_settings))
+        .route("/history", get(history_page))
+        .route("/favorites", get(favorites_page))
+        .route("/favorites/add", post(add_favorite))
+        .route("/favorites/remove", post(remove_favorite))
+        .route("/queue/from-saved", post(enqueue_saved))
+        .route("/saved/thumbnail/{id}", get(queue_thumbnail))
+        .route("/saved/preview/{id}", get(queue_preview))
+        .route("/saved/original/{id}", get(queue_original))
+        .route("/saved/rendered/{id}", get(queue_rendered))
         .route("/queue/reorder", post(reorder_queue))
         .route("/queue/remove", post(remove_queue_entry))
         .route("/queue/advance", post(advance_queue))
@@ -168,6 +180,7 @@ struct QueueView {
     display_name: String,
     provenance: String,
     is_current: bool,
+    favorite: bool,
     orientation_label: String,
     portrait: bool,
     is_dithered: bool,
@@ -476,11 +489,16 @@ async fn render_settings(
     status: StatusCode,
 ) -> Response {
     let queue = state.queue.snapshot().await;
+    let favorite_ids = state.queue.queue_favorite_ids().await.unwrap_or_default();
     let entries = queue
         .entries
         .iter()
         .enumerate()
-        .map(|(index, entry)| queue_view(index, entry))
+        .map(|(index, entry)| {
+            let mut view = queue_view(index, entry);
+            view.favorite = favorite_ids.contains(&entry.id);
+            view
+        })
         .collect::<Vec<_>>();
     let reorder_lines = entries
         .iter()
@@ -620,6 +638,7 @@ fn queue_view(index: usize, entry: &QueueEntry) -> QueueView {
         display_name: entry.display_name.clone(),
         provenance,
         is_current: index == 0,
+        favorite: false,
         orientation_label: format!(
             "{}{}",
             match entry.orientation {
@@ -2749,6 +2768,129 @@ mod tests {
             image::ImageFormat::Png
         );
         assert!(!directory.path().join("source/direct.png").exists());
+    }
+
+    #[tokio::test]
+    async fn library_pages_and_actions_are_protected_and_retained_previews_work() {
+        let (_directory, state) = manual_state(AdvancementSettings::Manual).await;
+        let app = router(state.clone());
+        for path in ["/history", "/favorites"] {
+            let response = app
+                .clone()
+                .oneshot(Request::get(path).body(Body::empty()).unwrap())
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            let html = String::from_utf8(bytes(response).await).unwrap();
+            assert!(html.contains("Queue &amp; settings"));
+        }
+        for path in [
+            "/history?page=0",
+            "/history?page=99999999",
+            "/favorites?page=-1",
+        ] {
+            let response = app
+                .clone()
+                .oneshot(Request::get(path).body(Body::empty()).unwrap())
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        }
+        let snapshot = state.queue.snapshot().await;
+        let id = snapshot.entries[0].id.clone();
+        for (csrf, expected) in [
+            ("bad", StatusCode::FORBIDDEN),
+            (state.csrf_token(), StatusCode::SEE_OTHER),
+        ] {
+            let body = serde_urlencoded::to_string([
+                ("csrf_token", csrf.to_owned()),
+                ("queue_generation", snapshot.generation.to_string()),
+                ("source", "queue".into()),
+                ("id", id.clone()),
+            ])
+            .unwrap();
+            let response = app
+                .clone()
+                .oneshot(
+                    Request::post("/favorites/add")
+                        .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
+                        .body(Body::from(body))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), expected);
+        }
+        let key = state.queue.favorites().await[0].0.picture_id.clone();
+        let snapshot = state.queue.snapshot().await;
+        state.queue.remove(snapshot.generation, &id).await.unwrap();
+        for kind in ["thumbnail", "preview", "original", "rendered"] {
+            let response = app
+                .clone()
+                .oneshot(
+                    Request::get(format!("/saved/{kind}/{key}"))
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK, "{kind}");
+            assert!(!bytes(response).await.is_empty());
+        }
+        for position in ["invalid", "front", "back"] {
+            let snapshot = state.queue.snapshot().await;
+            let body = serde_urlencoded::to_string([
+                ("csrf_token", state.csrf_token().to_owned()),
+                ("queue_generation", snapshot.generation.to_string()),
+                ("source", "favorites".into()),
+                ("id", key.clone()),
+                ("position", position.into()),
+            ])
+            .unwrap();
+            let response = app
+                .clone()
+                .oneshot(
+                    Request::post("/queue/from-saved")
+                        .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
+                        .body(Body::from(body))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            if position == "invalid" {
+                assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
+            } else {
+                assert_eq!(response.status(), StatusCode::SEE_OTHER);
+                let after = state.queue.snapshot().await;
+                assert_eq!(after.entries.len(), snapshot.entries.len() + 1);
+                let inserted = if position == "front" {
+                    &after.entries[0]
+                } else {
+                    after.entries.last().unwrap()
+                };
+                assert!(!snapshot.entries.iter().any(|entry| entry.id == inserted.id));
+                assert_eq!(inserted.display_name, "a.jpg");
+            }
+        }
+        let snapshot = state.queue.snapshot().await;
+        let body = serde_urlencoded::to_string([
+            ("csrf_token", state.csrf_token().to_owned()),
+            ("queue_generation", snapshot.generation.to_string()),
+            ("id", key),
+        ])
+        .unwrap();
+        let response = app
+            .oneshot(
+                Request::post("/favorites/remove")
+                    .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
+                    .body(Body::from(body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::SEE_OTHER);
+        assert!(state.queue.favorites().await.is_empty());
+        assert!(!state.queue.history().await.is_empty());
     }
 
     #[tokio::test]
