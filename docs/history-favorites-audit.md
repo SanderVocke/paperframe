@@ -2,7 +2,7 @@
 
 ## Success contract
 
-Complete every behavior and verification gate in `docs/history-favorites-plan.md`, preserve source/read-only and queue invariants, and push the finished work on `feature/history-favorites`. Tests, this matrix and a successful push are evidence, not substitutes for the requirements. Implementation and local verification are signed off below. The final remote/clean-tree gate remains pending until the final push is verified.
+Complete every behavior and verification gate in `docs/history-favorites-plan.md`, preserve source/read-only and queue invariants, and push the finished work on `feature/history-favorites`. Tests, this matrix and a successful push are evidence, not substitutes for the requirements. All implementation and verification requirements are signed off below. Implementation commit `02a72d7b00a9c1a5c79b825a51d181e88c532e95` was pushed to `origin/feature/history-favorites`; remote HEAD equality and a clean tree were observed. This final documentation-only sign-off is subject to the same post-push equality/clean-tree check.
 
 ## Evidence snapshot
 
@@ -13,7 +13,7 @@ Complete every behavior and verification gate in `docs/history-favorites-plan.md
 
 ## Per-checklist-item mapping
 
-IDs are phase.item in source-plan order. “Verified” maps to inspected implementation and the targeted assertion catalog below. “Pending” is the final remote aggregate gate, not a substitute for the local requirements.
+IDs are phase.item in source-plan order. “Verified” maps to inspected implementation and the targeted assertion catalog below. The final remote aggregate gate is backed by actual push/ref/working-tree command results, not by this table alone.
 
 | ID | Plan requirement | State | Concrete evidence |
 |---|---|---|---|
@@ -100,7 +100,7 @@ IDs are phase.item in source-plan order. “Verified” maps to inspected implem
 | 9.2 | Update shipped settings examples with the history section and defaults; update container docs if root mounting instructions need clarification. | Verified | `README.md` Recent history and favorites; both settings examples; `docs/containers.md`; final remote/tree audit still required. |
 | 9.3 | Explain disk usage: history is count-bounded, favorites are unbounded until removed, and objects are retained while any collection references them. | Verified | `README.md` Recent history and favorites; both settings examples; `docs/containers.md`; final remote/tree audit still required. |
 | 9.4 | Document migration/rollback implications of the new descriptor version and recommend backing up the managed data directory before upgrade. | Verified | `README.md` Recent history and favorites; both settings examples; `docs/containers.md`; final remote/tree audit still required. |
-| 9.5 | Completion requires all checklist behaviors implemented, migration/regression tests passing, and no queue-only cleanup path capable of deleting retained favorite/history assets. | Pending | Final commit, push, remote HEAD equality and clean-tree check must be observed. |
+| 9.5 | Completion requires all checklist behaviors implemented, migration/regression tests passing, and no queue-only cleanup path capable of deleting retained favorite/history assets. | Verified | Implementation `02a72d7` pushed; local/remote full SHA equality and clean tree observed. Final docs-only sign-off uses the same post-push checks. |
 
 ## Storage/mutation inventory and implementation adjustment
 
@@ -137,4 +137,4 @@ The plan preserves the existing per-file atomic settings-update/rollback contrac
 
 ## Final gate
 
-No implementation/test/UI/docs gap remains in the local review. The final aggregate 9.5 remains pending until the changes and signed-off checklist are committed and pushed, remote branch HEAD equals local HEAD, and the working tree is clean. Do not mark the active goal complete before observing those real command results.
+No implementation/test/UI/docs requirement remains uncovered in this review. The complete implementation was pushed and `git ls-remote origin refs/heads/feature/history-favorites` returned exactly the local implementation SHA above; `git status --short` was empty. The final documentation-only sign-off must also be pushed and checked with those commands before marking the active goal complete. The retained browser report is `docs/history-favorites-browser-report.json`; the executable verifier and detailed assertion catalog establish its scope rather than treating its green status as proof by itself.

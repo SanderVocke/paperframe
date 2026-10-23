@@ -154,4 +154,4 @@ Primary files: `src/routes.rs`, `templates/settings.html`.
 - [x] Update shipped settings examples with the history section and defaults; update container docs if root mounting instructions need clarification.
 - [x] Explain disk usage: history is count-bounded, favorites are unbounded until removed, and objects are retained while any collection references them.
 - [x] Document migration/rollback implications of the new descriptor version and recommend backing up the managed data directory before upgrade.
-- [ ] Completion requires all checklist behaviors implemented, migration/regression tests passing, and no queue-only cleanup path capable of deleting retained favorite/history assets.
+- [x] Completion requires all checklist behaviors implemented, migration/regression tests passing, and no queue-only cleanup path capable of deleting retained favorite/history assets.
