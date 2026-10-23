@@ -25,7 +25,7 @@ use tracing::{Level, error, info};
 
 use crate::{
     config::{
-        AdvancementSettings, DigikamSettings, ManualFolderSettings, PathMapping,
+        AdvancementSettings, DigikamSettings, HistorySettings, ManualFolderSettings, PathMapping,
         QueueAdvanceBehavior, QueueSettings, RenderingSettings, ReplaceSettingsError, Settings,
         SupplierKind, SupplierSettings,
     },
@@ -198,6 +198,7 @@ struct SettingsTemplate {
     supplier_status: String,
     target_length: String,
     max_upload_bytes: String,
+    history_max_entries: String,
     target_paper_7: bool,
     target_paper_l: bool,
     output_dither_bmp: bool,
@@ -228,6 +229,7 @@ struct SettingsForm {
     csrf_token: String,
     target_length: String,
     max_upload_bytes: String,
+    history_max_entries: String,
     frame_target: String,
     output_mode: String,
     advancement_type: String,
@@ -405,7 +407,16 @@ async fn update_settings(
             }
         }
     }
-    match state.settings.replace(expected, proposed).await {
+    let history_limit = proposed.history.max_entries;
+    let replacement = state
+        .queue
+        .with_history_limit(history_limit, state.settings.replace(expected, proposed))
+        .await;
+    let replacement = match replacement {
+        Ok(result) => result,
+        Err(error) => Err(ReplaceSettingsError::Persistence(error.to_string())),
+    };
+    match replacement {
         Ok(_) => {
             state.activate_registry(registry).await;
             state.queue.demand(QueueEventReason::Settings);
@@ -527,6 +538,7 @@ async fn render_settings(
         supplier_status,
         target_length: form.target_length,
         max_upload_bytes: form.max_upload_bytes,
+        history_max_entries: form.history_max_entries,
         target_paper_7: form.frame_target == "paper_7",
         target_paper_l: form.frame_target == "paper_l",
         output_dither_bmp: form.output_mode == "server_dither_bmp",
@@ -1629,6 +1641,7 @@ impl SettingsForm {
             csrf_token: csrf.into(),
             target_length: settings.queue.target_length.to_string(),
             max_upload_bytes: settings.queue.max_upload_bytes.to_string(),
+            history_max_entries: settings.history.max_entries.to_string(),
             frame_target: match settings.rendering.target {
                 FrameTarget::Paper7 => "paper_7",
                 FrameTarget::PaperL => "paper_l",
@@ -1747,6 +1760,12 @@ impl SettingsForm {
             _ => return Err("Unknown supplier type".into()),
         };
         let settings = Settings {
+            history: HistorySettings {
+                max_entries: self
+                    .history_max_entries
+                    .parse()
+                    .map_err(|_| "Invalid history limit")?,
+            },
             queue: QueueSettings {
                 target_length: self
                     .target_length
@@ -1828,6 +1847,7 @@ mod tests {
         fs::write(source.join("a.jpg"), A).unwrap();
         fs::write(source.join("c.jpg"), C).unwrap();
         let settings = Settings {
+            history: HistorySettings::default(),
             queue: QueueSettings {
                 target_length: 3,
                 max_upload_bytes: 1024,
@@ -2729,6 +2749,56 @@ mod tests {
             image::ImageFormat::Png
         );
         assert!(!directory.path().join("source/direct.png").exists());
+    }
+
+    #[tokio::test]
+    async fn history_settings_form_updates_limit_and_preserves_history_on_save_failure() {
+        let (directory, state) = manual_state(AdvancementSettings::Manual).await;
+        let before = state.queue.history().await;
+        assert!(!before.is_empty());
+        let snapshot = state.settings.snapshot().await;
+        let mut form = SettingsForm::from_settings(
+            snapshot.generation,
+            state.csrf_token(),
+            &snapshot.settings,
+        );
+        form.history_max_entries = "0".into();
+        let path = directory.path().join("settings.toml");
+        let settings_bytes = fs::read(&path).unwrap();
+        fs::remove_file(&path).unwrap();
+        fs::create_dir(&path).unwrap();
+        let response = router(state.clone())
+            .oneshot(
+                Request::post("/settings")
+                    .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
+                    .body(Body::from(serde_urlencoded::to_string(&form).unwrap()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(state.queue.history().await, before);
+        assert_eq!(
+            state.settings.snapshot().await.settings.history.max_entries,
+            100
+        );
+        fs::remove_dir(&path).unwrap();
+        fs::write(&path, settings_bytes).unwrap();
+        let response = router(state.clone())
+            .oneshot(
+                Request::post("/settings")
+                    .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
+                    .body(Body::from(serde_urlencoded::to_string(&form).unwrap()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::SEE_OTHER);
+        assert!(state.queue.history().await.is_empty());
+        assert_eq!(
+            state.settings.snapshot().await.settings.history.max_entries,
+            0
+        );
     }
 
     #[tokio::test]

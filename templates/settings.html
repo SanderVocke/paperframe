@@ -261,6 +261,7 @@ textarea.code{min-height:210px;font:12px/1.5 ui-monospace,SFMono-Regular,Consola
             <div class="settings-grid">
               <div>
                 <div class="field"><label for="target_length">Photos to keep ready</label><input id="target_length" name="target_length" type="number" min="1" max="100000" value="{{ target_length }}" required><span class="hint">The library fills the queue up to this number.</span></div>
+                <div class="field"><label for="history_max_entries">Recent history limit</label><input id="history_max_entries" name="history_max_entries" type="number" min="0" max="100000" value="{{ history_max_entries }}" required><span class="hint">Distinct pictures recently in the current queue slot, not confirmed frame deliveries. Set 0 to disable and clear history; favorites are kept.</span></div>
                 <div class="field"><label for="max_upload_bytes">Upload size limit</label><input id="max_upload_bytes" name="max_upload_bytes" type="number" min="1" max="104857600" value="{{ max_upload_bytes }}" required><span class="hint">Maximum bytes in one upload.</span></div>
                 <div class="field"><label for="supplier_id">Source name</label><input id="supplier_id" name="supplier_id" value="{{ supplier_id }}" required><span class="hint">Changing this lets previously used library photos appear again.</span></div>
               </div>
