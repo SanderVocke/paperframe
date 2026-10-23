@@ -39,6 +39,16 @@ The main plan's boxes intentionally remain unchecked until their whole requireme
 | 8 verification | Only schema/identity and existing regressions covered; feature/security/concurrency/manual tests remain. |
 | 9 docs/completion | User docs/examples, migration guidance, completed checklist, final audit remain. |
 
+## Retention/store increment
+
+- Implemented queue-to-favorite store operation with generation validation and idempotent duplicate adds; implemented favorite removal.
+- Saved compositions own independent `saved-<opaque-id>` image/source/thumbnail files. This deliberately trades extra disk space for isolation from existing queue overwrite/delete behavior. Queue-owned files are never referenced by saved records; no queue deletion path needs to keep a saved-owned file alive.
+- Saved-file GC follows descriptor reachability, runs under the mutation lock, and only removes the saved namespace. Removing the last favorite retains a snapshot if history still references it.
+- Startup validates saved identity, asset namespace, references, and assets, and includes saved assets in orphan-cleanup reachability.
+- Added tests for idempotency, queue orientation edits, queue removal, restart retention, final removal, and failed descriptor publication with snapshot cleanup.
+- Verification before final namespace validation: CI test command: 95 passed, 0 failed, 1 ignored. Final verification is recorded in the commit/continuation report.
+- History, UI, imports, saved previews, and requeue operations remain unimplemented. The objective is not complete.
+
 ## Next concrete action
 
-Finish auditing deletion and publication paths in `src/queue.rs`, then implement immutable saved-object ownership and reachability cleanup before enabling history/favorites. In particular inspect `preserve_legacy_source`, `remove`, `advance_internal`, `rerender_all`, orientation/text/edit operations, `publish_rerender`, `replace_derivative`, thumbnail publication, and startup orphan cleanup. Enqueues publish descriptors directly rather than exclusively through `commit_descriptor`, so a current-slot hook only in that method would miss initial/front enqueue transitions.
+Add current-slot capture consistently to ordinary commits and enqueue publication helpers; move snapshot copy I/O onto blocking workers before exposing HTTP handlers. Complete the deletion/publication audit and tests before enabling history/favorites. In particular inspect `preserve_legacy_source`, `remove`, `advance_internal`, `rerender_all`, orientation/text/edit operations, `publish_rerender`, `replace_derivative`, thumbnail publication, and startup orphan cleanup. Enqueues publish descriptors directly rather than exclusively through `commit_descriptor`, so a current-slot hook only in that method would miss initial/front enqueue transitions.

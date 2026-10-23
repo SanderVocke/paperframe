@@ -186,6 +186,7 @@ pub enum QueueEventReason {
     SupplierRefresh,
     SeenReset,
     Settings,
+    Library,
 }
 
 #[derive(Clone, Debug)]
@@ -1289,6 +1290,167 @@ impl QueueStore {
         .context("queue thumbnail publication worker stopped")?
     }
 
+    /// Snapshot assets into a separate immutable namespace. Queue publication and
+    /// cleanup are free to replace/delete queue-owned files without touching these.
+    /// Caller holds `mutation` throughout copying and descriptor publication.
+    fn retain_picture(&self, next: &mut Descriptor, entry: &QueueEntry) -> Result<String> {
+        let key = composition_key(entry)?;
+        if next.pictures.contains_key(&key) {
+            return Ok(key);
+        }
+        let mut saved = entry.clone();
+        saved.id = format!("saved-{}", random_id());
+        saved.object_name = format!("{}.image", saved.id);
+        saved.source_object_name = entry
+            .source_object_name
+            .as_ref()
+            .map(|_| format!("{}.source", saved.id));
+        let mut created = Vec::new();
+        let result = (|| -> Result<()> {
+            for (source, destination) in std::iter::once((
+                self.objects.join(&entry.object_name),
+                self.objects.join(&saved.object_name),
+            ))
+            .chain(
+                entry
+                    .source_object_name
+                    .as_ref()
+                    .zip(saved.source_object_name.as_ref())
+                    .map(|(a, b)| (self.objects.join(a), self.objects.join(b))),
+            ) {
+                let mut input = fs::File::open(source)?;
+                let mut output = OpenOptions::new()
+                    .write(true)
+                    .create_new(true)
+                    .open(&destination)?;
+                created.push(destination);
+                std::io::copy(&mut input, &mut output)?;
+                output.sync_all()?;
+            }
+            let thumbnail = self.thumbnails.join(thumbnail_name(&entry.id));
+            if thumbnail.exists() {
+                let destination = self.thumbnails.join(thumbnail_name(&saved.id));
+                let mut input = fs::File::open(thumbnail)?;
+                let mut output = OpenOptions::new()
+                    .write(true)
+                    .create_new(true)
+                    .open(&destination)?;
+                created.push(destination);
+                std::io::copy(&mut input, &mut output)?;
+                output.sync_all()?;
+            }
+            sync_directory(&self.objects)?;
+            sync_directory(&self.thumbnails)?;
+            Ok(())
+        })();
+        if let Err(error) = result {
+            for path in created {
+                let _ = fs::remove_file(path);
+            }
+            return Err(error);
+        }
+        next.pictures.insert(key.clone(), saved);
+        Ok(key)
+    }
+
+    pub async fn favorite_queue_entry(&self, expected: u64, id: &str) -> Result<String> {
+        let _guard = self.mutation.lock().await;
+        let mut next = self.descriptor.read().await.clone();
+        require_generation(&next, expected)?;
+        let entry = next
+            .entries
+            .iter()
+            .find(|entry| entry.id == id)
+            .cloned()
+            .context("queue entry not found")?;
+        let key = self.retain_picture(&mut next, &entry)?;
+        if !next
+            .favorites
+            .iter()
+            .any(|favorite| favorite.picture_id == key)
+        {
+            next.favorites.insert(
+                0,
+                FavoriteRecord {
+                    picture_id: key.clone(),
+                    added_at: chrono::Utc::now().timestamp(),
+                },
+            );
+            next.generation = next.generation.saturating_add(1);
+            if let Err(error) = self.commit_descriptor(next.clone()).await {
+                self.cleanup_saved(&*self.descriptor.read().await);
+                return Err(error);
+            }
+            self.notify(QueueEventReason::Library, next.generation);
+        }
+        Ok(key)
+    }
+
+    /// Only saved-owned objects are collected here. Queue staging/cleanup remains
+    /// independent. Caller holds the mutation lock so a snapshot cannot race GC.
+    fn cleanup_saved(&self, descriptor: &Descriptor) {
+        let objects = descriptor
+            .pictures
+            .values()
+            .flat_map(|entry| {
+                std::iter::once(entry.object_name.clone()).chain(entry.source_object_name.clone())
+            })
+            .collect::<HashSet<_>>();
+        let thumbnails = descriptor
+            .pictures
+            .values()
+            .map(|entry| thumbnail_name(&entry.id))
+            .collect::<HashSet<_>>();
+        for (directory, reachable) in [(&self.objects, objects), (&self.thumbnails, thumbnails)] {
+            if let Ok(entries) = fs::read_dir(directory) {
+                for entry in entries.flatten() {
+                    let name = entry.file_name().to_string_lossy().into_owned();
+                    if name.starts_with("saved-") && !reachable.contains(&name) {
+                        let _ = fs::remove_file(entry.path());
+                    }
+                }
+            }
+        }
+    }
+
+    pub async fn remove_favorite(&self, expected: u64, picture_id: &str) -> Result<()> {
+        let _guard = self.mutation.lock().await;
+        let mut next = self.descriptor.read().await.clone();
+        require_generation(&next, expected)?;
+        let index = next
+            .favorites
+            .iter()
+            .position(|item| item.picture_id == picture_id)
+            .context("favorite not found")?;
+        next.favorites.remove(index);
+        let retained = next
+            .favorites
+            .iter()
+            .map(|item| item.picture_id.as_str())
+            .chain(next.history.iter().map(|item| item.picture_id.as_str()))
+            .collect::<HashSet<_>>();
+        next.pictures.retain(|id, _| retained.contains(id.as_str()));
+        next.generation = next.generation.saturating_add(1);
+        self.commit_descriptor(next.clone()).await?;
+        self.cleanup_saved(&next);
+        self.notify(QueueEventReason::Library, next.generation);
+        Ok(())
+    }
+
+    pub async fn favorites(&self) -> Vec<(FavoriteRecord, QueueEntry)> {
+        let descriptor = self.descriptor.read().await;
+        descriptor
+            .favorites
+            .iter()
+            .filter_map(|favorite| {
+                descriptor
+                    .pictures
+                    .get(&favorite.picture_id)
+                    .map(|entry| (favorite.clone(), entry.clone()))
+            })
+            .collect()
+    }
+
     async fn commit_descriptor(&self, next: Descriptor) -> Result<()> {
         let path = self.state_path.clone();
         let disk = next.clone();
@@ -1351,7 +1513,11 @@ fn initialize(configured: &Path) -> Result<(PathBuf, PathBuf, PathBuf, Descripto
         persist_descriptor(&state_path, &value)?;
         value
     };
-    for entry in &descriptor.entries {
+    for entry in descriptor
+        .entries
+        .iter()
+        .chain(descriptor.pictures.values())
+    {
         validate_object_name(&entry.object_name)?;
         if let Some(source) = &entry.source_object_name {
             validate_object_name(source)?;
@@ -1363,6 +1529,43 @@ fn initialize(configured: &Path) -> Result<(PathBuf, PathBuf, PathBuf, Descripto
             text.validate()?;
         }
     }
+    for (id, entry) in &descriptor.pictures {
+        validate_object_name(&entry.id)?;
+        if !entry.id.starts_with("saved-") || composition_key(entry)? != *id {
+            bail!("invalid saved picture identity");
+        }
+        if entry.object_name != format!("{}.image", entry.id)
+            || entry
+                .source_object_name
+                .as_ref()
+                .is_some_and(|name| name != &format!("{}.source", entry.id))
+        {
+            bail!("saved picture assets must belong to the saved namespace");
+        }
+    }
+    let mut history_ids = HashSet::new();
+    let mut favorite_ids = HashSet::new();
+    if descriptor
+        .history
+        .iter()
+        .any(|item| !history_ids.insert(&item.picture_id))
+        || descriptor
+            .favorites
+            .iter()
+            .any(|item| !favorite_ids.insert(&item.picture_id))
+    {
+        bail!("duplicate saved picture reference");
+    }
+    for id in descriptor
+        .history
+        .iter()
+        .map(|item| &item.picture_id)
+        .chain(descriptor.favorites.iter().map(|item| &item.picture_id))
+    {
+        if !descriptor.pictures.contains_key(id) {
+            bail!("saved picture reference is missing: {id}");
+        }
+    }
     if descriptor.version < STATE_VERSION {
         migrate_descriptor(&objects, &mut descriptor)?;
         persist_descriptor(&state_path, &descriptor)?;
@@ -1370,11 +1573,16 @@ fn initialize(configured: &Path) -> Result<(PathBuf, PathBuf, PathBuf, Descripto
     let expected = descriptor
         .entries
         .iter()
+        .chain(descriptor.pictures.values())
         .flat_map(|entry| {
             std::iter::once(entry.object_name.clone()).chain(entry.source_object_name.clone())
         })
         .collect::<HashSet<_>>();
-    for entry in &descriptor.entries {
+    for entry in descriptor
+        .entries
+        .iter()
+        .chain(descriptor.pictures.values())
+    {
         let path = objects.join(&entry.object_name);
         let metadata = fs::symlink_metadata(&path)
             .with_context(|| format!("queue object is missing: {}", entry.object_name))?;
@@ -1400,6 +1608,7 @@ fn initialize(configured: &Path) -> Result<(PathBuf, PathBuf, PathBuf, Descripto
     let expected_thumbnails = descriptor
         .entries
         .iter()
+        .chain(descriptor.pictures.values())
         .map(|entry| thumbnail_name(&entry.id))
         .collect::<HashSet<_>>();
     for entry in fs::read_dir(&thumbnails).context("failed to inspect queue thumbnails")? {
@@ -1843,6 +2052,99 @@ mod tests {
             dedicated_text: false,
             supplier_id: None,
             source_key: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn favorite_snapshot_survives_queue_edit_removal_and_restart() {
+        let dir = tempdir().unwrap();
+        let queue = QueueStore::new(dir.path(), false).await.unwrap();
+        let entry = queue
+            .enqueue_rendered_batch(None, None, vec![rendered_request("photo.jpg", A)])
+            .await
+            .unwrap()
+            .remove(0);
+        let generation = queue.snapshot().await.generation;
+        let key = queue
+            .favorite_queue_entry(generation, &entry.id)
+            .await
+            .unwrap();
+        let favorite = queue.favorites().await.remove(0).1;
+        let bytes = fs::read(queue.objects.join(&favorite.object_name)).unwrap();
+        let generation = queue.snapshot().await.generation;
+        assert_eq!(
+            key,
+            queue
+                .favorite_queue_entry(generation, &entry.id)
+                .await
+                .unwrap()
+        );
+        assert_eq!(queue.snapshot().await.generation, generation);
+        queue
+            .set_orientation(
+                generation,
+                &entry.id,
+                ImageOrientation::Portrait,
+                FrameTarget::Paper7,
+                crate::renderer::OutputMode::DirectJpeg,
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            fs::read(queue.objects.join(&favorite.object_name)).unwrap(),
+            bytes
+        );
+        let generation = queue.snapshot().await.generation;
+        queue.remove(generation, &entry.id).await.unwrap();
+        drop(queue);
+        let reopened = QueueStore::new(dir.path(), false).await.unwrap();
+        assert_eq!(reopened.favorites().await.len(), 1);
+        assert_eq!(
+            fs::read(reopened.objects.join(&favorite.object_name)).unwrap(),
+            bytes
+        );
+        assert_eq!(
+            fs::read(
+                reopened
+                    .objects
+                    .join(favorite.source_object_name.as_ref().unwrap())
+            )
+            .unwrap(),
+            A
+        );
+        let generation = reopened.snapshot().await.generation;
+        reopened.remove_favorite(generation, &key).await.unwrap();
+        assert!(!reopened.objects.join(&favorite.object_name).exists());
+        assert!(reopened.favorites().await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn favorite_failure_does_not_publish_or_leak_snapshot_assets() {
+        let dir = tempdir().unwrap();
+        let queue = QueueStore::new(dir.path(), false).await.unwrap();
+        let entry = queue
+            .enqueue("legacy.jpg".into(), A.to_vec(), None, None)
+            .await
+            .unwrap();
+        let generation = queue.snapshot().await.generation;
+        fs::remove_file(&queue.state_path).unwrap();
+        fs::create_dir(&queue.state_path).unwrap();
+        assert!(
+            queue
+                .favorite_queue_entry(generation, &entry.id)
+                .await
+                .is_err()
+        );
+        assert_eq!(queue.snapshot().await.generation, generation);
+        assert!(queue.favorites().await.is_empty());
+        for path in fs::read_dir(&queue.objects).unwrap() {
+            assert!(
+                !path
+                    .unwrap()
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with("saved-")
+            );
         }
     }
 
