@@ -121,6 +121,66 @@ fn canonical_mapping(mapping: &PathMapping, cache_root: &Path) -> Result<Canonic
     })
 }
 
+/// Import a relative picture beneath an explicitly configured root. Every
+/// relative component is opened from a pinned directory descriptor, never by
+/// rejoining an unchecked path after canonicalization.
+#[cfg(unix)]
+pub fn read_relative_picture(root: &Path, relative: &Path, limit: u64) -> Result<Vec<u8>> {
+    use rustix::fs::{Mode, OFlags, open, openat};
+    let components = relative
+        .components()
+        .map(|component| match component {
+            Component::Normal(name) => Ok(name),
+            _ => anyhow::bail!("picture path must be relative and contain no traversal"),
+        })
+        .collect::<Result<Vec<_>>>()?;
+    if components.is_empty() {
+        bail!("picture path is empty");
+    }
+    let root = fs::canonicalize(root).context("source root is unavailable")?;
+    let mut directory = open(
+        &root,
+        OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+        Mode::empty(),
+    )
+    .context("failed to open source root")?;
+    for component in &components[..components.len() - 1] {
+        directory = openat(
+            &directory,
+            *component,
+            OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+            Mode::empty(),
+        )
+        .context("path directory is inaccessible or a symlink")?;
+    }
+    let file = openat(
+        &directory,
+        *components.last().unwrap(),
+        OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::NONBLOCK | OFlags::CLOEXEC,
+        Mode::empty(),
+    )
+    .context("picture is inaccessible or a symlink")?;
+    let file = File::from(file);
+    if !file.metadata()?.is_file() {
+        bail!("picture is not a regular file");
+    }
+    let limit = limit.min(100 * 1024 * 1024);
+    if file.metadata()?.len() > limit {
+        bail!("picture exceeds configured size limit");
+    }
+    let mut bytes = Vec::new();
+    file.take(limit + 1).read_to_end(&mut bytes)?;
+    if bytes.len() as u64 > limit {
+        bail!("picture exceeds configured size limit");
+    }
+    Ok(bytes)
+}
+
+#[cfg(not(unix))]
+pub fn read_relative_picture(_root: &Path, _relative: &Path, _limit: u64) -> Result<Vec<u8>> {
+    bail!("secure server-relative imports are currently supported only on Unix; use client upload")
+}
+
 fn safe_relative_album(path: &Path) -> Result<PathBuf> {
     let mut relative = PathBuf::new();
     for component in path.components() {
@@ -150,6 +210,40 @@ mod tests {
     use tempfile::tempdir;
 
     use super::*;
+
+    #[cfg(unix)]
+    #[test]
+    fn relative_import_rejects_traversal_symlinks_nonfiles_and_oversized_content() {
+        use std::os::unix::fs::symlink;
+        let dir = tempdir().unwrap();
+        let root = dir.path().join("root");
+        fs::create_dir_all(root.join("nested")).unwrap();
+        fs::write(root.join("nested/photo.jpg"), b"inside").unwrap();
+        fs::write(dir.path().join("outside.jpg"), b"outside").unwrap();
+        symlink(dir.path().join("outside.jpg"), root.join("link.jpg")).unwrap();
+        symlink(dir.path(), root.join("linked-dir")).unwrap();
+        assert_eq!(
+            read_relative_picture(&root, Path::new("nested/photo.jpg"), 100).unwrap(),
+            b"inside"
+        );
+        for path in [
+            "",
+            "../outside.jpg",
+            "/outside.jpg",
+            "nested/../../outside.jpg",
+            "link.jpg",
+            "linked-dir/outside.jpg",
+            "nested",
+            "missing.jpg",
+        ] {
+            assert!(
+                read_relative_picture(&root, Path::new(path), 100).is_err(),
+                "{path}"
+            );
+        }
+        assert!(read_relative_picture(&root, Path::new("nested/photo.jpg"), 2).is_err());
+        assert_eq!(fs::read(root.join("nested/photo.jpg")).unwrap(), b"inside");
+    }
 
     fn settings(root: &Path) -> DigikamSettings {
         DigikamSettings {

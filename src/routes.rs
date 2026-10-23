@@ -37,6 +37,7 @@ use crate::{
     state::{AppState, ImageRequest},
 };
 
+mod imports;
 mod library;
 use library::{add_favorite, enqueue_saved, favorites_page, history_page, remove_favorite};
 
@@ -62,6 +63,11 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/favorites", get(favorites_page))
         .route("/favorites/add", post(add_favorite))
         .route("/favorites/remove", post(remove_favorite))
+        .route("/favorites/path", post(imports::import_path))
+        .route(
+            "/favorites/upload",
+            post(imports::import_upload).layer(DefaultBodyLimit::max(UPLOAD_LIMIT)),
+        )
         .route("/queue/from-saved", post(enqueue_saved))
         .route("/saved/thumbnail/{id}", get(queue_thumbnail))
         .route("/saved/preview/{id}", get(queue_preview))
@@ -891,30 +897,7 @@ async fn upload_queue(State(state): State<Arc<AppState>>, mut multipart: Multipa
         uploads
             .into_iter()
             .map(|(display_name, bytes)| {
-                let decoded = crate::renderer::decode_source_named(&bytes, Some(&display_name))?;
-                let thumbnail = crate::renderer::thumbnail_jpeg(&decoded)?;
-                let rendered = crate::renderer::render_with_original(
-                    &decoded,
-                    &bytes,
-                    rendering.target,
-                    rendering.output_mode,
-                    decoded.orientation,
-                )?;
-                Ok(crate::queue::RenderedEnqueueRequest {
-                    display_name,
-                    source_bytes: bytes,
-                    derivative_bytes: rendered.bytes,
-                    thumbnail_bytes: thumbnail,
-                    media_type: rendered.media_type.into(),
-                    source_width: decoded.pixels.width(),
-                    source_height: decoded.pixels.height(),
-                    orientation: decoded.orientation,
-                    frame_target: rendering.target,
-                    text_overlay: None,
-                    dedicated_text: false,
-                    supplier_id: None,
-                    source_key: None,
-                })
+                imports::prepare_photo(display_name, bytes, rendering.clone())
             })
             .collect()
     })
@@ -2768,6 +2751,116 @@ mod tests {
             image::ImageFormat::Png
         );
         assert!(!directory.path().join("source/direct.png").exists());
+    }
+
+    fn favorite_upload_body(
+        queue_generation: u64,
+        settings_generation: u64,
+        csrf: &str,
+        content: &[u8],
+    ) -> Vec<u8> {
+        let mut body = format!("--favorite-boundary\r\nContent-Disposition: form-data; name=\"csrf_token\"\r\n\r\n{csrf}\r\n--favorite-boundary\r\nContent-Disposition: form-data; name=\"queue_generation\"\r\n\r\n{queue_generation}\r\n--favorite-boundary\r\nContent-Disposition: form-data; name=\"settings_generation\"\r\n\r\n{settings_generation}\r\n--favorite-boundary\r\nContent-Disposition: form-data; name=\"image\"; filename=\"client.jpg\"\r\nContent-Type: image/jpeg\r\n\r\n").into_bytes();
+        body.extend_from_slice(content);
+        body.extend_from_slice(b"\r\n--favorite-boundary--\r\n");
+        body
+    }
+
+    #[tokio::test]
+    async fn favorite_imports_do_not_touch_queue_history_seen_or_source() {
+        let (directory, state) = manual_state(AdvancementSettings::Manual).await;
+        let before = state.queue.snapshot().await;
+        let history = state.queue.history().await;
+        let seen = state.queue.seen("manual").await;
+        let settings_generation = state.settings.snapshot().await.generation;
+        let app = router(state.clone());
+        let oversized = vec![0u8; 1025];
+        for (csrf, content, expected) in [
+            ("bad", B, StatusCode::FORBIDDEN),
+            (
+                state.csrf_token(),
+                &b"corrupt"[..],
+                StatusCode::UNPROCESSABLE_ENTITY,
+            ),
+            (
+                state.csrf_token(),
+                oversized.as_slice(),
+                StatusCode::PAYLOAD_TOO_LARGE,
+            ),
+            (state.csrf_token(), B, StatusCode::SEE_OTHER),
+        ] {
+            let body = favorite_upload_body(
+                state.queue.snapshot().await.generation,
+                settings_generation,
+                csrf,
+                content,
+            );
+            let response = app
+                .clone()
+                .oneshot(
+                    Request::post("/favorites/upload")
+                        .header(
+                            header::CONTENT_TYPE,
+                            "multipart/form-data; boundary=favorite-boundary",
+                        )
+                        .body(Body::from(body))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), expected);
+        }
+        assert_eq!(state.queue.favorites().await.len(), 1);
+        fs::create_dir(directory.path().join("source/nested")).unwrap();
+        fs::write(directory.path().join("source/nested/photo.jpg"), C).unwrap();
+        for (root, path, expected) in [
+            ("0", "../settings.toml", StatusCode::UNPROCESSABLE_ENTITY),
+            ("99", "nested/photo.jpg", StatusCode::UNPROCESSABLE_ENTITY),
+            ("0", "nested/photo.jpg", StatusCode::SEE_OTHER),
+        ] {
+            let body = serde_urlencoded::to_string([
+                ("csrf_token", state.csrf_token().to_owned()),
+                (
+                    "queue_generation",
+                    state.queue.snapshot().await.generation.to_string(),
+                ),
+                ("settings_generation", settings_generation.to_string()),
+                ("root", root.into()),
+                ("path", path.into()),
+            ])
+            .unwrap();
+            let response = app
+                .clone()
+                .oneshot(
+                    Request::post("/favorites/path")
+                        .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
+                        .body(Body::from(body))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), expected);
+        }
+        assert_eq!(state.queue.favorites().await.len(), 2);
+        assert_eq!(state.queue.snapshot().await.entries, before.entries);
+        assert_eq!(state.queue.history().await, history);
+        assert_eq!(state.queue.seen("manual").await, seen);
+        assert_eq!(
+            fs::read(directory.path().join("source/nested/photo.jpg")).unwrap(),
+            C
+        );
+        fs::remove_dir_all(directory.path().join("source")).unwrap();
+        for (favorite, _) in state.queue.favorites().await {
+            let response = app
+                .clone()
+                .oneshot(
+                    Request::get(format!("/saved/original/{}", favorite.picture_id))
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+        }
     }
 
     #[tokio::test]

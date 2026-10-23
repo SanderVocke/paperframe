@@ -120,6 +120,30 @@ Advancing never consumes or rotates the only remaining image, so the frame keeps
 
 `target_length` is a refill target, not a maximum. In drop-and-refill mode supplier images are added until the queue reaches the target; direct uploads may make it longer.
 
+### Recent history and favorites
+
+Open **History** or **Favorites** from the control page. History means pictures that became the queue's **current (first) entry**, not confirmed frame deliveries. Repeated HTTP downloads and previews do not add history. Promoting the same composition again moves it to the top; a different orientation or text recipe is a distinct composition. Editing the current entry does not itself add a history event.
+
+Configure retention through Frame settings or at startup:
+
+```toml
+[history]
+max_entries = 100 # 0 disables and clears history; maximum 100000
+```
+
+Both collections are newest-first and paginated. **Queue at front** makes a saved picture current immediately; **Queue at back** appends it (and becomes current if the queue was empty). Each insertion creates an independent queue entry and intentional duplicates are allowed. Saved compositions are rendered for the current frame settings when requeued.
+
+Use **Favorite** on a queue or history card to retain its original and composition until explicitly removed. Later queue edits, history eviction, source changes/deletion, and supplier changes do not modify a favorite. Removing a favorite leaves queue/history references intact. Favorites are not automatically used for supplier refill.
+
+The Favorites page also imports one picture directly, without enqueueing:
+
+- **Upload to favorites** reads a picture from your device, using the same size/format/decoder limits as queue uploads.
+- **Add path to favorites** reads a relative path beneath a configured supplier root. Select the root (including the mapped root for DigiKam), then enter e.g. `album/photo.jpg`. Nested folders are supported. Absolute paths, `..`, symlinks, and non-regular files are rejected. Secure server-path imports currently require Unix; client uploads work on other platforms.
+
+Imports never modify source files or supplier-import tracking. Duplicate favorites are ignored. Reload and retry if another tab or queue advancement invalidated a form.
+
+**Storage and upgrades:** back up the entire managed data directory and settings before upgrading. Descriptor version 5 retains immutable saved copies separately from mutable queue assets; favorites are unbounded until removed, while history is count-bounded (not byte-bounded). Files are collected only after their final saved reference disappears. Saved copies can therefore use additional disk space even when the picture is also queued. Older binaries cannot read the new descriptor; downgrade by restoring the matching backup, not by editing the version number. Upgrading an older descriptor seeds its current picture once if history is enabled; ordinary restarts do not refresh its history timestamp.
+
 ### Refresh and supplier history
 
 - **Refresh supplier and refill** scans now instead of waiting for the next poll.

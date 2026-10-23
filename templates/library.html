@@ -5,6 +5,13 @@
 </style></head><body>
 <nav aria-label="Main navigation"><a href="/settings">Queue &amp; settings</a><a href="/history">History</a><a href="/favorites">Favorites</a></nav>
 <h1>{{ title }}</h1><p>{{ description }}</p>
+{% if favorites %}
+<section aria-label="Add a favorite"><h2>Add a favorite</h2>
+<p>Import a managed copy without adding it to the queue. One picture per submission.</p>
+<form method="post" action="/favorites/upload" enctype="multipart/form-data"><input type="hidden" name="csrf_token" value="{{ csrf_token }}"><input type="hidden" name="queue_generation" value="{{ generation }}"><input type="hidden" name="settings_generation" value="{{ settings_generation }}"><label>Picture from your device <input type="file" name="image" accept="image/*" required></label><button>Upload to favorites</button></form>
+<form method="post" action="/favorites/path" style="margin-top:16px"><input type="hidden" name="csrf_token" value="{{ csrf_token }}"><input type="hidden" name="queue_generation" value="{{ generation }}"><input type="hidden" name="settings_generation" value="{{ settings_generation }}"><label>Server source root <select name="root" required>{% for root in roots %}<option value="{{ root.index }}">{{ root.label }}</option>{% endfor %}</select></label> <label>Relative path <input name="path" placeholder="album/photo.jpg" required></label> <button>Add path to favorites</button><p><small>Relative to the selected configured root. Nested folders allowed; absolute paths, parent traversal and symlinks are rejected.</small></p></form>
+</section>
+{% endif %}
 {% if items.is_empty() %}<p>No pictures here yet.</p>{% endif %}
 <div class="grid">
 {% for item in items %}

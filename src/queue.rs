@@ -1455,6 +1455,102 @@ impl QueueStore {
         .context("queue thumbnail publication worker stopped")?
     }
 
+    /// Publish a prepared import directly to favorites. No transient queue entry,
+    /// current-slot transition, or supplier-seen mutation is involved.
+    pub async fn import_favorite(
+        &self,
+        expected: u64,
+        request: RenderedEnqueueRequest,
+    ) -> Result<String> {
+        let request = tokio::task::spawn_blocking(move || -> Result<_> {
+            crate::renderer::decode_source_named(
+                &request.source_bytes,
+                Some(&request.display_name),
+            )?;
+            validate_derivative(
+                &request.derivative_bytes,
+                &request.media_type,
+                request.frame_target,
+            )?;
+            validate_jpeg(&request.thumbnail_bytes)?;
+            if request.text_overlay.is_some() || request.dedicated_text {
+                bail!("direct picture import cannot contain text");
+            }
+            Ok(request)
+        })
+        .await
+        .context("favorite validation worker stopped")??;
+        let _guard = self.mutation.lock().await;
+        let mut next = self.descriptor.read().await.clone();
+        require_generation(&next, expected)?;
+        let id = format!("saved-{}", random_id());
+        let entry = QueueEntry {
+            object_name: format!("{id}.image"),
+            source_object_name: Some(format!("{id}.source")),
+            id,
+            display_name: request.display_name,
+            digest: digest(&request.derivative_bytes),
+            content_length: request.derivative_bytes.len() as u64,
+            media_type: request.media_type,
+            source_digest: Some(digest(&request.source_bytes)),
+            source_content_length: Some(request.source_bytes.len() as u64),
+            source_width: request.source_width,
+            source_height: request.source_height,
+            orientation: request.orientation,
+            orientation_source: OrientationSource::Inferred,
+            frame_target: request.frame_target,
+            renderer_profile: RENDER_PROFILE_VERSION,
+            text_overlay: None,
+            text_renderer_profile: 0,
+            dedicated_text: false,
+            supplier_id: request.supplier_id,
+            source_key: request.source_key,
+        };
+        let key = composition_key(&entry)?;
+        if next.favorites.iter().any(|item| item.picture_id == key) {
+            return Ok(key);
+        }
+        next.favorites.insert(
+            0,
+            FavoriteRecord {
+                picture_id: key.clone(),
+                added_at: chrono::Utc::now().timestamp(),
+            },
+        );
+        next.generation = next.generation.saturating_add(1);
+        if next.pictures.contains_key(&key) {
+            self.commit_descriptor(next.clone()).await?;
+        } else {
+            next.pictures.insert(key.clone(), entry.clone());
+            let root = self.root.clone();
+            let objects = self.objects.clone();
+            let thumbnails = self.thumbnails.clone();
+            let path = self.state_path.clone();
+            let disk = tokio::task::spawn_blocking(move || -> Result<_> {
+                publish_rendered_batch(
+                    &root,
+                    &objects,
+                    &thumbnails,
+                    &path,
+                    &[entry],
+                    vec![(
+                        request.source_bytes,
+                        request.derivative_bytes,
+                        request.thumbnail_bytes,
+                    )],
+                    &mut next,
+                )?;
+                Ok(next)
+            })
+            .await
+            .context("favorite publication worker stopped")??;
+            next = disk;
+            *self.descriptor.write().await = next.clone();
+        }
+        self.notify(QueueEventReason::Library, next.generation);
+        Ok(key)
+    }
+
     pub async fn favorite_queue_entry(&self, expected: u64, id: &str) -> Result<String> {
         let _guard = self.mutation.lock().await;
         let mut next = self.descriptor.read().await.clone();
@@ -2462,6 +2558,49 @@ mod tests {
             supplier_id: None,
             source_key: None,
         }
+    }
+
+    #[tokio::test]
+    async fn direct_favorite_import_is_idempotent_and_rolls_back_failed_publication() {
+        let dir = tempdir().unwrap();
+        let queue = QueueStore::new(dir.path(), false).await.unwrap();
+        let key = queue
+            .import_favorite(
+                queue.snapshot().await.generation,
+                rendered_request("a.jpg", A),
+            )
+            .await
+            .unwrap();
+        let favorites = queue.favorites().await;
+        let generation = queue.snapshot().await.generation;
+        assert_eq!(
+            queue
+                .import_favorite(generation, rendered_request("renamed.jpg", A))
+                .await
+                .unwrap(),
+            key
+        );
+        assert_eq!(queue.snapshot().await.generation, generation);
+        assert_eq!(queue.favorites().await, favorites);
+        assert!(queue.snapshot().await.entries.is_empty());
+        assert!(queue.history().await.is_empty());
+        let object_count = fs::read_dir(&queue.objects).unwrap().count();
+        let thumbnail_count = fs::read_dir(&queue.thumbnails).unwrap().count();
+        fs::remove_file(&queue.state_path).unwrap();
+        fs::create_dir(&queue.state_path).unwrap();
+        assert!(
+            queue
+                .import_favorite(generation, rendered_request("b.jpg", B))
+                .await
+                .is_err()
+        );
+        assert_eq!(queue.snapshot().await.generation, generation);
+        assert_eq!(queue.favorites().await, favorites);
+        assert_eq!(fs::read_dir(&queue.objects).unwrap().count(), object_count);
+        assert_eq!(
+            fs::read_dir(&queue.thumbnails).unwrap().count(),
+            thumbnail_count
+        );
     }
 
     #[tokio::test]

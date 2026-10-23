@@ -901,6 +901,7 @@ dependencies = [
  "image",
  "rand",
  "rusqlite",
+ "rustix",
  "serde",
  "serde_json",
  "serde_urlencoded",

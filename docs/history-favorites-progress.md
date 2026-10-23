@@ -81,6 +81,18 @@ The main plan's boxes intentionally remain unchecked until their whole requireme
 - Latest verification before the final pagination test: 103 passed, 0 failed, 1 ignored. Final results are recorded in the continuation/commit report.
 - **Still incomplete:** direct favorites upload/path import, shared in-page preview/card polish, complete stale/unknown-ID/security/concurrency tests, legacy compatible reuse, crash-recovery audit, docs, and manual desktop/mobile/PWA checks. No completion claim is made.
 
+## Direct favorite import increment
+
+- Added direct rendered-favorite publication without any temporary queue membership, current-slot transition or supplier-seen writes. Existing favorite compositions are idempotent; failed publication rolls back staged source/derivative/thumbnail assets.
+- Added `/favorites/upload` (one client picture, multipart/body and configured byte limits) and `/favorites/path` (configured source-root selection plus relative path). Both require CSRF, queue generation and settings generation, and use rendering-transition/concurrency guards.
+- Added favorites forms and extracted shared plain-photo preparation used by both queue uploads and favorite imports.
+- Server-relative reads use Unix `openat` with pinned directory descriptors, `NOFOLLOW` on every relative component, `NONBLOCK` for the final open, regular-file checks and bounded reading. Absolute/parent paths, symlinks, nonfiles and oversized content are rejected. Non-Unix server-path imports fail explicitly; client upload remains available.
+- Added production `rustix` dependency and updated lockfile.
+- Tests cover nested path success, traversal/root rejection, final/intermediate symlinks, nonfiles, missing/oversized files, upload CSRF/corruption/size limits, unchanged queue/history/seen/source state, source deletion independence, idempotency and failed publication cleanup.
+- Updated README and container documentation for behavior, imports, storage growth, backups/migration and downgrade limitations.
+- Verification: formatting, production check, CI test command: **107 passed, 0 failed, 1 ignored**.
+- **Not complete:** final prompt-to-artifact audit; shared preview/card UI polish and browser checks; remaining stale-ID/generation, race/concurrency/decoder-limit coverage; compatible derivative-only legacy reuse; cross-file settings/descriptor crash recovery review; full checklist evidence.
+
 ## Next concrete action
 
-Implement a direct rendered-favorite publication operation, then client multipart upload and server relative-path imports with configured root selection and race-resistant no-symlink opening. Neither import may create a transient queue item or alter supplier-seen state. Follow with the remaining UI/test/audit/documentation gates above. In particular inspect `preserve_legacy_source`, `remove`, `advance_internal`, `rerender_all`, orientation/text/edit operations, `publish_rerender`, `replace_derivative`, thumbnail publication, and startup orphan cleanup. Enqueues publish descriptors directly rather than exclusively through `commit_descriptor`, so a current-slot hook only in that method would miss initial/front enqueue transitions.
+Audit every main-plan checkbox against code/tests and write an explicit evidence table. Close missing legacy reuse, atomicity/crash-recovery and concurrency/security tests; exercise pages and forms in a real desktop/mobile browser if available. Do not mark the goal complete until all requirements have direct evidence and final changes are pushed. In particular inspect `preserve_legacy_source`, `remove`, `advance_internal`, `rerender_all`, orientation/text/edit operations, `publish_rerender`, `replace_derivative`, thumbnail publication, and startup orphan cleanup. Enqueues publish descriptors directly rather than exclusively through `commit_descriptor`, so a current-slot hook only in that method would miss initial/front enqueue transitions.

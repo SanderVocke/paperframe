@@ -30,6 +30,35 @@ struct LibraryTemplate {
     previous: usize,
     next: usize,
     pages: usize,
+    roots: Vec<RootChoice>,
+    settings_generation: u64,
+}
+
+struct RootChoice {
+    index: usize,
+    label: String,
+}
+pub(super) fn source_roots(settings: &Settings) -> Vec<(String, std::path::PathBuf)> {
+    settings
+        .suppliers
+        .iter()
+        .flat_map(|supplier| match &supplier.kind {
+            SupplierKind::ManualFolder(folder) => vec![(
+                format!("{} · source folder", supplier.id),
+                folder.directory.clone(),
+            )],
+            SupplierKind::DigikamSqlite(digikam) => digikam
+                .path_mappings
+                .iter()
+                .map(|mapping| {
+                    (
+                        format!("{} · {}", supplier.id, mapping.database_root.display()),
+                        mapping.mounted_root.clone(),
+                    )
+                })
+                .collect(),
+        })
+        .collect()
 }
 
 pub(super) async fn history_page(
@@ -61,6 +90,12 @@ async fn render_library(state: &Arc<AppState>, page: usize, favorites: bool) -> 
             favorite: item.favorite,
         })
         .collect();
+    let settings = state.settings.snapshot().await;
+    let roots = source_roots(&settings.settings)
+        .into_iter()
+        .enumerate()
+        .map(|(index, (label, _))| RootChoice { index, label })
+        .collect();
     let template = LibraryTemplate {
         title: if favorites {
             "Favorites"
@@ -81,6 +116,8 @@ async fn render_library(state: &Arc<AppState>, page: usize, favorites: bool) -> 
         previous: page.saturating_sub(1),
         next: page.saturating_add(1),
         pages: snapshot.pages,
+        roots,
+        settings_generation: settings.generation,
     };
     match template.render() {
         Ok(html) => Html(html).into_response(),
