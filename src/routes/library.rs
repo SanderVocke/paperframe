@@ -135,6 +135,7 @@ pub(super) struct FavoriteForm {
     queue_generation: String,
     source: String,
     id: String,
+    entry_version: Option<String>,
 }
 pub(super) async fn add_favorite(
     State(state): State<Arc<AppState>>,
@@ -148,7 +149,7 @@ pub(super) async fn add_favorite(
         "queue" => (
             state
                 .queue
-                .favorite_queue_entry(generation, &form.id)
+                .favorite_queue_entry(entry_expectation(generation, form.entry_version), &form.id)
                 .await
                 .map(|_| ()),
             "/settings",
@@ -164,6 +165,9 @@ pub(super) async fn add_favorite(
     };
     match result {
         Ok(()) => Redirect::to(redirect).into_response(),
+        Err(error) if redirect == "/settings" => {
+            queue_action_error(&state, &error.to_string()).await
+        }
         Err(error) => plain(
             StatusCode::CONFLICT,
             &format!("Could not save favorite; reload and retry: {error}"),
@@ -198,7 +202,7 @@ pub(super) async fn enqueue_saved(
     State(state): State<Arc<AppState>>,
     Form(form): Form<SavedQueueForm>,
 ) -> Response {
-    let generation = match validate_action(&state, &form.csrf_token, &form.queue_generation) {
+    let _generation = match validate_action(&state, &form.csrf_token, &form.queue_generation) {
         Ok(generation) => generation,
         Err((status, message)) => return plain(status, &message),
     };
@@ -232,7 +236,7 @@ pub(super) async fn enqueue_saved(
     match state
         .queue
         .enqueue_saved(
-            generation,
+            None,
             &form.id,
             position,
             rendering.target,
@@ -241,9 +245,6 @@ pub(super) async fn enqueue_saved(
         .await
     {
         Ok(_) => Redirect::to("/settings").into_response(),
-        Err(error) => plain(
-            StatusCode::CONFLICT,
-            &format!("Could not enqueue saved picture; reload and retry: {error}"),
-        ),
+        Err(error) => queue_action_error(&state, &error.to_string()).await,
     }
 }

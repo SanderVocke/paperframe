@@ -70,6 +70,47 @@ pub struct QueueEntry {
     pub source_key: Option<String>,
 }
 
+impl QueueEntry {
+    /// Includes recipe and render identity, but not unrelated queue/library changes.
+    pub fn version(&self) -> String {
+        digest(&serde_json::to_vec(self).expect("queue entries are serializable"))
+    }
+}
+
+/// Older clients may still submit a whole-queue generation. New editors submit
+/// the version of the entry they actually displayed.
+pub enum EntryExpectation {
+    Generation(u64),
+    Version(String),
+}
+
+impl From<u64> for EntryExpectation {
+    fn from(generation: u64) -> Self {
+        Self::Generation(generation)
+    }
+}
+
+impl EntryExpectation {
+    fn check(&self, state: &Descriptor, id: &str) -> Result<()> {
+        match self {
+            Self::Generation(generation) => require_generation(state, *generation),
+            Self::Version(version) => {
+                let entry = state
+                    .entries
+                    .iter()
+                    .find(|entry| entry.id == id)
+                    .context("This photo is no longer in the queue")?;
+                if entry.version() != *version {
+                    bail!(
+                        "This photo was edited elsewhere. Review the latest photo before saving again"
+                    );
+                }
+                Ok(())
+            }
+        }
+    }
+}
+
 fn default_media_type() -> String {
     "image/jpeg".into()
 }
@@ -256,7 +297,7 @@ pub struct QueueEvent {
 }
 
 #[cfg(test)]
-struct RerenderTestHook {
+struct RenderTestHook {
     started: tokio::sync::oneshot::Sender<()>,
     resume: tokio::sync::oneshot::Receiver<()>,
 }
@@ -271,7 +312,7 @@ pub struct QueueStore {
     events: watch::Sender<QueueEvent>,
     event_serial: AtomicU64,
     #[cfg(test)]
-    rerender_test_hook: std::sync::Mutex<Option<RerenderTestHook>>,
+    render_test_hook: std::sync::Mutex<Option<RenderTestHook>>,
 }
 
 impl QueueStore {
@@ -308,7 +349,7 @@ impl QueueStore {
             events,
             event_serial: AtomicU64::new(0),
             #[cfg(test)]
-            rerender_test_hook: std::sync::Mutex::new(None),
+            render_test_hook: std::sync::Mutex::new(None),
         });
         if migrate_current && store.snapshot().await.entries.is_empty() {
             let legacy = store.root.join("current.jpg");
@@ -703,9 +744,50 @@ impl QueueStore {
     }
 
     pub async fn reorder(&self, expected: u64, ids: Vec<String>) -> Result<QueueSnapshot> {
+        self.reorder_internal(Some(expected), None, ids).await
+    }
+
+    /// Only merge an unchanged displayed prefix with newly appended entries.
+    /// Deletions, front insertions, advances and competing reorders require review.
+    pub async fn reorder_displayed(
+        &self,
+        original: Vec<String>,
+        ids: Vec<String>,
+    ) -> Result<QueueSnapshot> {
+        self.reorder_internal(None, Some(original), ids).await
+    }
+
+    async fn reorder_internal(
+        &self,
+        expected: Option<u64>,
+        original: Option<Vec<String>>,
+        mut ids: Vec<String>,
+    ) -> Result<QueueSnapshot> {
         let _guard = self.mutation.lock().await;
         let current = self.descriptor.read().await.clone();
-        require_generation(&current, expected)?;
+        if let Some(expected) = expected {
+            require_generation(&current, expected)?;
+        }
+        if let Some(original) = original {
+            let actual = current
+                .entries
+                .iter()
+                .map(|entry| entry.id.clone())
+                .collect::<Vec<_>>();
+            let mut submitted = ids.clone();
+            submitted.sort();
+            let mut baseline = original.clone();
+            baseline.sort();
+            if submitted != baseline || baseline.windows(2).any(|pair| pair[0] == pair[1]) {
+                bail!("Reorder must contain every displayed photo exactly once");
+            }
+            if !actual.starts_with(&original) {
+                bail!(
+                    "The queue order or active photo changed elsewhere. Review the updated queue before reordering"
+                );
+            }
+            ids.extend_from_slice(&actual[original.len()..]);
+        }
         if ids.len() != current.entries.len() {
             bail!("reorder must contain every queue entry exactly once");
         }
@@ -736,14 +818,23 @@ impl QueueStore {
     }
 
     pub async fn remove(&self, expected: u64, id: &str) -> Result<QueueSnapshot> {
+        self.remove_internal(Some(expected), id).await
+    }
+
+    /// Stable queue IDs are never reused; repeating a deletion is a safe no-op.
+    pub async fn remove_by_id(&self, id: &str) -> Result<QueueSnapshot> {
+        self.remove_internal(None, id).await
+    }
+
+    async fn remove_internal(&self, expected: Option<u64>, id: &str) -> Result<QueueSnapshot> {
         let _guard = self.mutation.lock().await;
         let current = self.descriptor.read().await.clone();
-        require_generation(&current, expected)?;
-        let index = current
-            .entries
-            .iter()
-            .position(|entry| entry.id == id)
-            .context("queue entry not found")?;
+        if let Some(expected) = expected {
+            require_generation(&current, expected)?;
+        }
+        let Some(index) = current.entries.iter().position(|entry| entry.id == id) else {
+            return Ok(snapshot_of(&current));
+        };
         let mut next = current;
         let removed = next.entries.remove(index);
         next.generation = next.generation.saturating_add(1);
@@ -766,7 +857,7 @@ impl QueueStore {
     }
 
     pub async fn advance(&self, behavior: QueueAdvanceBehavior) -> Result<bool> {
-        self.advance_internal(None, None, behavior).await
+        self.advance_internal(None, None, None, behavior).await
     }
 
     pub async fn advance_at_generation(
@@ -774,7 +865,8 @@ impl QueueStore {
         expected: u64,
         behavior: QueueAdvanceBehavior,
     ) -> Result<bool> {
-        self.advance_internal(Some(expected), None, behavior).await
+        self.advance_internal(Some(expected), None, None, behavior)
+            .await
     }
 
     pub async fn advance_if_current(
@@ -782,19 +874,41 @@ impl QueueStore {
         id: &str,
         behavior: QueueAdvanceBehavior,
     ) -> Result<bool> {
-        self.advance_internal(None, Some(id), behavior).await
+        self.advance_internal(None, Some(id), None, behavior).await
+    }
+
+    pub async fn advance_displayed(
+        &self,
+        original: &[String],
+        behavior: QueueAdvanceBehavior,
+    ) -> Result<bool> {
+        self.advance_internal(None, None, Some(original), behavior)
+            .await
     }
 
     async fn advance_internal(
         &self,
         expected: Option<u64>,
         id: Option<&str>,
+        original: Option<&[String]>,
         behavior: QueueAdvanceBehavior,
     ) -> Result<bool> {
         let _guard = self.mutation.lock().await;
         let current = self.descriptor.read().await.clone();
         if let Some(expected) = expected {
             require_generation(&current, expected)?;
+        }
+        if let Some(original) = original {
+            let actual = current
+                .entries
+                .iter()
+                .map(|entry| entry.id.clone())
+                .collect::<Vec<_>>();
+            if original.is_empty() || !actual.starts_with(original) {
+                bail!(
+                    "The active photo or queue order changed elsewhere. Review the updated queue before advancing"
+                );
+            }
         }
         match id {
             Some(id) if current.entries.first().map(|entry| entry.id.as_str()) != Some(id) => {
@@ -849,16 +963,7 @@ impl QueueStore {
         }
         let base_generation = base.generation;
         #[cfg(test)]
-        {
-            let hook = {
-                let mut guard = self.rerender_test_hook.lock().unwrap();
-                guard.take()
-            };
-            if let Some(hook) = hook {
-                hook.started.send(()).unwrap();
-                hook.resume.await.context("rerender test hook canceled")?;
-            }
-        }
+        self.pause_render_for_test().await?;
         let objects = self.objects.clone();
         let entries = base.entries;
         let rendered = tokio::task::spawn_blocking(move || -> Result<Vec<_>> {
@@ -951,15 +1056,16 @@ impl QueueStore {
 
     pub async fn set_orientation(
         &self,
-        expected: u64,
+        expected: impl Into<EntryExpectation>,
         id: &str,
         orientation: ImageOrientation,
         target: FrameTarget,
         output_mode: crate::renderer::OutputMode,
     ) -> Result<QueueSnapshot> {
-        // Decode and render outside the mutation lock, then reject publication if the queue moved.
+        // Render outside the lock, then check this entry again at publication.
+        let expected = expected.into();
         let base = self.descriptor.read().await.clone();
-        require_generation(&base, expected)?;
+        expected.check(&base, id)?;
         let entry = base
             .entries
             .iter()
@@ -992,7 +1098,7 @@ impl QueueStore {
 
         let _guard = self.mutation.lock().await;
         let current = self.descriptor.read().await.clone();
-        require_generation(&current, expected)?;
+        expected.check(&current, &id)?;
         let index = current
             .entries
             .iter()
@@ -1043,7 +1149,7 @@ impl QueueStore {
 
     pub async fn set_text(
         &self,
-        expected: u64,
+        expected: impl Into<EntryExpectation>,
         id: &str,
         text_overlay: Option<TextOverlay>,
         target: FrameTarget,
@@ -1052,8 +1158,9 @@ impl QueueStore {
         if let Some(text) = &text_overlay {
             text.validate()?;
         }
+        let expected = expected.into();
         let base = self.descriptor.read().await.clone();
-        require_generation(&base, expected)?;
+        expected.check(&base, id)?;
         let entry = base
             .entries
             .iter()
@@ -1092,7 +1199,7 @@ impl QueueStore {
 
         let _guard = self.mutation.lock().await;
         let current = self.descriptor.read().await.clone();
-        require_generation(&current, expected)?;
+        expected.check(&current, &id)?;
         let index = current
             .entries
             .iter()
@@ -1144,7 +1251,7 @@ impl QueueStore {
 
     pub async fn edit_entry(
         &self,
-        expected: u64,
+        expected: impl Into<EntryExpectation>,
         id: &str,
         orientation: ImageOrientation,
         text_overlay: Option<TextOverlay>,
@@ -1154,8 +1261,9 @@ impl QueueStore {
         if let Some(text) = &text_overlay {
             text.validate()?;
         }
+        let expected = expected.into();
         let base = self.descriptor.read().await.clone();
-        require_generation(&base, expected)?;
+        expected.check(&base, id)?;
         let entry = base
             .entries
             .iter()
@@ -1191,9 +1299,12 @@ impl QueueStore {
         .await
         .context("queue edit render worker stopped")??;
 
+        #[cfg(test)]
+        self.pause_render_for_test().await?;
+
         let _guard = self.mutation.lock().await;
         let current = self.descriptor.read().await.clone();
-        require_generation(&current, expected)?;
+        expected.check(&current, &id)?;
         let index = current
             .entries
             .iter()
@@ -1245,10 +1356,26 @@ impl QueueStore {
         Ok(snapshot_of(&next))
     }
 
-    pub async fn reset_seen(&self, expected: u64, supplier_id: &str) -> Result<QueueSnapshot> {
+    #[cfg(test)]
+    async fn pause_render_for_test(&self) -> Result<()> {
+        let hook = self.render_test_hook.lock().unwrap().take();
+        if let Some(hook) = hook {
+            hook.started.send(()).unwrap();
+            hook.resume.await.context("render test hook canceled")?;
+        }
+        Ok(())
+    }
+
+    pub async fn reset_seen(
+        &self,
+        expected: impl Into<Option<u64>>,
+        supplier_id: &str,
+    ) -> Result<QueueSnapshot> {
         let _guard = self.mutation.lock().await;
         let current = self.descriptor.read().await.clone();
-        require_generation(&current, expected)?;
+        if let Some(expected) = expected.into() {
+            require_generation(&current, expected)?;
+        }
         let mut next = current;
         next.seen.remove(supplier_id);
         next.generation = next.generation.saturating_add(1);
@@ -1559,10 +1686,14 @@ impl QueueStore {
         Ok(key)
     }
 
-    pub async fn favorite_queue_entry(&self, expected: u64, id: &str) -> Result<String> {
+    pub async fn favorite_queue_entry(
+        &self,
+        expected: impl Into<EntryExpectation>,
+        id: &str,
+    ) -> Result<String> {
         let _guard = self.mutation.lock().await;
         let mut next = self.descriptor.read().await.clone();
-        require_generation(&next, expected)?;
+        expected.into().check(&next, id)?;
         let entry = next
             .entries
             .iter()
@@ -1682,14 +1813,17 @@ impl QueueStore {
 
     pub async fn enqueue_saved(
         &self,
-        expected: u64,
+        expected: impl Into<Option<u64>>,
         picture_id: &str,
         position: QueueInsertPosition,
         target: FrameTarget,
         mode: crate::renderer::OutputMode,
     ) -> Result<Vec<QueueEntry>> {
+        let expected = expected.into();
         let base = self.descriptor.read().await.clone();
-        require_generation(&base, expected)?;
+        if let Some(expected) = expected {
+            require_generation(&base, expected)?;
+        }
         let entry = base
             .pictures
             .get(picture_id)
@@ -1745,13 +1879,13 @@ impl QueueStore {
         })
         .await
         .context("saved picture render worker stopped")??;
-        self.enqueue_rendered_batch_at_impl(Some(expected), None, position, vec![request], false)
+        self.enqueue_rendered_batch_at_impl(expected, None, position, vec![request], false)
             .await
     }
 
     async fn enqueue_legacy_saved(
         &self,
-        expected: u64,
+        expected: Option<u64>,
         mut entry: QueueEntry,
         position: QueueInsertPosition,
         target: FrameTarget,
@@ -1777,7 +1911,9 @@ impl QueueStore {
         }
         let _guard = self.mutation.lock().await;
         let mut next = self.descriptor.read().await.clone();
-        require_generation(&next, expected)?;
+        if let Some(expected) = expected {
+            require_generation(&next, expected)?;
+        }
         let source = self.objects.join(&entry.object_name);
         entry.id = random_id();
         entry.thumbnail_object_name = None;
@@ -4058,6 +4194,88 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn entry_edit_publication_merges_appends_but_rechecks_edits_and_deletions() {
+        for change in ["append", "edit", "remove"] {
+            let dir = tempdir().unwrap();
+            let queue = QueueStore::new(dir.path(), false).await.unwrap();
+            queue
+                .enqueue_rendered_batch(None, None, vec![rendered_request("a.jpg", A)])
+                .await
+                .unwrap();
+            let entry = queue.snapshot().await.entries.remove(0);
+            let orientation = if entry.orientation == ImageOrientation::Portrait {
+                ImageOrientation::Landscape
+            } else {
+                ImageOrientation::Portrait
+            };
+            let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+            let (resume_tx, resume_rx) = tokio::sync::oneshot::channel();
+            *queue.render_test_hook.lock().unwrap() = Some(RenderTestHook {
+                started: started_tx,
+                resume: resume_rx,
+            });
+            let worker_queue = queue.clone();
+            let worker_entry = entry.clone();
+            let worker = tokio::spawn(async move {
+                worker_queue
+                    .edit_entry(
+                        EntryExpectation::Version(worker_entry.version()),
+                        &worker_entry.id,
+                        orientation,
+                        None,
+                        FrameTarget::Paper7,
+                        crate::renderer::OutputMode::DirectJpeg,
+                    )
+                    .await
+            });
+            tokio::time::timeout(std::time::Duration::from_secs(2), started_rx)
+                .await
+                .unwrap()
+                .unwrap();
+            match change {
+                "append" => {
+                    queue
+                        .enqueue_rendered_batch(None, None, vec![rendered_request("b.jpg", B)])
+                        .await
+                        .unwrap();
+                }
+                "edit" => {
+                    queue
+                        .set_orientation(
+                            EntryExpectation::Version(entry.version()),
+                            &entry.id,
+                            orientation,
+                            FrameTarget::Paper7,
+                            crate::renderer::OutputMode::DirectJpeg,
+                        )
+                        .await
+                        .unwrap();
+                }
+                "remove" => {
+                    queue.remove_by_id(&entry.id).await.unwrap();
+                }
+                _ => unreachable!(),
+            }
+            let before_publication = queue.snapshot().await;
+            resume_tx.send(()).unwrap();
+            let result = worker.await.unwrap();
+            let after = queue.snapshot().await;
+            if change == "append" {
+                result.unwrap();
+                assert_eq!(after.entries.len(), 2);
+                assert_eq!(after.entries[0].orientation, orientation);
+                assert_eq!(after.entries[1], before_publication.entries[1]);
+            } else {
+                assert!(result.is_err(), "{change} must invalidate the entry edit");
+                assert_eq!(after.entries, before_publication.entries);
+                assert_eq!(after.generation, before_publication.generation);
+            }
+            let reopened = QueueStore::new(dir.path(), false).await.unwrap();
+            assert_eq!(reopened.snapshot().await.entries, after.entries);
+        }
+    }
+
+    #[tokio::test]
     async fn cpu_render_phase_does_not_hold_mutation_lock_and_rejects_stale_publication() {
         let dir = tempdir().unwrap();
         let queue = QueueStore::new(dir.path(), false).await.unwrap();
@@ -4067,7 +4285,7 @@ mod tests {
             .unwrap();
         let (started_tx, started_rx) = tokio::sync::oneshot::channel();
         let (resume_tx, resume_rx) = tokio::sync::oneshot::channel();
-        *queue.rerender_test_hook.lock().unwrap() = Some(RerenderTestHook {
+        *queue.render_test_hook.lock().unwrap() = Some(RenderTestHook {
             started: started_tx,
             resume: resume_rx,
         });

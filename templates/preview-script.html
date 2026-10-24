@@ -9,7 +9,8 @@
   const ditheredPanel=document.getElementById('dithered-panel');
   const ditheredPreview=document.getElementById('dithered-preview');
   const ditheredFull=document.getElementById('dithered-full');
-  document.querySelectorAll('[data-preview-trigger]').forEach(trigger=>trigger.addEventListener('click',()=>{
+  document.addEventListener('click',event=>{
+    const trigger=event.target.closest('[data-preview-trigger]');if(!trigger)return;
     const id=encodeURIComponent(trigger.dataset.id);
     const prefix=trigger.dataset.prefix||'/queue';
     const name=trigger.dataset.name;
@@ -22,7 +23,7 @@
     previewGrid.classList.toggle('single',!isDithered||isDedicated);
     if(isDithered){ditheredPreview.alt='Dithered preview of '+name;ditheredPreview.src=prefix+'/dithered-preview/'+id;ditheredFull.href=prefix+'/rendered/'+id;}
     previewDialog.showModal();
-  }));
+  });
   document.getElementById('preview-close').addEventListener('click',()=>previewDialog.close());
   previewDialog.addEventListener('click',event=>{if(event.target===previewDialog)previewDialog.close();});
   previewDialog.addEventListener('close',()=>{originalPreview.removeAttribute('src');ditheredPreview.removeAttribute('src');});
