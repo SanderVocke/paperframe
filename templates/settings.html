@@ -35,11 +35,14 @@
     <h1 id="page-title">Your photo frame</h1>
     <p class="welcome-copy">Choose what appears next, add favorite photos, and keep your frame fresh.</p>
     <div class="primary-actions">
+      <div id="frame-queue-actions" style="display:contents">
       <form method="post" action="/queue/advance">
+        <textarea name="original_order" hidden>{{ reorder_lines }}</textarea>
         <input type="hidden" name="csrf_token" value="{{ csrf_token }}"><input type="hidden" name="queue_generation" value="{{ queue_generation }}">
         <button class="btn btn-primary" type="submit"{% if entries.is_empty() %} disabled{% endif %}><svg viewBox="0 0 24 24" fill="none" stroke="currentColor"><path d="m6 4 10 8L6 20V4Z"/><path d="M19 5v14"/></svg>Show next photo</button>
       </form>
       {% if !entries.is_empty() %}<a class="btn btn-secondary" href="/frame/current.jpg" target="_blank"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor"><path d="M2.5 12s3.5-6 9.5-6 9.5 6 9.5 6-3.5 6-9.5 6-9.5-6-9.5-6Z"/><circle cx="12" cy="12" r="2.5"/></svg>View frame</a>{% endif %}
+      </div>
       <button class="btn btn-secondary" id="install-app" type="button" hidden><svg viewBox="0 0 24 24" fill="none" stroke="currentColor"><path d="M12 3v12m0 0 4-4m-4 4-4-4"/><path d="M5 19h14"/></svg>Install app</button>
     </div>
   </div>
@@ -77,11 +80,15 @@
 </section>
 
 <section class="section" aria-labelledby="queue-title">
+  <div id="queue-feedback" role="status" aria-live="polite" hidden></div>
+  <button class="btn btn-secondary" id="queue-review" type="button" hidden>Review latest queue</button>
+  <div id="queue-panel" data-generation="{{ queue_generation }}">
   <div class="section-heading">
     <div><h2 id="queue-title">Your photo queue</h2><p>The first photo is active. Use the arrows to change the order.</p></div>
     <div class="queue-actions">
       <form id="order-form" class="save-order" method="post" action="/queue/reorder">
         <input type="hidden" name="csrf_token" value="{{ csrf_token }}"><input type="hidden" name="queue_generation" value="{{ queue_generation }}">
+        <textarea name="original_order" hidden>{{ reorder_lines }}</textarea>
         <textarea class="sr-only" id="order" name="order" aria-label="Photo order">{{ reorder_lines }}</textarea>
         <button class="btn btn-primary" type="submit">Save order</button>
       </form>
@@ -106,8 +113,8 @@
             <button class="icon-btn" type="button" data-move="up" title="Move earlier" aria-label="Move {{ image.display_name }} earlier"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor"><path d="m6 15 6-6 6 6"/></svg></button>
             <button class="icon-btn" type="button" data-move="down" title="Move later" aria-label="Move {{ image.display_name }} later"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor"><path d="m6 9 6 6 6-6"/></svg></button>
           </div>
-          <button class="icon-btn" type="button" data-edit-trigger data-id="{{ image.id }}" data-name="{{ image.display_name }}" data-orientation="{% if image.portrait %}portrait{% else %}landscape{% endif %}" data-dedicated="{% if image.dedicated_text %}true{% else %}false{% endif %}" data-has-text="{% if image.has_text %}true{% else %}false{% endif %}" data-text="{{ image.text_body }}" data-horizontal="{{ image.text_horizontal }}" data-vertical="{{ image.text_vertical }}" data-background="{{ image.text_background }}" data-size="{{ image.text_size }}" title="Edit" aria-label="Edit {{ image.display_name }}"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor"><path d="m4 20 4.2-1 10.6-10.6a2.1 2.1 0 0 0-3-3L5.2 16 4 20Z"/><path d="m14.5 6.5 3 3"/></svg></button>
-          {% if image.favorite %}<span title="Saved in favorites">★</span>{% else %}<form method="post" action="/favorites/add"><input type="hidden" name="csrf_token" value="{{ csrf_token }}"><input type="hidden" name="queue_generation" value="{{ queue_generation }}"><input type="hidden" name="id" value="{{ image.id }}"><input type="hidden" name="source" value="queue"><button class="btn btn-quiet" type="submit" title="Save favorite">☆ Favorite</button></form>{% endif %}
+          <button class="icon-btn" type="button" data-edit-trigger data-entry-version="{{ image.entry_version }}" data-id="{{ image.id }}" data-name="{{ image.display_name }}" data-orientation="{% if image.portrait %}portrait{% else %}landscape{% endif %}" data-dedicated="{% if image.dedicated_text %}true{% else %}false{% endif %}" data-has-text="{% if image.has_text %}true{% else %}false{% endif %}" data-text="{{ image.text_body }}" data-horizontal="{{ image.text_horizontal }}" data-vertical="{{ image.text_vertical }}" data-background="{{ image.text_background }}" data-size="{{ image.text_size }}" title="Edit" aria-label="Edit {{ image.display_name }}"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor"><path d="m4 20 4.2-1 10.6-10.6a2.1 2.1 0 0 0-3-3L5.2 16 4 20Z"/><path d="m14.5 6.5 3 3"/></svg></button>
+          {% if image.favorite %}<span title="Saved in favorites">★</span>{% else %}<form method="post" action="/favorites/add"><input type="hidden" name="csrf_token" value="{{ csrf_token }}"><input type="hidden" name="queue_generation" value="{{ queue_generation }}"><input type="hidden" name="id" value="{{ image.id }}"><input type="hidden" name="source" value="queue"><input type="hidden" name="entry_version" value="{{ image.entry_version }}"><button class="btn btn-quiet" type="submit" title="Save favorite">☆ Favorite</button></form>{% endif %}
           <form method="post" action="/queue/remove" onsubmit="return confirm('Remove this item from the queue?')">
             <input type="hidden" name="csrf_token" value="{{ csrf_token }}"><input type="hidden" name="queue_generation" value="{{ queue_generation }}"><input type="hidden" name="id" value="{{ image.id }}">
             <button class="icon-btn remove" type="submit" title="Remove from queue" aria-label="Remove {{ image.display_name }}"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor"><path d="M4 7h16m-10 4v6m4-6v6M9 7l1-3h4l1 3m3 0-1 14H7L6 7"/></svg></button>
@@ -118,6 +125,8 @@
     {% endfor %}
   </ol>
   {% endif %}
+
+  </div>
 
   <form class="upload-panel" method="post" action="/queue/upload" enctype="multipart/form-data">
     <input type="hidden" name="csrf_token" value="{{ csrf_token }}"><input type="hidden" name="queue_generation" value="{{ queue_generation }}">
@@ -214,7 +223,8 @@
 
 <dialog class="entry-edit-dialog" id="entry-editor" aria-labelledby="entry-editor-title">
   <form method="post" action="/queue/edit" data-composition-editor>
-    <input type="hidden" name="csrf_token" value="{{ csrf_token }}"><input type="hidden" name="queue_generation" value="{{ queue_generation }}"><input type="hidden" name="id" id="entry-editor-id">
+    <input type="hidden" name="csrf_token" value="{{ csrf_token }}"><input type="hidden" name="queue_generation" value="{{ queue_generation }}"><input type="hidden" name="id" id="entry-editor-id"><input type="hidden" name="entry_version">
+    <div data-action-feedback role="alert" hidden></div>
     <header class="preview-header"><h2 id="entry-editor-title">Edit queue item</h2><button class="icon-btn" id="entry-editor-close" type="button" aria-label="Close editor"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor"><path d="m6 6 12 12M18 6 6 18"/></svg></button></header>
     <div class="entry-edit-grid">
       <div class="entry-preview-viewport"><div class="composition-preview entry-composition-preview" data-composition-preview><img id="entry-editor-image" alt=""><div class="composition-position"><span>Text preview</span></div></div></div>
@@ -306,7 +316,10 @@
   const updateEditorPreview=setupCompositionEditor(editorForm);
   const editorImage=document.getElementById('entry-editor-image');
   const removeTextButton=document.getElementById('entry-editor-remove-text');
-  document.querySelectorAll('[data-edit-trigger]').forEach(trigger=>trigger.addEventListener('click',()=>{
+  document.addEventListener('click',event=>{
+    const trigger=event.target.closest('[data-edit-trigger]');if(!trigger)return;
+    editorForm.querySelector('[data-action-feedback]').hidden=true;
+    editorForm.elements.namedItem('entry_version').value=trigger.dataset.entryVersion;
     editorForm.elements.namedItem('id').value=trigger.dataset.id;
     editorForm.elements.namedItem('orientation').value=trigger.dataset.orientation;
     editorForm.elements.namedItem('body').value=trigger.dataset.text;
@@ -320,37 +333,15 @@
     if(dedicated)editorImage.removeAttribute('src');else editorImage.src='/queue/preview/'+encodeURIComponent(trigger.dataset.id);
     removeTextButton.hidden=dedicated||trigger.dataset.hasText!=='true';
     updateEditorPreview();editorDialog.showModal();
-  }));
+  });
   document.getElementById('entry-editor-close').addEventListener('click',()=>editorDialog.close());
   editorDialog.addEventListener('click',event=>{if(event.target===editorDialog)editorDialog.close();});
   editorDialog.addEventListener('close',()=>editorImage.removeAttribute('src'));
   removeTextButton.addEventListener('click',()=>{editorForm.elements.namedItem('body').value='';editorForm.requestSubmit();});
 
-  const list=document.getElementById('queue-list');
-  const order=document.getElementById('order');
-  const orderForm=document.getElementById('order-form');
-  if(!list)return;
-  function syncOrder(){
-    order.value=Array.from(list.children).map(card=>card.dataset.id+'\t'+card.dataset.name).join('\n');
-    orderForm.classList.add('changed');
-    list.querySelectorAll('.photo-card').forEach((card,index)=>card.classList.toggle('current',index===0));
-    list.querySelectorAll('.active-badge').forEach(badge=>badge.remove());
-    const first=list.querySelector('.photo-card .photo-link');
-    if(first){const badge=document.createElement('span');badge.className='active-badge';badge.textContent='Active after save';first.appendChild(badge);}
-  }
-  list.addEventListener('click',event=>{
-    const button=event.target.closest('[data-move]');if(!button)return;
-    const card=button.closest('.photo-card');
-    if(button.dataset.move==='up'&&card.previousElementSibling)list.insertBefore(card,card.previousElementSibling);
-    if(button.dataset.move==='down'&&card.nextElementSibling)list.insertBefore(card.nextElementSibling,card);
-    syncOrder();card.focus({preventScroll:true});
-  });
-  let dragged=null;
-  list.addEventListener('dragstart',event=>{dragged=event.target.closest('.photo-card');if(!dragged)return;dragged.classList.add('dragging');event.dataTransfer.effectAllowed='move';});
-  list.addEventListener('dragover',event=>{event.preventDefault();const card=event.target.closest('.photo-card');if(!dragged||!card||card===dragged)return;const box=card.getBoundingClientRect();const after=event.clientY>box.top+box.height/2||(Math.abs(event.clientY-(box.top+box.height/2))<box.height*.2&&event.clientX>box.left+box.width/2);list.insertBefore(dragged,after?card.nextSibling:card);});
-  list.addEventListener('dragend',()=>{if(!dragged)return;dragged.classList.remove('dragging');dragged=null;syncOrder();});
 })();
 </script>
+{% include "queue-sync-script.html" %}
 {% include "pending-submit-script.html" %}
 </body>
 </html>

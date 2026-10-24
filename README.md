@@ -157,7 +157,9 @@ Use the control page for live changes. Editing `data/settings.toml` by hand whil
 
 Keep the supplier ID stable. Changing it creates a new supplier history namespace, so existing source images become eligible again.
 
-If a form reports that the queue or settings changed, reload the page and retry. This protects against one browser tab overwriting newer changes from another tab.
+Queue actions can be used consecutively without reloading. The control page refreshes the queue automatically while preserving settings, upload/message drafts, and open photo edits. Deleting a photo targets its stable ID; background refill does not invalidate another deletion. Saving an order preserves newly appended photos at the end.
+
+If another client changes the displayed order or active photo, the app asks you to **Review latest queue** rather than overwriting that change. Competing edits to the same photo also require review; close and reopen the editor to load its latest version. Save an unsaved order before performing another queue action, or explicitly discard it using **Review latest queue**. Settings and standalone library forms retain their own conflict checks. See [queue concurrency behavior and tests](docs/queue-concurrency.md).
 
 ## Choose an image supplier
 

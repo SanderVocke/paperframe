@@ -1,0 +1,157 @@
+<script>
+(function(){
+  const panel=document.getElementById('queue-panel');
+  const feedback=document.getElementById('queue-feedback');
+  const review=document.getElementById('queue-review');
+  const editor=document.getElementById('entry-editor');
+  let busy=false, polling=false, epoch=0, draftEpoch=0, dragged=null, deferred=false, requestedReview=null;
+  const orderDirty=()=>document.getElementById('order-form').classList.contains('changed');
+  function notice(message,canReview=false){
+    feedback.textContent=message;
+    feedback.hidden=!message;
+    review.hidden=!canReview;
+  }
+  function applyQueue(page,force=false){
+    const incoming=page.getElementById('queue-panel');
+    if(!incoming)return false;
+    if(!force&&incoming.dataset.generation===panel.dataset.generation)return true;
+    // Never silently rebase a user's draft onto a different queue or entry.
+    if(dragged||(!force&&orderDirty())||editor.open){
+      deferred=true;
+      notice('The queue changed. Your draft is preserved; save it or review the latest queue.',true);
+      return false;
+    }
+    panel.replaceChildren(...incoming.childNodes);
+    panel.dataset.generation=incoming.dataset.generation;
+    for(const selector of ['#frame-queue-actions','.connection','.status-panel']){
+      const current=document.querySelector(selector),next=page.querySelector(selector);
+      if(current&&next)current.replaceWith(next);
+    }
+    deferred=false;
+    review.hidden=true;
+    return true;
+  }
+  async function refresh(force=false){
+    if(force)requestedReview=draftEpoch;
+    if(busy||polling||document.hidden)return;
+    polling=true;
+    const reviewDraft=requestedReview;
+    requestedReview=null;
+    const requestEpoch=epoch,requestDraft=reviewDraft??draftEpoch;
+    const forceReview=reviewDraft!==null;
+    try{
+      const response=await fetch('/settings',{cache:'no-store'});
+      if(!response.ok)throw new Error('Could not refresh the queue');
+      const page=new DOMParser().parseFromString(await response.text(),'text/html');
+      if(!page.getElementById('queue-panel'))throw new Error('Queue page unavailable');
+      // A GET started before a mutation must never overwrite its result.
+      if(requestEpoch===epoch&&!busy){
+        const wasDeferred=deferred;
+        if(applyQueue(page,forceReview&&requestDraft===draftEpoch)&&(wasDeferred||forceReview))notice('Queue updated.');
+      }
+    }catch(error){
+      if(forceReview)notice('Could not refresh the queue. Your draft is preserved; try again.',true);
+    }finally{
+      polling=false;
+      if(requestedReview!==null&&!busy&&!document.hidden)refresh();
+    }
+  }
+  review.addEventListener('click',()=>{
+    if(busy)return;
+    if(orderDirty()&&!confirm('Discard your unsaved order and show the current queue?'))return;
+    refresh(true);
+  });
+  editor.addEventListener('close',()=>{if(deferred)refresh();});
+  window.addEventListener('pageshow',()=>refresh());
+  document.addEventListener('visibilitychange',()=>{if(!document.hidden)refresh();});
+  setInterval(()=>refresh(),5000);
+
+  // Delegation keeps card controls working after a queue refresh.
+  function syncOrder(){
+    draftEpoch++;
+    const list=document.getElementById('queue-list');
+    document.getElementById('order').value=Array.from(list.children).map(card=>card.dataset.id+'\t'+card.dataset.name).join('\n');
+    document.getElementById('order-form').classList.add('changed');
+    list.querySelectorAll('.photo-card').forEach((card,index)=>card.classList.toggle('current',index===0));
+    list.querySelectorAll('.active-badge').forEach(badge=>badge.remove());
+    const first=list.querySelector('.photo-card .photo-link');
+    if(first){const badge=document.createElement('span');badge.className='active-badge';badge.textContent='Active after save';first.appendChild(badge);}
+  }
+  panel.addEventListener('click',event=>{
+    const button=event.target.closest('[data-move]');if(!button||busy)return;
+    const card=button.closest('.photo-card'),list=card.parentElement;
+    if(button.dataset.move==='up'&&card.previousElementSibling)list.insertBefore(card,card.previousElementSibling);
+    if(button.dataset.move==='down'&&card.nextElementSibling)list.insertBefore(card.nextElementSibling,card);
+    syncOrder();button.focus({preventScroll:true});
+  });
+  panel.addEventListener('dragstart',event=>{
+    if(busy){event.preventDefault();return;}
+    dragged=event.target.closest('.photo-card');if(!dragged)return;
+    dragged.classList.add('dragging');event.dataTransfer.effectAllowed='move';
+  });
+  panel.addEventListener('dragover',event=>{
+    event.preventDefault();const card=event.target.closest('.photo-card');if(!dragged||!card||card===dragged)return;
+    const box=card.getBoundingClientRect();
+    const after=event.clientY>box.top+box.height/2||(Math.abs(event.clientY-(box.top+box.height/2))<box.height*.2&&event.clientX>box.left+box.width/2);
+    card.parentElement.insertBefore(dragged,after?card.nextSibling:card);
+  });
+  panel.addEventListener('dragend',()=>{if(!dragged)return;dragged.classList.remove('dragging');dragged=null;syncOrder();});
+
+  // Progressive enhancement: native forms still work without JavaScript.
+  // Never automatically replay a POST, especially advance/upload/message.
+  document.addEventListener('submit',async event=>{
+    const form=event.target,path=new URL(form.action,location.href).pathname;
+    if(!path.startsWith('/queue/')&&!path.startsWith('/supplier/')&&path!=='/favorites/add')return;
+    if(event.defaultPrevented)return;
+    event.preventDefault();
+    if(busy)return;
+    // Otherwise a successful deletion could leave a misleading unsaved order.
+    if(orderDirty()&&path!=='/queue/reorder'){
+      notice('Save your order first, or review the latest queue to discard it.',true);
+      return;
+    }
+    const data=new FormData(form);
+    if(event.submitter&&event.submitter.name)data.append(event.submitter.name,event.submitter.value);
+    const body=form.enctype==='multipart/form-data'?data:new URLSearchParams(data);
+    const buttons=Array.from(form.querySelectorAll('button')).map(button=>[button,button.disabled]);
+    buttons.forEach(([button])=>button.disabled=true);
+    busy=true;epoch++;
+    let succeeded=false;
+    try{
+      const response=await fetch(form.action,{method:'POST',body,cache:'no-store'});
+      const text=await response.text();
+      const page=new DOMParser().parseFromString(text,'text/html');
+      if(!response.ok){
+        // The server returns a current queue with a friendly error. Do not replace
+        // a draft or change its baseline token; the user must explicitly review.
+        const message=page.querySelector('[role="alert"]')?.textContent.trim()||text;
+        applyQueue(page);
+        notice(message,true);
+        const local=form.querySelector('[data-action-feedback]');
+        if(local){local.textContent=message+' Close and reopen the editor to review the latest photo. Your draft has not been replaced.';local.hidden=false;}
+        return;
+      }
+      // An expired reverse-proxy session may redirect fetch to a 200 login page.
+      // That is not evidence that the mutation succeeded; keep every draft intact.
+      if(!page.getElementById('queue-panel'))throw new Error('Queue page unavailable');
+      succeeded=true;
+      if(path==='/queue/reorder')document.getElementById('order-form').classList.remove('changed');
+      if(path==='/queue/edit')editor.close();
+      if(path==='/queue/upload'||path==='/queue/message'){
+        form.reset();form.dispatchEvent(new Event('input',{bubbles:true}));
+        if(path==='/queue/upload')document.getElementById('images').dispatchEvent(new Event('change'));
+      }
+      applyQueue(page,true);
+      notice('Queue updated.');
+    }catch(error){
+      notice('Could not confirm whether the action completed. Review the latest queue before trying again. If your login expired, open the app in another tab to sign in.',true);
+      const local=form.querySelector('[data-action-feedback]');
+      if(local){local.textContent='Connection interrupted. Close the editor and review the queue before trying again.';local.hidden=false;}
+    }finally{
+      busy=false;
+      buttons.forEach(([button,disabled])=>button.disabled=disabled);
+      if(succeeded)refresh();
+    }
+  });
+})();
+</script>

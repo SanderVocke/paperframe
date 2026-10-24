@@ -29,7 +29,7 @@ use crate::{
         QueueAdvanceBehavior, QueueSettings, RenderingSettings, ReplaceSettingsError, Settings,
         SupplierKind, SupplierSettings,
     },
-    queue::{PreparedImage, QueueEntry, QueueEventReason, QueueInsertPosition},
+    queue::{EntryExpectation, PreparedImage, QueueEntry, QueueEventReason, QueueInsertPosition},
     renderer::{
         FrameTarget, HorizontalTextPosition, OutputMode, TextBackground, TextOverlay, TextSize,
         VerticalTextPosition,
@@ -199,6 +199,7 @@ struct QueueView {
     text_background: String,
     text_size: String,
     thumbnail_version: String,
+    entry_version: String,
     order_line: String,
 }
 
@@ -271,24 +272,28 @@ struct SettingsForm {
 struct QueueActionForm {
     csrf_token: String,
     queue_generation: String,
+    original_order: Option<String>,
 }
 #[derive(Deserialize)]
 struct RemoveForm {
     csrf_token: String,
     queue_generation: String,
     id: String,
+    entry_version: Option<String>,
 }
 #[derive(Deserialize)]
 struct ReorderForm {
     csrf_token: String,
     queue_generation: String,
     order: String,
+    original_order: Option<String>,
 }
 #[derive(Deserialize)]
 struct OrientationForm {
     csrf_token: String,
     queue_generation: String,
     id: String,
+    entry_version: Option<String>,
     orientation: String,
 }
 #[derive(Deserialize)]
@@ -296,6 +301,7 @@ struct TextForm {
     csrf_token: String,
     queue_generation: String,
     id: String,
+    entry_version: Option<String>,
     body: String,
     horizontal: String,
     vertical: String,
@@ -307,6 +313,7 @@ struct EditEntryForm {
     csrf_token: String,
     queue_generation: String,
     id: String,
+    entry_version: Option<String>,
     body: String,
     horizontal: String,
     vertical: String,
@@ -588,7 +595,7 @@ async fn render_settings(
         error,
     };
     match template.render() {
-        Ok(html) => (status, Html(html)).into_response(),
+        Ok(html) => (status, [(header::CACHE_CONTROL, "no-store")], Html(html)).into_response(),
         Err(error) => {
             error!(%error, "failed to render settings");
             plain(
@@ -678,6 +685,7 @@ fn queue_view(index: usize, entry: &QueueEntry) -> QueueView {
             .map(|text| text_size_name(text.size).to_owned())
             .unwrap_or_else(|| "large".into()),
         thumbnail_version: entry.digest.chars().take(12).collect(),
+        entry_version: entry.version(),
         order_line: format!("{}\t{}", entry.id, entry.display_name),
     }
 }
@@ -725,13 +733,17 @@ async fn reorder_queue(
         Ok(value) => value,
         Err((status, message)) => return plain(status, &message),
     };
-    let ids = form
-        .order
-        .lines()
-        .filter_map(|line| line.split_whitespace().next())
-        .map(str::to_owned)
-        .collect();
-    mutation_response(state.queue.reorder(generation, ids).await)
+    let ids = order_ids(&form.order);
+    let result = match form.original_order {
+        Some(original) => {
+            state
+                .queue
+                .reorder_displayed(order_ids(&original), ids)
+                .await
+        }
+        None => state.queue.reorder(generation, ids).await,
+    };
+    mutation_response(&state, result).await
 }
 async fn remove_queue_entry(
     State(state): State<Arc<AppState>>,
@@ -741,7 +753,8 @@ async fn remove_queue_entry(
         Ok(value) => value,
         Err((status, message)) => return plain(status, &message),
     };
-    mutation_response(state.queue.remove(generation, &form.id).await)
+    let _ = generation; // The ID, not an unrelated queue revision, identifies this deletion.
+    mutation_response(&state, state.queue.remove_by_id(&form.id).await).await
 }
 async fn advance_queue(
     State(state): State<Arc<AppState>>,
@@ -758,14 +771,21 @@ async fn advance_queue(
         .settings
         .queue
         .advance_behavior;
-    match state
-        .queue
-        .advance_at_generation(generation, behavior)
-        .await
-    {
-        Ok(_) => Redirect::to("/settings").into_response(),
-        Err(error) => plain(StatusCode::CONFLICT, &error.to_string()),
-    }
+    let result = match form.original_order {
+        Some(original) => {
+            state
+                .queue
+                .advance_displayed(&order_ids(&original), behavior)
+                .await
+        }
+        None => {
+            state
+                .queue
+                .advance_at_generation(generation, behavior)
+                .await
+        }
+    };
+    mutation_response(&state, result).await
 }
 async fn refresh_supplier(
     State(state): State<Arc<AppState>>,
@@ -775,9 +795,7 @@ async fn refresh_supplier(
         Ok(value) => value,
         Err((status, message)) => return plain(status, &message),
     };
-    if state.queue.snapshot().await.generation != generation {
-        return plain(StatusCode::CONFLICT, "Queue changed concurrently");
-    }
+    let _ = generation; // Requesting a scan does not overwrite queue state.
     state.queue.demand(QueueEventReason::SupplierRefresh);
     Redirect::to("/settings").into_response()
 }
@@ -797,13 +815,43 @@ async fn reset_supplier_seen(
         .supplier()
         .id
         .clone();
-    mutation_response(state.queue.reset_seen(generation, &supplier_id).await)
+    let _ = generation;
+    mutation_response(&state, state.queue.reset_seen(None, &supplier_id).await).await
 }
-fn mutation_response(result: anyhow::Result<crate::queue::QueueSnapshot>) -> Response {
+
+fn order_ids(order: &str) -> Vec<String> {
+    order
+        .lines()
+        .filter_map(|line| line.split_whitespace().next())
+        .map(str::to_owned)
+        .collect()
+}
+
+fn entry_expectation(generation: u64, version: Option<String>) -> EntryExpectation {
+    version
+        .map(EntryExpectation::Version)
+        .unwrap_or(EntryExpectation::Generation(generation))
+}
+
+async fn mutation_response<T>(state: &Arc<AppState>, result: anyhow::Result<T>) -> Response {
     match result {
         Ok(_) => Redirect::to("/settings").into_response(),
-        Err(error) => plain(StatusCode::CONFLICT, &error.to_string()),
+        Err(error) => queue_action_error(state, &error.to_string()).await,
     }
+}
+
+async fn queue_action_error(state: &Arc<AppState>, message: &str) -> Response {
+    let snapshot = state.settings.snapshot().await;
+    render_settings(
+        state,
+        snapshot.generation,
+        SettingsForm::from_settings(snapshot.generation, state.csrf_token(), &snapshot.settings),
+        Some(format!(
+            "Action not applied: {message}. Review the current queue before trying again."
+        )),
+        StatusCode::CONFLICT,
+    )
+    .await
 }
 fn validate_action(
     state: &AppState,
@@ -822,6 +870,7 @@ fn validate_action(
 }
 
 async fn upload_queue(State(state): State<Arc<AppState>>, mut multipart: Multipart) -> Response {
+    let _transition = state.rendering_transition.read().await;
     let settings = state.settings.snapshot().await.settings;
     let mut csrf = None;
     let mut generation = None;
@@ -869,7 +918,7 @@ async fn upload_queue(State(state): State<Arc<AppState>>, mut multipart: Multipa
     }
     let csrf = csrf.unwrap_or_default();
     let generation = generation.unwrap_or_default();
-    let generation = match validate_action(&state, &csrf, &generation) {
+    let _generation = match validate_action(&state, &csrf, &generation) {
         Ok(value) => value,
         Err((status, message)) => return plain(status, &message),
     };
@@ -908,20 +957,21 @@ async fn upload_queue(State(state): State<Arc<AppState>>, mut multipart: Multipa
         Ok(Err(error)) => return plain(StatusCode::UNPROCESSABLE_ENTITY, &error.to_string()),
         Err(error) => return plain(StatusCode::INTERNAL_SERVER_ERROR, &error.to_string()),
     };
-    match state
-        .queue
-        .enqueue_rendered_batch_at(Some(generation), None, position, requests)
-        .await
-    {
-        Ok(_) => Redirect::to("/settings").into_response(),
-        Err(error) => plain(StatusCode::UNPROCESSABLE_ENTITY, &error.to_string()),
-    }
+    mutation_response(
+        &state,
+        state
+            .queue
+            .enqueue_rendered_batch_at(None, None, position, requests)
+            .await,
+    )
+    .await
 }
 async fn create_text_message(
     State(state): State<Arc<AppState>>,
     Form(form): Form<MessageForm>,
 ) -> Response {
-    let generation = match validate_action(&state, &form.csrf_token, &form.queue_generation) {
+    let _transition = state.rendering_transition.read().await;
+    let _generation = match validate_action(&state, &form.csrf_token, &form.queue_generation) {
         Ok(value) => value,
         Err((status, message)) => return plain(status, &message),
     };
@@ -986,20 +1036,21 @@ async fn create_text_message(
         Ok(Err(error)) => return plain(StatusCode::UNPROCESSABLE_ENTITY, &error.to_string()),
         Err(error) => return plain(StatusCode::INTERNAL_SERVER_ERROR, &error.to_string()),
     };
-    match state
-        .queue
-        .enqueue_rendered_batch_at(Some(generation), None, position, vec![request])
-        .await
-    {
-        Ok(_) => Redirect::to("/settings").into_response(),
-        Err(error) => plain(StatusCode::CONFLICT, &error.to_string()),
-    }
+    mutation_response(
+        &state,
+        state
+            .queue
+            .enqueue_rendered_batch_at(None, None, position, vec![request])
+            .await,
+    )
+    .await
 }
 
 async fn edit_queue_entry(
     State(state): State<Arc<AppState>>,
     Form(form): Form<EditEntryForm>,
 ) -> Response {
+    let _transition = state.rendering_transition.read().await;
     let generation = match validate_action(&state, &form.csrf_token, &form.queue_generation) {
         Ok(value) => value,
         Err((status, message)) => return plain(status, &message),
@@ -1027,27 +1078,28 @@ async fn edit_queue_entry(
         Ok(permit) => permit,
         Err(error) => return plain(StatusCode::SERVICE_UNAVAILABLE, &error.to_string()),
     };
-    match state
-        .queue
-        .edit_entry(
-            generation,
-            &form.id,
-            orientation,
-            text,
-            rendering.target,
-            rendering.output_mode,
-        )
-        .await
-    {
-        Ok(_) => Redirect::to("/settings").into_response(),
-        Err(error) => plain(StatusCode::CONFLICT, &error.to_string()),
-    }
+    mutation_response(
+        &state,
+        state
+            .queue
+            .edit_entry(
+                entry_expectation(generation, form.entry_version),
+                &form.id,
+                orientation,
+                text,
+                rendering.target,
+                rendering.output_mode,
+            )
+            .await,
+    )
+    .await
 }
 
 async fn update_queue_text(
     State(state): State<Arc<AppState>>,
     Form(form): Form<TextForm>,
 ) -> Response {
+    let _transition = state.rendering_transition.read().await;
     let generation = match validate_action(&state, &form.csrf_token, &form.queue_generation) {
         Ok(value) => value,
         Err((status, message)) => return plain(status, &message),
@@ -1067,26 +1119,27 @@ async fn update_queue_text(
         Ok(permit) => permit,
         Err(error) => return plain(StatusCode::SERVICE_UNAVAILABLE, &error.to_string()),
     };
-    match state
-        .queue
-        .set_text(
-            generation,
-            &form.id,
-            Some(text),
-            rendering.target,
-            rendering.output_mode,
-        )
-        .await
-    {
-        Ok(_) => Redirect::to("/settings").into_response(),
-        Err(error) => plain(StatusCode::CONFLICT, &error.to_string()),
-    }
+    mutation_response(
+        &state,
+        state
+            .queue
+            .set_text(
+                entry_expectation(generation, form.entry_version),
+                &form.id,
+                Some(text),
+                rendering.target,
+                rendering.output_mode,
+            )
+            .await,
+    )
+    .await
 }
 
 async fn remove_queue_text(
     State(state): State<Arc<AppState>>,
     Form(form): Form<RemoveForm>,
 ) -> Response {
+    let _transition = state.rendering_transition.read().await;
     let generation = match validate_action(&state, &form.csrf_token, &form.queue_generation) {
         Ok(value) => value,
         Err((status, message)) => return plain(status, &message),
@@ -1096,20 +1149,20 @@ async fn remove_queue_text(
         Ok(permit) => permit,
         Err(error) => return plain(StatusCode::SERVICE_UNAVAILABLE, &error.to_string()),
     };
-    match state
-        .queue
-        .set_text(
-            generation,
-            &form.id,
-            None,
-            rendering.target,
-            rendering.output_mode,
-        )
-        .await
-    {
-        Ok(_) => Redirect::to("/settings").into_response(),
-        Err(error) => plain(StatusCode::CONFLICT, &error.to_string()),
-    }
+    mutation_response(
+        &state,
+        state
+            .queue
+            .set_text(
+                entry_expectation(generation, form.entry_version),
+                &form.id,
+                None,
+                rendering.target,
+                rendering.output_mode,
+            )
+            .await,
+    )
+    .await
 }
 
 fn text_overlay_from_fields(
@@ -1386,6 +1439,7 @@ async fn set_queue_orientation(
     State(state): State<Arc<AppState>>,
     Form(form): Form<OrientationForm>,
 ) -> Response {
+    let _transition = state.rendering_transition.read().await;
     let generation = match validate_action(&state, &form.csrf_token, &form.queue_generation) {
         Ok(value) => value,
         Err((status, message)) => return plain(status, &message),
@@ -1405,20 +1459,20 @@ async fn set_queue_orientation(
         Ok(permit) => permit,
         Err(error) => return plain(StatusCode::SERVICE_UNAVAILABLE, &error.to_string()),
     };
-    match state
-        .queue
-        .set_orientation(
-            generation,
-            &form.id,
-            orientation,
-            rendering.target,
-            rendering.output_mode,
-        )
-        .await
-    {
-        Ok(_) => Redirect::to("/settings").into_response(),
-        Err(error) => plain(StatusCode::CONFLICT, &error.to_string()),
-    }
+    mutation_response(
+        &state,
+        state
+            .queue
+            .set_orientation(
+                entry_expectation(generation, form.entry_version),
+                &form.id,
+                orientation,
+                rendering.target,
+                rendering.output_mode,
+            )
+            .await,
+    )
+    .await
 }
 
 async fn health_ready(State(state): State<Arc<AppState>>) -> StatusCode {
@@ -1824,6 +1878,8 @@ fn parse_mappings(input: &str) -> Result<Vec<PathMapping>, String> {
 
 #[cfg(test)]
 mod tests {
+    mod concurrency;
+
     use std::{fs, net::IpAddr, path::Path};
 
     use axum::{body::Body, extract::ConnectInfo, http::Request};
